@@ -26,6 +26,7 @@ OS = "windows" if WINDOWS else "linux"
 # Arguments some tests need. {name} is a tool or folder found below (find_tools); a check whose tools are missing is
 # skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
 ARGS = {
+    "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_input_background.py": ["--cc", "gcc"],
     "nx2/test_import_windows.py": ["--cxx", "g++"],
     "tests/test_lower_depbar.py": ["--cxx", "clang++"],
