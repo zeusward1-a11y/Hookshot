@@ -584,14 +584,24 @@ VkFormat supported_vertex_format(VkFormat f) {
 // (+ the guest page table's address, a task draw's first, and the fallback's two buffer addresses)
 constexpr uint32_t kPushSize = Shader::Backend::SPIRV::MESH_FALLBACK_PUSH_END;
 
-void ensure_layout(Program& p) {
-    if (p.layout) return;
+bool ensure_layout(Program& p) {
+    if (p.layout) return true;
+    static std::atomic<unsigned> set_errors{0}, layout_errors{0};
+    const auto failed = [&](const char* operation, VkResult result, std::atomic<unsigned>& errors) {
+        const unsigned n = errors.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8)
+            logf("vk: %s for program %016llx failed (%d)", operation, (unsigned long long)p.key, (int)result);
+        else if (n == 8)
+            logf("vk: further %s failures are not logged", operation);
+        return false;
+    };
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<VkDescriptorType> binding_types;
     uint32_t total = 0;
     auto add = [&](VkDescriptorType type, VkShaderStageFlags stage, const auto& descriptors) {
         for (const auto& d : descriptors) {
             bindings.push_back({(uint32_t)bindings.size(), type, d.count, stage, nullptr});
-            p.binding_types.push_back(type);
+            binding_types.push_back(type);
             total += d.count;
         }
     };
@@ -603,35 +613,48 @@ void ensure_layout(Program& p) {
         add(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, st.vk_stage, st.info.texture_descriptors);
         add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, st.vk_stage, st.info.image_descriptors);
     }
-    p.push = dev.push_descriptor && vkCmdPushDescriptorSetKHR && total <= dev.max_push_descriptors;
+    const bool push = dev.push_descriptor && vkCmdPushDescriptorSetKHR && total <= dev.max_push_descriptors;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    if (p.push) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    if (push) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = (uint32_t)bindings.size();
     li.pBindings = bindings.data();
-    vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set_layout);
+    VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
+    const VkResult set_result = vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set_layout);
+    if (set_result != VK_SUCCESS || !set_layout) return failed("vkCreateDescriptorSetLayout", set_result, set_errors);
     VkShaderStageFlags stages = 0;
     for (const Stage& st : p.stages) stages |= st.vk_stage;
     const VkPushConstantRange range{stages, 0, kPushSize};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
-    pi.pSetLayouts = &p.set_layout;
+    pi.pSetLayouts = &set_layout;
     pi.pushConstantRangeCount = 1;
     pi.pPushConstantRanges = &range;
     VkPipelineLayout layout = VK_NULL_HANDLE;
-    vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
-    p.push_stages = stages;
-    for (const Stage& st : p.stages) p.uses_render_area |= st.info.uses_render_area;
-    p.uses_push = p.uses_render_area;
-    for (const Stage& st : p.stages) p.uses_push |= st.info.uses_rescaling_uniform;
+    const VkResult layout_result = vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+    if (layout_result != VK_SUCCESS || !layout) {
+        vkDestroyDescriptorSetLayout(dev.device, set_layout, nullptr);
+        return failed("vkCreatePipelineLayout", layout_result, layout_errors);
+    }
+    bool uses_render_area = p.uses_render_area;
+    for (const Stage& st : p.stages) uses_render_area |= st.info.uses_render_area;
+    bool uses_push = uses_render_area;
+    for (const Stage& st : p.stages) uses_push |= st.info.uses_rescaling_uniform;
     static const bool follow_graphics = !getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0;
     for (const Stage& st : p.stages)   // (the page table; EvilOOT: and graphics stages with RX_VK_FOLLOW_GRAPHICS)
-        p.uses_push |= ((st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) ||
+        uses_push |= ((st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) ||
                         follow_graphics) &&
                        st.info.uses_global_memory;
-    for (const Stage& st : p.stages) p.uses_push |= (st.vk_stage & VK_SHADER_STAGE_TASK_BIT_EXT) != 0;   // (its first workgroup)
-    if (p.fallback) p.uses_push = true;   // (its records' and payloads' addresses)
+    for (const Stage& st : p.stages) uses_push |= (st.vk_stage & VK_SHADER_STAGE_TASK_BIT_EXT) != 0;   // (its first workgroup)
+    if (p.fallback) uses_push = true;   // (its records' and payloads' addresses; the mesh fallback, #779)
+    p.set_layout = set_layout;
+    p.binding_types = std::move(binding_types);
+    p.push = push;
+    p.push_stages = stages;
+    p.uses_render_area = uses_render_area;
+    p.uses_push = uses_push;
     std::atomic_thread_fence(std::memory_order_release);   // (the layout last: a thread that sees it sees the rest)
     p.layout = layout;
+    return true;
 }
 
 // ---- the pipeline cache, on disk ----
@@ -5039,7 +5062,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         PROF(PROF_PIPE);
         if (!p.layout) {
             ParLock lk;
-            ensure_layout(p);
+            if (!ensure_layout(p)) SKIP_HERE();
         }
         pe = graphics_pipeline(p, s, at, topo, types);
     }
@@ -6325,7 +6348,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
     const auto warm_compute = [&](Program& p) {
         if (!warm_cs || taau_key(p.key)) return;
-        ensure_layout(p);
+        if (!ensure_layout(p)) return;
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -6362,8 +6385,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
             }
             if (std::unique_ptr<Program> p = seed_program(i / 3, (int)(i % 3))) {
                 if (!p->failed) made++;
-                if (!p->failed && warm && !p->compute) {
-                    ensure_layout(*p);
+                if (!p->failed && warm && !p->compute && ensure_layout(*p)) {
                     Targets at{};
                     for (int part = 1; part <= 2; part++)
                         if (const VkPipeline lib = build_graphics(*p, *blank, at, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, part)) {
@@ -6444,8 +6466,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     for (const auto& n : notes) wanted.insert(n->prog);
     std::vector<Program*> computes;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
-        ensure_layout(p);
-        if (p.compute) computes.push_back(&p);
+        if (ensure_layout(p) && p.compute) computes.push_back(&p);
     });
     const double read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const size_t total = notes.size() + computes.size();
@@ -6488,7 +6509,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
             } else {
                 PipeNote& n = *notes[i - computes.size()];
                 const Program* p = program_find(n.prog, n.variant);
-                if (p) {
+                if (p && p->layout) {
                     const VkPipeline made = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo);
                     std::lock_guard lk(note_mu);
                     auto it = pipelines.find(n.key);
@@ -6559,7 +6580,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
             if (i >= keys.size()) return;
             const auto& list = by_program[keys[i]];
             program_cache_borrow(keys[i], [&](Program& p) {
-                ensure_layout(p);
+                if (!ensure_layout(p)) return;
                 for (const PipeNote* n : list)
                     if (n->variant == p.variant)
                         if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
@@ -6684,7 +6705,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     Program& p = const_cast<Program&>(*cp);
     if (!p.layout) {
         ParLock lk;
-        ensure_layout(p);
+        if (!ensure_layout(p)) SKIP_HERE();
     }
     // (the compute pipeline is compiled on a worker, not here with the recording lock held: AMD's compiler took 15-23 s on the
     // culling programs, every recording thread stopped behind it and the screen stayed black after the opening (6950 XT, RX 6600,
