@@ -26,13 +26,13 @@ def finish_statements(source, filename):
     main = next(node for node in ast.parse(source).body
                 if isinstance(node, ast.FunctionDef) and node.name == "main")
     starts = [i for i, node in enumerate(main.body) if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "staged" for target in node.targets)]
-    assert len(starts) == 1
+              and any(isinstance(target, ast.Name) and target.id in ("staged", "launcher") for target in node.targets)]
+    assert starts
     start = starts[0]
     end = next(i for i, node in enumerate(main.body[start + 1:], start + 1)
                if isinstance(node, ast.If) and any(isinstance(call, ast.Call)
                and isinstance(call.func, ast.Name) and call.func.id == "shader_census_cmd" for call in ast.walk(node)))
-    # Include the real list/append, stage-copy loop and swap loop; no rewritten installation algorithm.
+    # Include real launcher/destination selection, list/append, stage-copy and swap; no rewritten installation algorithm.
     return compile(ast.Module(body=main.body[start:end], type_ignores=[]), filename, "exec")
 
 
@@ -64,9 +64,14 @@ class FinishOutputTests(unittest.TestCase):
             if path.is_file():
                 path.chmod(stat.S_IREAD | stat.S_IWRITE)
 
-    def finish(self):
+    def finish(self, launcher=False):
+        if launcher:
+            (self.root / "HookshotBuilder-Setup.exe").write_bytes(b"new synthetic launcher")
         with mock.patch.object(make_game, "BESIDE", ["hookshot.exe"]):
-            exec(FINISH, make_game.__dict__, {"built": str(self.built), "out": str(self.out), "work": str(self.work)})
+            # Comprehensions use globals. Keep one namespace, as in production, and discover only authored setup files.
+            namespace = dict(make_game.__dict__, built=str(self.built), out=str(self.out), work=str(self.work),
+                             ROOT=str(self.root / "tools"), LINUX=False if launcher else make_game.LINUX)
+            exec(FINISH, namespace)
 
     def assert_installed_unchanged(self):
         self.assertEqual(self.destination.read_bytes(), b"existing synthetic executable")
@@ -117,6 +122,51 @@ class FinishOutputTests(unittest.TestCase):
         self.assertEqual(self.destination.read_bytes(), self.source.read_bytes())
         self.assertEqual((self.out / "image.bin").read_bytes(), self.image.read_bytes())
         self.assert_no_staging_files()
+
+    def test_launcher_stages_all_three_files_before_replacement(self):
+        binary = self.out / "bin" / "hookshot.exe"
+        binary.parent.mkdir()
+        binary.write_bytes(b"existing synthetic game in bin")
+        copy = make_game.shutil.copy2
+        copied = []
+
+        def observe_copy(source, destination):
+            self.assert_installed_unchanged()
+            self.assertEqual(binary.read_bytes(), b"existing synthetic game in bin")
+            result = copy(source, destination)
+            self.assert_installed_unchanged()
+            self.assertEqual(binary.read_bytes(), b"existing synthetic game in bin")
+            copied.append(Path(source))
+            return result
+
+        with mock.patch.object(make_game.shutil, "copy2", side_effect=observe_copy):
+            self.finish(launcher=True)
+        self.assertEqual(copied, [self.source, self.image, self.root / "HookshotBuilder-Setup.exe"])
+        self.assertEqual(binary.read_bytes(), self.source.read_bytes())
+        self.assertEqual(self.destination.read_bytes(), b"new synthetic launcher")
+        self.assertEqual((self.out / "image.bin").read_bytes(), self.image.read_bytes())
+        self.assertEqual(list(self.out.rglob("*.new")), [])
+
+    def test_partial_launcher_copy_preserves_game_image_and_launcher(self):
+        binary = self.out / "bin" / "hookshot.exe"
+        binary.parent.mkdir()
+        binary.write_bytes(b"existing synthetic game in bin")
+        copy = make_game.shutil.copy2
+
+        def partial_launcher(source, destination):
+            if Path(source) == self.root / "HookshotBuilder-Setup.exe":
+                Path(destination).write_bytes(b"partial launcher")
+                raise OSError(errno.ENOSPC, "synthetic disk-full error")
+            return copy(source, destination)
+
+        with mock.patch.object(make_game.shutil, "copy2", side_effect=partial_launcher):
+            with self.assertRaises(OSError):
+                self.finish(launcher=True)
+        self.assert_installed_unchanged()
+        self.assertEqual(binary.read_bytes(), b"existing synthetic game in bin")
+        self.assertEqual(binary.with_name("hookshot.exe.new").read_bytes(), self.source.read_bytes())
+        self.assertEqual((self.out / "image.bin.new").read_bytes(), self.image.read_bytes())
+        self.assertEqual((self.out / "hookshot.exe.new").read_bytes(), b"partial launcher")
 
     def test_partial_executable_copy_preserves_both_installed_files(self):
         def partial_copy(source, destination):
