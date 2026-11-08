@@ -378,6 +378,9 @@ static void load_hookshot_env(void) {
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
+/* (nx2/oot_native_resolution.py) mode 1's scene base scale 1.0 instead of 0.8: Resolution 100% (host/nn_vi.c keeps it current),
+   HOS_SCENE_NATIVE=0/1 over it */
+volatile int hos_native_scene;
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
 /* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
 volatile int hos_occlusion_off;
@@ -530,14 +533,19 @@ static int game_main(int argc, char **argv) {
                 FILE *o = fopen(path, "r");
                 if (o) {
                     char line[80];
-                    while (fgets(line, sizeof line, o))
+                    while (fgets(line, sizeof line, o)) {
                         if (!strncmp(line, "ultrawide=", 10)) on = atoi(line + 10) != 0;
+                        /* (the game sizes its scene before the menu is up: Resolution 100% read here too) */
+                        if (!strncmp(line, "resolution=", 11)) hos_native_scene = atoi(line + 11) == 1;
+                    }
                     fclose(o);
                 }
             }
             const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
             if (on && sh > 0) want = (float)sw / (float)sh;
         }
+        if (getenv("HOS_SCENE_NATIVE")) hos_native_scene = atoi(getenv("HOS_SCENE_NATIVE")) != 0;
+        if (hos_native_scene) hos_log("boot: Resolution 100%%: the scene at the picture's size (HOS_SCENE_NATIVE=0: the game's 0.8)");
         extern volatile uint64_t hos_wide_out, hos_wide_scene;
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
         const double game = 16.0 / 9.0;

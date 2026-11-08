@@ -184,7 +184,8 @@ static void scan_dt(long long presents) {
 extern volatile uint64_t hos_gfx_module;
 volatile int hos_fixed_resolution = 0;   /* (the lifted code reads these: nx2/oot_patches.py) */
 volatile uint32_t hos_fixed_scale_bits = 0x3f800000;   /* (HOS_RES_SCALE: the fixed path's scale) */
-volatile int hos_dynres_runs = 0;   /* (the dynamic path's frames: it fills fields the 3D reads, +8 +16 +168) */
+volatile int hos_dynres_runs = 0;
+volatile int hos_fix_res = 0;   /* (the scene's cached scale checked against the fixed one: nx2/oot_native_resolution.py) */   /* (the dynamic path's frames: it fills fields the 3D reads, +8 +16 +168) */
 volatile float hos_text_scale = 1.0f;   /* (the letters' clock of a text pane, f_80b1e140: nx2/oot_patches.py) */
 /* The Insert menu's Text speed (0 Normal, 1 2x, 2 4x, 3 Instant), HOS_TEXT_SPEED=<0..3> over it: what the time of a letter
    animation's step is multiplied by. Instant: the page at once, as the game's own skip on A */
@@ -205,6 +206,18 @@ static void realtime_step(int64_t now) {
     }
     {   /* (the Insert menu's Resolution: the fixed path's scale, live; HOS_RES_SCALE below stays over it) */
         const int percent = rx_option(3, 0);
+        /* (HOS_FIX_RES=0/1 over it; on at 100% as PR #329 tested it: 67% and 50% showed noise there) */
+        static const char *fix_env;
+        static int fix_looked;
+        if (!fix_looked) fix_looked = 1, fix_env = getenv("HOS_FIX_RES");
+        hos_fix_res = fix_env && *fix_env ? atoi(fix_env) != 0 : percent >= 100;
+        {   /* (Resolution 100%: the scene's base scale 1.0, host/hos_main.c; once raised the game keeps it until a restart) */
+            extern volatile int hos_native_scene;
+            static const char *native_env;
+            static int native_looked;
+            if (!native_looked) native_looked = 1, native_env = getenv("HOS_SCENE_NATIVE");
+            if (!(native_env && *native_env) && rx_option(3, -1) >= 0) hos_native_scene = percent >= 100;
+        }
         if (percent > 0 && !getenv("HOS_RES_SCALE")) {
             const float v = percent / 100.0f;
             memcpy((void *)&hos_fixed_scale_bits, &v, 4);
