@@ -5427,10 +5427,12 @@ std::string prepared_path() {
 }
 /// (hookshot) An update: every shader was prepared once here, for another translator. Each release changes the translator, and every
 /// update then held the game's start for the whole seed again (116k variants, minutes on most PCs: "shaders need to be prepared every
-/// update"). Then only what the notes name is built before the game (precompile_run), the rest in play behind it (prepare_background).
-/// RX_VK_PREPARE_BLOCKING=1: the whole seed before the game, as at a first start
+/// update"). With RX_VK_PREPARE_BACKGROUND=1 only what the notes name is built before the game (precompile_run), the rest in play
+/// behind it (prepare_background)
 bool prepare_is_update() {
-    if (getenv("RX_VK_PREPARE_AGAIN") || getenv("RX_VK_PREPARE_BLOCKING")) return false;
+    // (opt-in, RX_VK_PREPARE_BACKGROUND=1: when the translator changed, the program cache is gone too, and the first area then
+    // translated thousands of programs in play: 1 fps and black frames for minutes, which looked broken. Before the game is the default)
+    if (getenv("RX_VK_PREPARE_AGAIN") || !getenv("RX_VK_PREPARE_BACKGROUND")) return false;
     FILE* f = fopen(prepared_path().c_str(), "rb");
     if (!f) return false;
     uint64_t have = 0;
