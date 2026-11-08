@@ -534,7 +534,7 @@ const char* key_name(int vk) {
     }
     return snprintf(b, sizeof b, "Key %d", vk), b;
 }
-// the keys a binding can take (Esc cancels, Insert and F1 are the menu's, Delete clears)
+// the keys a binding can take (Esc cancels, Home and F1 are the menu's, Delete clears)
 const std::vector<int>& bindable_keys() {
     static std::vector<int> k;
     if (k.empty()) {
@@ -543,7 +543,7 @@ const std::vector<int>& bindable_keys() {
         for (int c = VK_F2; c <= VK_F12; c++) k.push_back(c);
         for (int c = VK_NUMPAD0; c <= VK_NUMPAD0 + 9; c++) k.push_back(c);
         for (int c : {VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_TAB, VK_RETURN, VK_BACK, VK_CAPITAL, VK_UP, VK_DOWN,
-                      VK_LEFT, VK_RIGHT, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_ADD, VK_SUBTRACT, VK_MULTIPLY,
+                      VK_LEFT, VK_RIGHT, VK_INSERT, VK_END, VK_PRIOR, VK_NEXT, VK_ADD, VK_SUBTRACT, VK_MULTIPLY,
                       VK_DIVIDE, VK_DECIMAL, VK_OEM_1, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
                       VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
                       0x05, 0x06})   // (the mouse's buttons too: they count while the mouse is captured)
@@ -949,7 +949,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     wrap_help(dc, rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
     SelectObject(dc, body);
     SetTextColor(dc, RGB(140, 150, 144));
-    const char* hint = "Arrows change   Q/E or LB/RB: tabs   Insert, F1 or Home closes";   // (fits 448 px at 16 px)
+    const char* hint = "Arrows change   Q/E or LB/RB: tabs   Home or F1 closes";   // (fits 448 px at 16 px)
     TextOutA(dc, 16 * s, help_top + 4 * s + help_px + 10 * s, hint, (int)strlen(hint));
     SelectObject(dc, old);
     DeleteObject(title);
@@ -1243,7 +1243,7 @@ void menu_tick() {
     fullscreen_tick();
     enum { K_N = 17 };
     static bool held[K_N];
-    static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
+    static const int keys[K_N] = {VK_HOME, VK_UP,   /* (Home: Rodrigo prefers it to Insert) */ VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
                                   VK_RETURN, VK_DELETE, VK_BACK,
                                   'Q', 'E', VK_TAB,   // (the tabs: Q and E, Tab and Shift+Tab)
                                   VK_PRIOR, VK_NEXT, VK_HOME, VK_END};   // (the long lists: a page, the ends)
