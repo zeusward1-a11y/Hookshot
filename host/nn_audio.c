@@ -11,7 +11,8 @@
    aux effects pass through. Played sample counts and released wave buffers go back to the game as on hardware.
    The game's parameter changes take effect together at RequestUpdateAudioRenderer, and volume changes ramp over a
    frame, as the console's renderer does them (see "parameter updates").
-   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence. */
+   HOS_AUDIO_DUMP=<file.wav>: also write what is played (checking without speakers); HOS_AUDIO=0: silence;
+   HOS_AUDIO_DEVICE=<n>: that waveOut device first; HOS_AUDIO_MUTE=1: the device fed at volume 0 (test runs). */
 #include "hos.h"
 #include <math.h>
 #include <stdio.h>
@@ -579,6 +580,14 @@ static void au_device_name(unsigned device, char *out, size_t size) {
 #endif
 }
 static uint64_t au_ms(void) { return (uint64_t)GetTickCount64(); }
+/* HOS_AUDIO_MUTE=1 (test runs): the device opened and fed as for a player, at volume 0 */
+static void au_opened(HWAVEOUT w) {
+#ifdef _WIN32
+    if (getenv("HOS_AUDIO_MUTE")) waveOutSetVolume(w, 0);
+#else
+    (void)w;
+#endif
+}
 
 /* ---- output: waveOut, 10 ms blocks; a WAV file with HOS_AUDIO_DUMP ---------------------------------------------- */
 #define NBLOCKS 10
@@ -617,6 +626,7 @@ static int output_try(int candidate, const WAVEFORMATEX *f) {
         wout = NULL;
         return 0;
     }
+    au_opened(wout);
     char name[64];
     if (device == WAVE_MAPPER) snprintf(name, sizeof name, "the default device");
     else au_device_name(device, name, sizeof name);

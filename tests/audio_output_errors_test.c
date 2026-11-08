@@ -96,6 +96,7 @@ static MMRESULT test_close(HWAVEOUT out) { (void)out; close_calls++; return 0; }
 static unsigned au_device_count(void) { return 2; }
 static void au_device_name(unsigned device, char *out, size_t size) { snprintf(out, size, "test device %u", device); }
 static uint64_t au_ms(void) { return now_ms; }
+static void au_opened(HWAVEOUT w) { (void)w; }
 #define getenv test_getenv
 #define waveOutOpen test_open
 #define waveOutPrepareHeader test_prepare
