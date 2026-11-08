@@ -595,6 +595,17 @@ def stop_stray_compilers(work, default_work):
         print("could not look for an earlier build's processes: %s" % e, flush=True)
 
 
+def makefile_words(text):
+    """Decode clang -M words, preserving ordinary Windows backslashes."""
+    text = re.sub(r"\\\r?\n", " ", text)
+    words = re.findall(r"(?:\\[ \t]|\S)+", text)
+    # clang doubles backslashes before an escaped space, but adds only one before #.
+    def unescape(m):
+        slashes, char = m.groups()
+        return "\\" * ((len(slashes) - 1) // 2 if char != "#" else len(slashes) - 1) + char
+    return [re.sub(r"(\\+)([ \t#])", unescape, word).replace("$$", "$") for word in words]
+
+
 def _drop_stale_linux(work):
     """The AppImage's sysroot is a new /tmp/.mount_... path every start. The stamp is the compiler's version and stdio.h's
     bytes, not that path, so an update reuses the compiled game when the headers did not change (the Windows stamp leaves
@@ -650,7 +661,7 @@ def drop_stale_objects(work):
                            encoding="utf-8", errors="replace")
     if r.returncode:
         return
-    found = sorted({h.lower() for h in re.findall(r"\S+\.h\b", r.stdout.replace("\\" + chr(10), " "))})
+    found = sorted({h.lower() for h in makefile_words(r.stdout) if h.endswith(".h")})
 
     # (issue 565) The paths are taken relative to the builder's own folder, with the compiler's version: under
     # versions\<tag>\ every release looked like new headers, and an update compiled everything again (2+ hours). clang

@@ -17,6 +17,16 @@ control, short and zero-length descriptor caps, signed/unsigned loads and a
 high 64-bit base. These eight scenarios and the eleven upstream cases emit
 nineteen modules in total.
 
+The additional `--cas-loops OUTPUT_DIRECTORY` case emits one real compute IR
+program with shared/storage byte writes, a storage/global float atomic add and
+a global compare-and-swap. With `RX_VK_FOLLOW_STORES=1`, it checks seven emitted
+retry loops across the SSBO and page-table routes. Each counter must be a leading
+entry-block variable, reset before its loop, incremented once per failed or
+successful exchange, and tested against 1024 alongside the actual exchange
+success. The failed-attempt path must feed back the returned word and retry.
+The two alternative single-exchange global CAS routes must return directly,
+without being counted as retry loops. CI validates all twenty modules.
+
 The fixture checks the emitted SPIR-V dependency chain; it does not execute a
 shader or driver, and does not validate odd guest addresses or AMD hardware. It
 tests the SPIR-V backend's lowering contract only.
@@ -30,3 +40,5 @@ target includes project compatibility headers with a function-local static
 inside a `constexpr` assertion macro. GCC rejects that construct in C++20,
 while the project's production Linux compiler is Clang in C++20 mode. The
 fixture does not establish an unmodified MSVC build.
+To include the CAS case when reproducing manually, run the built fixture again
+with `RX_VK_FOLLOW_STORES=1` and `--cas-loops` before validating the output modules.
