@@ -467,15 +467,17 @@ static float oot_load_float(Ctx *c, uint64_t addr) {
 static _Thread_local uint64_t flight_transform_controller;
 static _Thread_local uint64_t flight_pose_actor;
 static _Thread_local float flight_transform_yaw;
+static int64_t flight_player_seen;
 
 static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
     int rx_option(int id, int otherwise);
     static uint64_t flying_actor, marked_actor, marked_controller;
     static int64_t last_tick, last_player_tick;
     static float target[3], velocity[3], mark[3], yaw;
-    const int flying = rx_option(HOS_OPT_CHEAT_FLIGHT, 0);
+    const int flying = rx_option(HOS_OPT_CHEAT_FLIGHT, 0) > 0;
     if (!flying) flying_actor = 0;
     const int64_t now = hos_now_ns();
+    __atomic_store_n(&flight_player_seen, now, __ATOMIC_RELAXED);
     if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
     last_player_tick = now;
     const int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
@@ -582,6 +584,15 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     if (returning) hos_log("cheats: returned to %.2f %.2f %.2f", mark[0], mark[1], mark[2]);
 }
 #endif
+
+int hos_oot_flight_shortcut_ready(void) {
+#ifdef _WIN32
+    const int64_t seen = __atomic_load_n(&flight_player_seen, __ATOMIC_RELAXED);
+    return seen && hos_now_ns() - seen < 250000000;
+#else
+    return 0;
+#endif
+}
 
 #ifdef _WIN32
 static void oot_write_flight_rotation(Ctx *c, uint64_t matrix) {

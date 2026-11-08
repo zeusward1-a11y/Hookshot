@@ -593,7 +593,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         const char* values[] = {tx_onoff(protect_hearts.load() == 1), tx_onoff(player_flight.load() == 1),
                                 "", "", clock_text, pouch_items[pouch_item], quantity, tx_onoff(free_camera.load())};
         const char* help[] = {"Protects Link's hearts. Hits can still knock him back.",
-            "Move relative to the camera. Jump, R or Page Up climbs. L or Page Down descends.",
+            "Double-tap Jump to toggle. Hold Jump, R or Page Up to climb. L or Page Down descends.",
             "Remember Link's position for this loaded scene.",
             "Teleport Link to the marked position in the current scene.",
             "Choose an hour with Left or Right. Enter sets the world clock.",
@@ -882,7 +882,7 @@ void menu_set_gpu_count(int count) {
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
 int menu_heart_protection() { return protect_hearts.load(std::memory_order_relaxed); }
-int menu_player_flight() { return player_flight.load(std::memory_order_relaxed); }
+int menu_player_flight() { return cheats_enabled ? player_flight.load(std::memory_order_relaxed) : -1; }
 int menu_free_camera() { return free_camera.load(std::memory_order_relaxed); }
 int menu_take_cheat_action() { return cheat_action.exchange(0, std::memory_order_relaxed); }
 
@@ -931,6 +931,10 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
 }
 
 void menu_option_set(int id, int value) {
+    if (id == HOS_OPT_CHEAT_FLIGHT) {
+        if (cheats_enabled) player_flight.store(value != 0, std::memory_order_relaxed);
+        return;
+    }
     if (id != 7) return;
     opts.mouse_sens = std::min(std::max(value, 10), 500);   // (the keys work while the menu is closed: it shows it when opened)
     save();

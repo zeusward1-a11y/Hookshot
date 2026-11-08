@@ -621,6 +621,36 @@ uint64_t hos_free_camera_input(int *height) {
     return __atomic_load_n(&free_camera_axes, __ATOMIC_RELAXED);
 }
 
+static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int free_camera) {
+    int hos_oot_flight_shortcut_ready(void);
+    static int64_t first_press;
+    static int held, consume_jump;
+    const uint64_t jump = 1ULL << B_B;
+    const int down = !!(*buttons & jump);
+    if (mode < 0 || menu_open || free_camera || !hos_oot_flight_shortcut_ready() || !game_in_front()) {
+        first_press = 0;
+        held = 1;
+        consume_jump = 0;
+        return mode > 0;
+    }
+    if (down && !held) {
+        const int64_t now = hos_now_ns();
+        if (first_press && now - first_press <= 300000000) {
+            mode = !mode;
+            rx_option_set(HOS_OPT_CHEAT_FLIGHT, mode);
+            first_press = 0;
+            consume_jump = !mode;
+        } else {
+            first_press = now;
+        }
+    } else if (!down) {
+        consume_jump = 0;
+    }
+    held = down;
+    if (consume_jump) *buttons &= ~jump;
+    return mode > 0;
+}
+
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
@@ -731,12 +761,15 @@ static void npad_states(Ctx *c) {
         uint64_t axes = 0;
         uint64_t flight = 0;
         int height = 0;
-        if (rx_option(HOS_OPT_CHEAT_CAMERA, 0) && !rx_option(1, 0)) {
+        const int menu_open = rx_option(1, 0);
+        const int free_camera = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+        const int flying = flight_jump_shortcut(&buttons, rx_option(HOS_OPT_CHEAT_FLIGHT, -1), menu_open, free_camera);
+        if (free_camera && !menu_open) {
             for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
             height = (int)(buttons >> B_R & 1) - (int)(buttons >> B_L & 1);
             memset(stick, 0, sizeof stick);
             buttons &= ~((1ULL << B_L) | (1ULL << B_R));
-        } else if (rx_option(HOS_OPT_CHEAT_FLIGHT, 0) && !rx_option(1, 0)) {
+        } else if (flying && !menu_open) {
             const uint64_t climb = (1ULL << B_B) | (1ULL << B_R);
             const int vertical = !!(buttons & climb) - (int)(buttons >> B_L & 1);
             flight = (uint16_t)stick[0] | (uint64_t)(uint16_t)stick[1] << 16 |
