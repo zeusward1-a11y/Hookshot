@@ -533,7 +533,7 @@ bool started_up() {
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
         part = 0;
-        const bool prepared = prepare_run(progress);
+        const bool prepared = prepare_run(progress, false);
         part = 1;
         if (prepared) predict_run(progress);
         part = 2;
@@ -578,8 +578,10 @@ bool started_up() {
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
-        if (prepare_run(progress)) predict_run(progress);
+        const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
+        if (!update && prepare_run(progress, false)) predict_run(progress);
         precompile_run(progress);
+        if (update) prepare_background();
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
     }
     return true;

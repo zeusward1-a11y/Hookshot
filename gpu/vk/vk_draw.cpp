@@ -5419,13 +5419,31 @@ bool precompile_wanted() {
     if (const char* e = getenv("RX_VK_PRECOMPILE")) on = atoi(e) != 0;
     return on;
 }
-/// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator. True: prepared now
-bool prepare_run(void (*progress)(size_t done, size_t total)) {
-    const auto t0 = std::chrono::steady_clock::now();
+std::string prepared_path() {
     char exe[MAX_PATH];
     const DWORD exe_n = game_module_path(exe, MAX_PATH);
     std::string path(exe, exe_n);
-    path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepared.bin";
+    return path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_prepared.bin";
+}
+/// (hookshot) An update: every shader was prepared once here, for another translator. Each release changes the translator, and every
+/// update then held the game's start for the whole seed again (116k variants, minutes on most PCs: "shaders need to be prepared every
+/// update"). Then only what the notes name is built before the game (precompile_run), the rest in play behind it (prepare_background).
+/// RX_VK_PREPARE_BLOCKING=1: the whole seed before the game, as at a first start
+bool prepare_is_update() {
+    if (getenv("RX_VK_PREPARE_AGAIN") || getenv("RX_VK_PREPARE_BLOCKING")) return false;
+    FILE* f = fopen(prepared_path().c_str(), "rb");
+    if (!f) return false;
+    uint64_t have = 0;
+    const bool read = fread(&have, 8, 1, f) == 1;
+    fclose(f);
+    return read && have != program_cache_stamp();
+}
+/// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator. True: prepared now.
+/// background: in play, behind the game: a few workers at idle priority, translation only (the driver's part is left to first use:
+/// its compiler crashing in here would take the game with it)
+bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::string path = prepared_path();
     const uint64_t stamp = program_cache_stamp();
     if (FILE* f = fopen(path.c_str(), "rb")) {
         uint64_t have = 0;
@@ -5444,9 +5462,10 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     // crashes on one of them (it happens: TotK Recomp's issue 30) would crash here at every start: the file says this step began and
     // did not end, and the next start goes without it. Those libraries are then built when a draw first needs them
     const std::string warming = path + ".warming";
-    bool warm = gpl_wanted() && !getenv("RX_VK_NO_WARM");
-    bool warm_cs = !getenv("RX_VK_NO_WARM");
-    if (FILE* f = fopen(warming.c_str(), "rb")) {
+    bool warm = gpl_wanted() && !getenv("RX_VK_NO_WARM") && !background;
+    bool warm_cs = !getenv("RX_VK_NO_WARM") && !background;
+    if (background) {
+    } else if (FILE* f = fopen(warming.c_str(), "rb")) {
         fclose(f);
         warm = warm_cs = false;
         logf("vk: the last start did not finish the driver's part of the shaders: left out");
@@ -5483,7 +5502,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     };
     const auto worker = [&] {
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             const size_t i = next++;
             if (i >= total) return;
@@ -5516,7 +5535,9 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    // (in play: a quarter of the CPUs, two to four, the game's own threads before them)
+    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : std::clamp(cpus / 2, 1u, 32u);
+    for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
     while (done.load() < total) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -5526,12 +5547,20 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     int64_t translated = 0, failed = 0;
     shader_stats(&translated, &failed);
-    logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries; %zu compute variants, %zu programs with "
-         "texture variants, %zu at the limit) in %.1f s", programs, made.load(), (long long)failed, libs.load(), variants.load(),
+    logf("vk: prepared %zu shader programs%s (%zu new, %lld failed, %zu stage libraries; %zu compute variants, %zu programs with "
+         "texture variants, %zu at the limit) in %.1f s", programs, background ? " in play" : "", made.load(), (long long)failed, libs.load(), variants.load(),
          asking.load(), capped.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    remove(warming.c_str());
+    if (!background) remove(warming.c_str());
     if (FILE* f = fopen(path.c_str(), "wb")) fwrite(&stamp, 8, 1, f), fclose(f);
     return true;
+}
+void prepare_background() {
+    std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        Sleep(20000);   // (past the title screen's own loading)
+        logf("vk: an update: the shaders not met yet are translated in play, behind the game");
+        prepare_run(nullptr, true);
+    }).detach();
 }
 
 void precompile_run(void (*progress)(size_t done, size_t total)) {
