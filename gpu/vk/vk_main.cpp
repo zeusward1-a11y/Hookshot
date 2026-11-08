@@ -223,6 +223,9 @@ bool create_device() {
     // RX_VK_CHECKPOINTS=0: off
     if (!getenv("RX_VK_CHECKPOINTS") || strcmp(getenv("RX_VK_CHECKPOINTS"), "0") != 0)
         optional(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, dev.checkpoints);
+    // (asked for only: a marker written twice a draw, where the NV ones are not there to hide a race)
+    if (const char* c = getenv("RX_VK_CHECKPOINTS"); !dev.checkpoints && c && strcmp(c, "0") != 0 && strcmp(c, "ext") != 0)
+        optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
 
@@ -367,6 +370,7 @@ bool create_device() {
 
     load_device(dev.device);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};

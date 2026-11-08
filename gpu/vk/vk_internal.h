@@ -46,6 +46,7 @@ struct Device {
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
          conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
          checkpoints = false,   // (RX_VK_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints)
+         buffer_marker = false, // (RX_VK_CHECKPOINTS=1 without the NV extension: VK_AMD_buffer_marker, AMD and Intel)
          device_fault = false,  // (VK_EXT_device_fault: what a lost device faulted on)
          sparse_images = false, // (sparse resident 2D images on the queue: the terrain's huge arrays)
          sparse_buffers = false, // (sparse-bound buffers on the queue: a pool imported as several dma-bufs)
@@ -104,6 +105,8 @@ void memory_end_submission(VkCommandBuffer cmd);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
+/// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
+void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS

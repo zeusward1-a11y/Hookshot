@@ -45,7 +45,10 @@ def main():
         check("a stale part of an earlier lift is removed", not Path(d, "code_001_9.c").exists())
         parts = [files[1]] + sorted(made, key=lambda p: int(re.search(r"_(\d+)\.c$", p).group(1)))
         check("the giant chunk is cut", len(parts) >= 2)
-        texts = [Path(p).read_text(newline="") for p in parts]
+        texts = []
+        for p in parts:   # (read as written, with no newline translation: Path.read_text(newline=) is Python 3.13's)
+            with open(p, newline="") as f:
+                texts.append(f.read())
         check("every part has the chunk's declarations", all(t.startswith(PREAMBLE) for t in texts))
         check("the parts hold the chunk's functions in order", "".join(t[len(PREAMBLE):] for t in texts) == "".join(big))
         check("no part is cut inside a function", all(t[len(PREAMBLE):].startswith("void f_") for t in texts))

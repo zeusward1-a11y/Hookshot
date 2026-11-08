@@ -2319,16 +2319,38 @@ struct Checkpoint { uint64_t prog; uint64_t frame; uint32_t seq; char kind; };
 Checkpoint checkpoints[1 << 16];
 std::atomic<uint32_t> checkpoint_n{0};
 
+// (VK_AMD_buffer_marker, where the NV checkpoints are missing: marker i's sequence number goes to word 2i when the GPU
+// reaches it and to word 2i + 1 once all the work before it is done. Host memory, not VRAM: a GPU reset loses VRAM.)
+VkBuffer marker_buffer = VK_NULL_HANDLE;
+volatile uint32_t* marker_words = nullptr;
+
 // (RX_VK_CHECKPOINTS=ext: the extension on, no markers: which of the two keeps the device from being lost)
 bool checkpoint_markers() {
     static const bool on = !getenv("RX_VK_CHECKPOINTS") || strcmp(getenv("RX_VK_CHECKPOINTS"), "ext") != 0;
     return on;
 }
+bool checkpoints_on() {
+    return ((dev.checkpoints && vkCmdSetCheckpointNV) || marker_words) && checkpoint_markers();
+}
+void set_checkpoint(VkCommandBuffer cmd, uint32_t i, uint32_t seq) {
+    if (marker_words) {
+        vkCmdWriteBufferMarkerAMD(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, marker_buffer, 8ull * i, seq);
+        vkCmdWriteBufferMarkerAMD(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, marker_buffer, 8ull * i + 4, seq);
+    } else {
+        vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
+    }
+}
 void checkpoint(VkCommandBuffer cmd, const Program& p, char kind) {
-    if (!dev.checkpoints || !vkCmdSetCheckpointNV || !checkpoint_markers()) return;
+    if (!checkpoints_on()) return;
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {p.key, texture_frame_no(), seq, kind};
-    vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
+    set_checkpoint(cmd, i, seq);
+}
+const char* checkpoint_kind(char c) {
+    return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
+         : c == 'm' ? "mirror sync of pool"
+         : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
+         : "?";
 }
 
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at) {
@@ -2387,11 +2409,79 @@ void device_fault_report() {
 }
 
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind) {
-    if (!dev.checkpoints || !vkCmdSetCheckpointNV || !checkpoint_markers()) return;
+    if (!checkpoints_on()) return;
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {key, texture_frame_no(), seq, kind};
-    vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
+    set_checkpoint(cmd, i, seq);
 }
+
+void buffer_markers_init() {
+    if (!vkCmdWriteBufferMarkerAMD) return;
+    const VkDeviceSize size = 8ull << 16;
+    VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bi.size = size;
+    bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer buffer{};
+    if (vkCreateBuffer(dev.device, &bi, nullptr, &buffer) != VK_SUCCESS) return;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev.device, buffer, &req);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = UINT32_MAX;
+    for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++)   // (system memory first: it outlasts a reset)
+        for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++) {
+            const VkMemoryPropertyFlags f = dev.memory.memoryTypes[i].propertyFlags;
+            if ((req.memoryTypeBits >> i & 1) && (f & want) == want && (pass || !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+                type = i;
+        }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = type;
+    VkDeviceMemory memory{};
+    void* words = nullptr;
+    if (type == UINT32_MAX || vkAllocateMemory(dev.device, &ai, nullptr, &memory) != VK_SUCCESS) {
+        vkDestroyBuffer(dev.device, buffer, nullptr);
+        logf("vk: RX_VK_CHECKPOINTS: no host memory for the buffer markers");
+        return;
+    }
+    vkBindBufferMemory(dev.device, buffer, memory, 0);
+    if (vkMapMemory(dev.device, memory, 0, size, 0, &words) != VK_SUCCESS) {
+        vkDestroyBuffer(dev.device, buffer, nullptr);
+        vkFreeMemory(dev.device, memory, nullptr);
+        return;
+    }
+    std::memset(words, 0, size);
+    marker_buffer = buffer;
+    marker_words = (volatile uint32_t*)words;
+    logf("vk: RX_VK_CHECKPOINTS: VK_AMD_buffer_marker, a marker before each draw and dispatch (memory type %u)", type);
+}
+
+namespace {
+// (the markers the GPU reached whose earlier work never finished: the hang is in the work after the last marker that did)
+void buffer_markers_report() {
+    const uint32_t n = checkpoint_n.load(), first = n > 0xFFFF ? n - 0xFFFF : 1;
+    uint32_t reached = 0, last_done = 0;
+    std::vector<uint32_t> stuck;
+    for (uint32_t s = first; s && s <= n; s++) {
+        const uint32_t i = (s - 1) & 0xFFFF;
+        const bool r = marker_words[2 * i] == s, d = marker_words[2 * i + 1] == s;
+        reached += r;
+        if (d) last_done = s;
+        else if (r) stuck.push_back(s);
+    }
+    logf("vk: device lost: %u markers set, %u reached; the last whose earlier work all finished: %u", n, reached, last_done);
+    const auto line = [](const char* what, uint32_t s) {
+        const Checkpoint& k = checkpoints[(s - 1) & 0xFFFF];
+        logf("vk:   %s: marker %u (%s %016llx, frame %llu)", what, s, checkpoint_kind(k.kind), (unsigned long long)k.prog,
+             (unsigned long long)k.frame);
+    };
+    for (uint32_t s = last_done > 6 ? last_done - 6 : 1; last_done && s < last_done; s++) line("finished before", s);
+    // (from the last finished marker to the first reached one whose earlier work did not finish: what the GPU was running)
+    const uint32_t start = last_done ? last_done : first;
+    const uint32_t end = std::max(start, stuck.empty() ? start + 8 : std::min(stuck.front(), start + 16));
+    for (uint32_t s = start; s && s <= end && s <= n; s++) line(s == last_done ? "RUNNING after" : "running", s);
+    for (size_t j = 0; j < stuck.size() && j < 12; j++) line("reached, earlier work unfinished", stuck[j]);
+}
+} // namespace
 
 void draw_records_log(uint64_t lo, uint64_t hi);
 void checkpoints_report() {
@@ -2404,29 +2494,32 @@ void checkpoints_report() {
         draw_records_log(f > 6 ? f - 6 : 0, f);
     }
     // (checkpoints first: on NVIDIA vkGetDeviceFaultInfoEXT has not come back after a fault, which lost the report)
-    logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints" : "the fault info (RX_VK_CHECKPOINTS=1 for markers)");
+    logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints"
+                                        : marker_words ? "the buffer markers"
+                                                       : "the fault info (RX_VK_CHECKPOINTS=1 for markers)");
     struct FaultLast { ~FaultLast() { if (std::getenv("RX_VK_FAULT_INFO")) device_fault_report(); } } fault_last;
+    const auto watched = [] {
+        std::lock_guard lk(watch_mu);
+        for (int i = 0; i < 40; i++)
+            if (!watch_ring[(watch_at + i) % 40].empty()) logf("%s", watch_ring[(watch_at + i) % 40].c_str());
+    };
+    if (marker_words) {
+        buffer_markers_report();
+        watched();
+        return;
+    }
     if (!dev.checkpoints || !vkGetQueueCheckpointDataNV) return;
     uint32_t n = 0;
     vkGetQueueCheckpointDataNV(dev.queue, &n, nullptr);
     std::vector<VkCheckpointDataNV> cps(n, VkCheckpointDataNV{VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
     vkGetQueueCheckpointDataNV(dev.queue, &n, cps.data());
     logf("vk: device lost: %u checkpoints (%u markers set)", n, checkpoint_n.load());
-    {
-        std::lock_guard lk(watch_mu);
-        for (int i = 0; i < 40; i++)
-            if (!watch_ring[(watch_at + i) % 40].empty()) logf("%s", watch_ring[(watch_at + i) % 40].c_str());
-    }
+    watched();
     for (const VkCheckpointDataNV& c : cps) {
         const uint32_t i = (uint32_t)(uintptr_t)c.pCheckpointMarker - 1;
         if (i >= (1u << 16)) continue;
         const Checkpoint& k = checkpoints[i];
-        auto kind = [](char c) {
-            return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
-                 : c == 'm' ? "mirror sync of pool"
-                 : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
-                 : "?";
-        };
+        const auto kind = checkpoint_kind;
         logf("vk:   stage %#x: marker %u (%s %016llx, frame %llu)", (unsigned)c.stage, k.seq, kind(k.kind),
              (unsigned long long)k.prog, (unsigned long long)k.frame);
         // (the ones before it, for context)

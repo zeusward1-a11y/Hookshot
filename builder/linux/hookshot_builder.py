@@ -109,6 +109,33 @@ def free_gb(path):
         return None
 
 
+def xft_dpi():
+    """the DPI KDE and GNOME hand X apps when the desktop is scaled. Tk on X11 and XWayland never reads it."""
+    env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+    try:
+        out = subprocess.run(["xrdb", "-query"], env=env, capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r"^Xft\.dpi:\s*([0-9.]+)", out, re.M)
+    return float(found.group(1)) if found else None
+
+
+def ui_scale(screen_height, dpi=None, environ=os.environ):
+    """how much bigger than 96 DPI to draw the window. HOOKSHOT_UI_SCALE, then GDK_SCALE or QT_SCALE_FACTOR above 1
+    (Wayland sessions export GDK_SCALE=1 whatever the screen), then Xft.dpi; with none of them (gamescope, a bare X
+    session) a 1440p or 4K screen is still scaled by its height."""
+    for name, least in (("HOOKSHOT_UI_SCALE", 0), ("GDK_SCALE", 1), ("QT_SCALE_FACTOR", 1)):
+        try:
+            value = float(environ.get(name, ""))
+        except ValueError:
+            continue
+        if value > least:
+            return min(max(value, 0.5), 4.0)
+    if dpi:
+        return min(max(dpi / 96, 0.5), 4.0)
+    return min(screen_height / 1080, 4.0) if screen_height >= 1440 else 1.0
+
+
 def _arg(name):
     args = sys.argv[1:]
     if name in args:
@@ -122,7 +149,8 @@ class Builder(tk.Tk):
     def __init__(self, launch=None, update=None, fetched=False, tag=None):
         super().__init__()
         self.title("Hookshot Builder")
-        self.minsize(620, 420)
+        self.apply_scale()
+        self.minsize(self.px(620), self.px(420))
         self.cfg = load_config()
         self.proc = None
         self.lines = queue.Queue()
@@ -148,7 +176,7 @@ class Builder(tk.Tk):
         self.space_text = tk.StringVar()
         self.stage_text = tk.StringVar()
         self.time_text = tk.StringVar()
-        self.pad = {"padx": 12, "pady": 4}
+        self.pad = {"padx": self.px(12), "pady": self.px(4)}
         self.page = None
         self.build_button = None
         if update is not None:
@@ -161,13 +189,28 @@ class Builder(tk.Tk):
         self.after(100, self.pump)
         self.protocol("WM_DELETE_WINDOW", self.close)
 
+    def apply_scale(self):
+        """Fonts sized in points follow tk scaling; a named font sized in pixels (Tk 8.6 on X11: -12) does not, so it is
+        multiplied."""
+        self.scale = ui_scale(self.winfo_screenheight(), xft_dpi())
+        if self.scale == 1.0:
+            return
+        self.tk.call("tk", "scaling", self.scale * 96 / 72)
+        for name in self.tk.splitlist(self.tk.call("font", "names")):
+            size = int(self.tk.call("font", "configure", name, "-size"))
+            if size < 0:
+                self.tk.call("font", "configure", name, "-size", -max(1, round(-size * self.scale)))
+
+    def px(self, n):
+        return int(round(n * self.scale))
+
     # ---- the form ----
     def show_form(self):
         self.title("Hookshot Builder")
         if self.page:
             self.page.destroy()
         f = self.page = ttk.Frame(self)
-        f.pack(fill="both", expand=True, pady=8)
+        f.pack(fill="both", expand=True, pady=self.px(8))
         f.columnconfigure(1, weight=1)
         ttk.Label(f, text="Hookshot", font=("TkDefaultFont", 16, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", **self.pad)
         ttk.Label(f, text="Turns your own copy of Ocarina of Time into a game folder you can start on PC.").grid(
@@ -179,7 +222,7 @@ class Builder(tk.Tk):
         kinds = ttk.Frame(f)
         kinds.grid(row=3, column=1, columnspan=2, sticky="w")
         ttk.Radiobutton(kinds, text=".nup file", value="nup", variable=self.kind, command=self.show_form).pack(side="left")
-        ttk.Radiobutton(kinds, text="romfs and exefs", value="folders", variable=self.kind, command=self.show_form).pack(side="left", padx=12)
+        ttk.Radiobutton(kinds, text="romfs and exefs", value="folders", variable=self.kind, command=self.show_form).pack(side="left", padx=self.px(12))
         row = 4
         if self.kind.get() == "nup":
             self.path_row(f, row, ".nup file", self.nup, lambda: self.pick_file(self.nup))
@@ -188,7 +231,7 @@ class Builder(tk.Tk):
             row += 1
             self.path_row(f, row, "exefs", self.exefs, lambda: self.pick_dir(self.exefs))
         row += 1
-        ttk.Label(f, textvariable=self.check_text, wraplength=560).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
+        ttk.Label(f, textvariable=self.check_text, wraplength=self.px(560)).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1
         self.path_row(f, row, "Save the game to", self.out, lambda: self.pick_dir(self.out))
         row += 1
@@ -200,10 +243,10 @@ class Builder(tk.Tk):
         row += 1
         ttk.Label(f, textvariable=self.space_text).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1
-        ttk.Label(f, textvariable=self.status, wraplength=560).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
+        ttk.Label(f, textvariable=self.status, wraplength=self.px(560)).grid(row=row, column=0, columnspan=3, sticky="w", **self.pad)
         row += 1
         self.build_button = ttk.Button(f, text="Build", command=self.build)
-        self.build_button.grid(row=row, column=0, columnspan=3, sticky="we", padx=12, pady=12)
+        self.build_button.grid(row=row, column=0, columnspan=3, sticky="we", padx=self.px(12), pady=self.px(12))
         self.out.trace_add("write", lambda *a: self.update_space())
         self.update_space()
         self.apply_mode()
@@ -307,24 +350,24 @@ class Builder(tk.Tk):
         else:
             self.launch_status.set("Could not check for updates (GitHub did not answer)" if self.latest is None else "Hookshot")
         if hasattr(self, "launch_update"):
-            self.launch_update.pack(side="right", padx=4) if show else self.launch_update.pack_forget()
+            self.launch_update.pack(side="right", padx=self.px(4)) if show else self.launch_update.pack_forget()
 
     def show_launch(self, folder):
         if self.page:
             self.page.destroy()
         self.title("Hookshot")
         f = self.page = ttk.Frame(self)
-        f.pack(fill="both", expand=True, pady=8)
+        f.pack(fill="both", expand=True, pady=self.px(8))
         game, _kept = linux_update.game_version(folder)
         ttk.Label(f, text="Hookshot %s" % game if game else "Hookshot", font=("TkDefaultFont", 16, "bold")).pack(anchor="w", **self.pad)
-        ttk.Label(f, text=folder, wraplength=560).pack(anchor="w", **self.pad)
+        ttk.Label(f, text=folder, wraplength=self.px(560)).pack(anchor="w", **self.pad)
         self.launch_status = tk.StringVar(value="Checking for updates...")
-        ttk.Label(f, textvariable=self.launch_status, wraplength=560).pack(anchor="w", **self.pad)
+        ttk.Label(f, textvariable=self.launch_status, wraplength=self.px(560)).pack(anchor="w", **self.pad)
         buttons = ttk.Frame(f)
         buttons.pack(anchor="e", **self.pad)
         self.launch_update = ttk.Button(buttons, text="Update", command=lambda: self.begin_update(folder))
-        ttk.Button(buttons, text="Play", command=lambda: self.play_and_close(folder)).pack(side="right", padx=4)
-        ttk.Button(buttons, text="Open folder", command=lambda: subprocess.Popen(["xdg-open", folder])).pack(side="right", padx=4)
+        ttk.Button(buttons, text="Play", command=lambda: self.play_and_close(folder)).pack(side="right", padx=self.px(4))
+        ttk.Button(buttons, text="Open folder", command=lambda: subprocess.Popen(["xdg-open", folder])).pack(side="right", padx=self.px(4))
         self.lookup_latest()
 
     def begin_update(self, folder=None):
@@ -432,7 +475,7 @@ class Builder(tk.Tk):
         self.compile_started = None
         self.times = None
         f = self.page = ttk.Frame(self)
-        f.pack(fill="both", expand=True, pady=8)
+        f.pack(fill="both", expand=True, pady=self.px(8))
         f.columnconfigure(0, weight=1)
         f.rowconfigure(5, weight=1)
         self.heading = ttk.Label(f, text=title, font=("TkDefaultFont", 16, "bold"))
@@ -482,7 +525,7 @@ class Builder(tk.Tk):
                     if hasattr(self, "buttons"):
                         for widget in self.buttons.winfo_children():
                             widget.destroy()
-                        ttk.Button(self.buttons, text="Back", command=self.show_form).pack(side="right", padx=4)
+                        ttk.Button(self.buttons, text="Back", command=self.show_form).pack(side="right", padx=self.px(4))
                 elif kind == "line":
                     self.on_line(v)
                 elif kind == "exit":
@@ -563,11 +606,11 @@ class Builder(tk.Tk):
                 add_to_menu(folder)
             except OSError:
                 pass
-            ttk.Button(self.buttons, text="Play", command=lambda: self.play_and_close(folder)).pack(side="right", padx=4)
-            ttk.Button(self.buttons, text="Open folder", command=lambda: subprocess.Popen(["xdg-open", folder])).pack(side="right", padx=4)
+            ttk.Button(self.buttons, text="Play", command=lambda: self.play_and_close(folder)).pack(side="right", padx=self.px(4))
+            ttk.Button(self.buttons, text="Open folder", command=lambda: subprocess.Popen(["xdg-open", folder])).pack(side="right", padx=self.px(4))
         else:
             self.stage_text.set("The build stopped: %s" % getattr(self, "error", "see the lines above"))
-            ttk.Button(self.buttons, text="Back", command=self.show_form).pack(side="right", padx=4)
+            ttk.Button(self.buttons, text="Back", command=self.show_form).pack(side="right", padx=self.px(4))
 
     def cancel(self):
         if self.proc and self.proc.poll() is None:

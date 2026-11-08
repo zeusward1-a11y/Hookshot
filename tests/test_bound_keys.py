@@ -68,7 +68,13 @@ static LONG InterlockedCompareExchange(volatile LONG *p, LONG v, LONG c) { LONG 
 static void Sleep(int ms) { (void)ms; }
 static void hos_log(const char *f, ...) { (void)f; }
 static const char *ini_dir;
-static DWORD GetModuleFileNameA(void *m, char *b, DWORD n) { (void)m; return (DWORD)snprintf(b, n, "%s/hookshot.exe", ini_dir); }
+/* (the separator the system's own path has: nn_hid.c looks for a backslash first, so a mixed path finds the wrong folder) */
+#ifdef _WIN32
+#define EXE_SEP "\\"
+#else
+#define EXE_SEP "/"
+#endif
+static DWORD GetModuleFileNameA(void *m, char *b, DWORD n) { (void)m; return (DWORD)snprintf(b, n, "%s" EXE_SEP "hookshot.exe", ini_dir); }
 #define hos_game_path_a(b,n) GetModuleFileNameA(0,b,n)
 static int held[256];
 static int key(int vk) { return held[vk & 255]; }

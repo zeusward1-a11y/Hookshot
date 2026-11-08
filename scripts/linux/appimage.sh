@@ -62,6 +62,7 @@ find "$T" -name __pycache__ -prune -exec rm -rf {} +
 
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
+cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"

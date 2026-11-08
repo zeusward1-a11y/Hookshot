@@ -6,6 +6,8 @@
 #                     the player's PC compiles the game with them. The play profile (work/hookshot_pieces.prof) wants
 #                     LLVM 23 or newer.
 #   python/           CPython (python-build-standalone) with lz4, numpy, capstone, unicorn and zstandard: the tools
+#   tk/               libtcl9tk9.0.so built with Xft, with libXft and libXrender: put over python/'s, which draws only
+#                     X core fonts (under XWayland one 13 px bitmap font, whatever the size asked for or the screen)
 #   ffmpeg/           FFmpeg's libavcodec, libswscale, libswresample, libavutil, static and LGPL, with dav1d for OoT's
 #                     AV1 movies (VP8 / VP9 too) - linked into the game
 #   sdl2/             libSDL2-2.0.so.0: the window, sound and controllers, placed beside the game
@@ -23,6 +25,9 @@ JOBS=$(nproc)
 LLVM_VER=23.1.5
 PY_TAG=20261026
 PY_VER=3.12.16
+TCLTK_VER=9.0.4   # (python-build-standalone's Tcl and Tk: its tk9.0 scripts stay, beside this libtcl9tk9.0.so)
+TCL_SHA256=d0aed49230bc02a65c1e0229e65f34590a4b037ec40d546f32573b467f7551ea
+TK_SHA256=d7a146d2917eb8b5cc95276dbf0e3d03c7464d2b19c1675357857c989301dbb4
 SDL_VER=2.32.10
 FFMPEG_VER=9.0.2
 DAV1D_VER=1.5.4
@@ -87,6 +92,28 @@ if ! done_for python "$PY_VER-$PY_TAG"; then
     mark python "$PY_VER-$PY_TAG"
 fi
 
+# ---- Tk with Xft (the builder window's fonts; Tcl is built only for Tk's configure and stub library) ----
+if ! done_for tk "$TCLTK_VER"; then
+    fetch "https://downloads.sourceforge.net/project/tcl/Tcl/$TCLTK_VER/tcl$TCLTK_VER-src.tar.gz" "tcl$TCLTK_VER.tar.gz"
+    fetch "https://downloads.sourceforge.net/project/tcl/Tcl/$TCLTK_VER/tk$TCLTK_VER-src.tar.gz" "tk$TCLTK_VER.tar.gz"
+    printf '%s  %s\n' "$TCL_SHA256" "$DL/tcl$TCLTK_VER.tar.gz" "$TK_SHA256" "$DL/tk$TCLTK_VER.tar.gz" | sha256sum -c -
+    rm -rf "$DEPS/src-tcl" "$DEPS/src-tk" "$DEPS/tk"
+    mkdir -p "$DEPS/src-tcl" "$DEPS/src-tk" "$DEPS/tk"
+    tar -xzf "$DL/tcl$TCLTK_VER.tar.gz" -C "$DEPS/src-tcl" --strip-components=1
+    tar -xzf "$DL/tk$TCLTK_VER.tar.gz" -C "$DEPS/src-tk" --strip-components=1
+    (cd "$DEPS/src-tcl/unix" && ./configure --enable-shared --with-system-libtommath=no && make -j"$JOBS" binaries)
+    # (no rpath: libXft and libXrender are found beside it through _tkinter's $ORIGIN/../..)
+    (cd "$DEPS/src-tk/unix" && ./configure --enable-shared --with-tcl="$DEPS/src-tcl/unix" --enable-xft --disable-libcups \
+        --disable-xss --disable-zipfs --disable-rpath && make -j"$JOBS" binaries)
+    cp "$DEPS/src-tk/unix/libtcl9tk9.0.so" "$DEPS/tk/"
+    strip --strip-unneeded "$DEPS/tk/libtcl9tk9.0.so"
+    readelf -d "$DEPS/tk/libtcl9tk9.0.so" | grep -q 'libXft\.so\.2' || { echo "Tk was built without Xft"; exit 1; }
+    cp -L /usr/lib/x86_64-linux-gnu/libXft.so.2 /usr/lib/x86_64-linux-gnu/libXrender.so.1 "$DEPS/tk/"
+    cp "$DEPS/src-tk/license.terms" "$DEPS/tk/Tk-license.terms"
+    rm -rf "$DEPS/src-tcl" "$DEPS/src-tk"
+    mark tk "$TCLTK_VER"
+fi
+
 # ---- dav1d and FFmpeg (static, position independent: linked into the game's executable) ----
 P=$DEPS/ffmpeg
 if ! done_for ffmpeg "$FFMPEG_VER-$DAV1D_VER"; then
@@ -138,7 +165,7 @@ if ! done_for cpm "$VK_HEADERS-$SPIRV_HEADERS-$VMA"; then
 fi
 
 # ---- the licenses of what the AppImage carries (Python's and its modules' are in python/) ----
-if ! done_for licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER"; then
+if ! done_for licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER-$TCLTK_VER"; then
     L=$DEPS/licenses
     rm -rf "$L" && mkdir -p "$L"
     curl -fsSL -o "$L/LLVM-LICENSE.TXT" "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$LLVM_VER/llvm/LICENSE.TXT"
@@ -146,7 +173,10 @@ if ! done_for licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER"; then
     curl -fsSL -o "$L/FFmpeg-LICENSE.md" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$FFMPEG_VER/LICENSE.md"
     curl -fsSL -o "$L/dav1d-COPYING" "https://code.videolan.org/videolan/dav1d/-/raw/$DAV1D_VER/COPYING"
     cp "$DEPS/sdl2/LICENSE.txt" "$L/SDL2-LICENSE.txt"
-    mark licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER"
+    cp "$DEPS/tk/Tk-license.terms" "$L/Tk-license.terms"
+    cp /usr/share/doc/libxft2/copyright "$L/libXft-copyright"
+    cp /usr/share/doc/libxrender1/copyright "$L/libXrender-copyright"
+    mark licenses "$LLVM_VER-$FFMPEG_VER-$DAV1D_VER-$SDL_VER-$TCLTK_VER"
 fi
 
 # ---- appimagetool ----
