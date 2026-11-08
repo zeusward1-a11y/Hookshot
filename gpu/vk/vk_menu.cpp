@@ -197,7 +197,8 @@ Row rows[] = {
 constexpr int kCheatsRow = sizeof rows / sizeof rows[0] - 1;
 bool cheats_enabled = false;
 std::atomic<int> protect_hearts{-1};
-std::atomic<int> player_flight{0};
+// -1 disables the shortcut, 0 enables it on the ground, and 1 means flying.
+std::atomic<int> player_flight{-1};
 std::atomic<int> free_camera{0};
 std::atomic<int> cheat_action{0};
 int clock_hour = 12;
@@ -590,10 +591,10 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         char clock_text[12], quantity[12];
         snprintf(clock_text, sizeof clock_text, "%02d:00", clock_hour);
         snprintf(quantity, sizeof quantity, "%+d", pouch_delta);
-        const char* values[] = {tx_onoff(protect_hearts.load() == 1), tx_onoff(player_flight.load() == 1),
+        const char* values[] = {tx_onoff(protect_hearts.load() == 1), tx_onoff(player_flight.load() >= 0),
                                 "", "", clock_text, pouch_items[pouch_item], quantity, tx_onoff(free_camera.load())};
         const char* help[] = {"Protects Link's hearts. Hits can still knock him back.",
-            "Double-tap Jump to toggle. Hold Jump, R or Page Up to climb. L or Page Down descends.",
+            "Enable double-tap Jump for takeoff and landing. Hold Jump to climb or L to descend.",
             "Remember Link's position for this loaded scene.",
             "Teleport Link to the marked position in the current scene.",
             "Choose an hour with Left or Right. Enter sets the world clock.",
@@ -932,7 +933,10 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
 
 void menu_option_set(int id, int value) {
     if (id == HOS_OPT_CHEAT_FLIGHT) {
-        if (cheats_enabled) player_flight.store(value != 0, std::memory_order_relaxed);
+        if (cheats_enabled) {
+            int expected = value ? 0 : 1;
+            player_flight.compare_exchange_strong(expected, value != 0, std::memory_order_relaxed);
+        }
         return;
     }
     if (id != 7) return;
@@ -1048,8 +1052,8 @@ void menu_tick() {
                 changed = true;
             }
             if (cheat_selected < 2 && (press[3] || press[4] || press[7])) {
-                auto& setting = cheat_selected == 0 ? protect_hearts : player_flight;
-                setting.store(!setting.load());
+                if (cheat_selected == 0) protect_hearts.store(!protect_hearts.load());
+                else player_flight.store(player_flight.load() < 0 ? 0 : -1);
                 changed = true;
             }
             if (cheat_selected == 4 && (press[3] || press[4])) {

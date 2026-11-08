@@ -638,8 +638,9 @@ static int flight_jump_shortcut(uint64_t *buttons, int mode, int menu_open, int 
         if (first_press && now - first_press <= 300000000) {
             mode = !mode;
             rx_option_set(HOS_OPT_CHEAT_FLIGHT, mode);
+            mode = rx_option(HOS_OPT_CHEAT_FLIGHT, -1);
             first_press = 0;
-            consume_jump = !mode;
+            consume_jump = mode == 0;
         } else {
             first_press = now;
         }
