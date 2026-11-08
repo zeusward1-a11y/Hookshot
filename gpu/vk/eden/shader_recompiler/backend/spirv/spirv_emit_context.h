@@ -407,6 +407,12 @@ public:
     u32 mesh_map_bytes{};
     u32 mesh_primitive_base{}; ///< first word of the per-primitive groups
     std::vector<MeshLineTarget> mesh_vertex_targets;
+    // (hookshot) a vertex generic output and the components no vertex line writes: they get (0,0,0,1) as in the vertex stage
+    struct MeshDefault {
+        Id variable;
+        u32 missing;
+    };
+    std::vector<MeshDefault> mesh_vertex_defaults;
     std::vector<MeshLineTarget> mesh_primitive_targets;
     std::array<Id, 2> mesh_outputs_marker{};
     std::array<Id, 4> mesh_tasks_marker{};

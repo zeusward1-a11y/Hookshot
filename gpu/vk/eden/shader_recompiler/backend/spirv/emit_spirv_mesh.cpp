@@ -146,6 +146,14 @@ void MeshEpilogue(EmitContext& ctx) {
     for (u32 first = 0; first < mesh.max_vertices; first += threads) {
         const Id vertex{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         const auto copy = [&] {
+            for (const auto& d : ctx.mesh_vertex_defaults) {
+                for (u32 c = 0; c < 4; ++c) {
+                    if (d.missing & (1U << c)) {
+                        ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, d.variable, vertex, ctx.Const(c)),
+                                    ctx.Const(c == 3 ? 1.0f : 0.0f));
+                    }
+                }
+            }
             CopyLines(ctx, vertex, 0, vertex_lines, ctx.mesh_vertex_targets);
             if (convert_depth) {
                 ConvertDepth(ctx, vertex);
