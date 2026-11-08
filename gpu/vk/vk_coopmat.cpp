@@ -343,9 +343,10 @@ void software_multiplies(const char* why) {
 } // namespace
 
 void coopmat_init() {
-    // (amd-fix) NaN guard on float colour outputs for every card but NVIDIA (mma_layout.h frag_nan_guard)
-    Shader::Backend::SPIRV::frag_nan_guard = dev.props.vendorID != 0x10DE && !std::getenv("RX_VK_NO_NAN_GUARD");
-    if (Shader::Backend::SPIRV::frag_nan_guard) logf("vk: colour outputs NaN-guarded (not an NVIDIA card)");
+    // (amd-fix) NaN guard on float colour outputs (mma_layout.h frag_nan_guard), on every card since v2.0.6 as NX2navi's patch 0027
+    // has it: the neon plants were reported on NVIDIA cards too, and one NaN texel spreads through bloom and blur
+    Shader::Backend::SPIRV::frag_nan_guard = !std::getenv("RX_VK_NO_NAN_GUARD");
+    if (Shader::Backend::SPIRV::frag_nan_guard) logf("vk: colour outputs NaN-guarded");
     Shader::Backend::SPIRV::position_invariant = dev.props.vendorID != 0x10DE && !std::getenv("RX_VK_NO_INVARIANT");
     if (Shader::Backend::SPIRV::position_invariant) logf("vk: positions invariant (not an NVIDIA card)");
     // (hookshot) RX_VK_MMA_SOFTWARE=1: HMMA_nx2 in a shader function on subgroup shuffles, no cooperative matrices
