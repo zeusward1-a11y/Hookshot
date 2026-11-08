@@ -6,7 +6,6 @@ when an upload needs it: every user asks for it first and stops when it cannot b
 a floor, and the spare ones are counted out as well as in.
 python -I -B tests/test_mem_trim.py
 """
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,8 +42,12 @@ def main():
     need(begin.index("r.streams.resize(1)") < begin.index("r.si = 0"), "the streams given back are used after")
 
     tex = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
-    need(len(re.findall(r"if \(!bc_scratch_layout\(cmd(, [\w>.-]+)?\)\) return false;", tex)) == 2,
-         "a BC3 upload uses a scratch it did not ask for")
+    astc = block(tex, "bool upload_astc_gpu(")
+    copy = block(tex, "bool texture_copy_into_bc(")
+    need("if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;" in astc,
+         "an ASTC upload does not check scratch allocation with its resize mode")
+    need("if (!bc_scratch_layout(cmd, dst->bc_resized)) return false;" in copy,
+         "a BC3 copy does not check scratch allocation with its destination resize mode")
     need("bc_have = false" in block(tex, "void bc_scratch_idle("), "the scratch given back is still taken for made")
     need("dead.push_back" in block(tex, "void bc_scratch_idle("), "the scratch is freed with no wait for the GPU")
     need("total_bytes -= std::min(total_bytes, tex.bytes + tex.pad)" in tex, "a texture leaves the budget by its texels only")
