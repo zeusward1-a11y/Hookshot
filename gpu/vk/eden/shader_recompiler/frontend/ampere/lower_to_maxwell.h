@@ -1953,7 +1953,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(32, 8)} << 20) | (u64{insn.Bits(78, 2)} << 39));
             break;
         }
-        case 0x305: case 0xb05: case 0xd05: { // F2I NTZ, register/constant-buffer/uniform source
+        case 0x305: case 0x905: case 0xb05: case 0xd05: { // F2I NTZ, register/immediate/constant-buffer/uniform source
+            const bool immediate = opcode == 0x905;
             const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
             // F16 source: bit 72 signs the result as in the other forms, bits 60-61 pick H0/H1.
             const bool half = opcode == 0x305 && (mode & ~0x100U) == 0x0010f000;
@@ -1964,12 +1965,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // (hookshot) a negated or absolute register source (bits 63, 62), made first
             const bool source_mod = opcode == 0x305 && !half && (insn.words[1] & 0x3fffff00U) == 0;
             if ((!half && !small && !floor && !nearest && !ceil && (mode & ~0x10100U) != 0x0020f000) ||
-                (opcode != 0xb05 && !source_mod && (insn.words[1] & (half ? 0xefffff00U : 0xffffff00U))) ||
+                (opcode != 0xb05 && !immediate && !source_mod && (insn.words[1] & (half ? 0xefffff00U : 0xffffff00U))) ||
+                (immediate && insn.Bits(24, 8)) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
             const bool is_signed = insn.Bits(72, 1);
-            u32 source = opcode == 0xb05 ? materialize(2, 0, 252, false, false)
+            u32 source = immediate ? materialize(1, 0, 252, false, false)
+                       : opcode == 0xb05 ? materialize(2, 0, 252, false, false)
                        : opcode == 0xd05 ? uniform_register(insn.Bits(32, 8)) : insn.Bits(32, 8);
             if (source_mod && insn.Bits(62, 2)) source = materialize(0, insn.Bits(32, 8), 249, insn.Bits(62, 1), insn.Bits(63, 1));
             if (half) {
