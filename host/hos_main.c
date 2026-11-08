@@ -10,6 +10,8 @@
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
 #include "hos_paths.h"
+#include "../gpu/vk/vk_api.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -375,6 +377,348 @@ static void load_hookshot_env(void) {
     fclose(f);
 }
 
+int hos_oot_protect_hearts;
+
+int hos_oot_hearts_enabled(void) {
+    int rx_option(int id, int otherwise);
+    const int menu = rx_option(HOS_OPT_CHEAT_HEARTS, -1);
+    return menu < 0 ? hos_oot_protect_hearts : menu;
+}
+
+int hos_oot_is_player(Ctx *c, uint64_t actor) {
+    if (recomp_load64(c, actor) != 0x84b6c460ULL) return 0;
+    // Other actors share this vtable. The actor's resource record identifies Link.
+    const uint64_t resource = recomp_load64(c, actor + 16);
+    return resource && recomp_load32(c, resource + 88) == 0x79616c50 &&
+           recomp_load16(c, resource + 92) == 0x7265 &&
+           recomp_load8(c, resource + 94) == 0;
+}
+
+#ifdef _WIN32
+static void oot_edit_pouch(Ctx *c, int action) {
+    static const char *const items[] = {
+        "Item_DekuSeed", "Item_DekuNut", "Item_DekuStick", "Item_Bomb", "Item_Arrow_Normal"
+    };
+    const unsigned item = (unsigned)(action - 200) / 32;
+    const int delta = (action - 200) % 32 - 10;
+    if (item >= sizeof items / sizeof items[0] || !delta || delta < -10 || delta > 10) return;
+
+    const uint64_t pouch_singleton = recomp_load64(c, 0x84c9e0d0ULL);
+    const uint64_t state_singleton = recomp_load64(c, 0x84c9e2a8ULL);
+    const uint64_t actor_db = recomp_load64(c, 0x84eb6888ULL);
+    const uint64_t actor_info = recomp_load64(c, 0x84e8c060ULL);
+    A64Fn edit = a64_lookup(0x828d4a70ULL);
+    if (!edit || !pouch_singleton || !recomp_load64(c, pouch_singleton) ||
+        !state_singleton || !recomp_load64(c, state_singleton) || !actor_db || !actor_info) return;
+
+    // OneShotAddOrRemovePouchContent reads the event parameters through pointers.
+    const Ctx saved = *c;
+    const uint64_t event = c->x[31] - 0xa0;
+    memset(A64_PTR(event), 0, 0xa0);
+    memcpy(A64_PTR(event + 0x80), items[item], strlen(items[item]) + 1);
+    recomp_store64_sp(c, event + 0x20, event + 0x60);
+    recomp_store64_sp(c, event + 0x30, event + 0x70);
+    recomp_store64_sp(c, event + 0x38, event + 0x68);
+    recomp_store64_sp(c, event + 0x48, event + 0x74);
+    recomp_store64_sp(c, event + 0x50, event + 0x74);
+    recomp_store64_sp(c, event + 0x60, event + 0x80);
+    recomp_store64_sp(c, event + 0x68, 0x83f0a6d8ULL); // Script
+    recomp_store32_sp(c, event + 0x70, (uint32_t)delta);
+    c->x[31] = event;
+    c->x[0] = event;
+    edit(c);
+    const uint32_t result = recomp_load32(c, event + 0x18) >> 30;
+    *c = saved;
+    hos_log("cheats: pouch %s %+d (event status %u)", items[item], delta, result);
+}
+
+static void oot_set_time(Ctx *c, unsigned hour) {
+    // ExecuteWmSetTime passes seconds since midnight to the world manager.
+    const uint64_t singleton = recomp_load64(c, 0x84c9e898ULL);
+    const uint64_t world = singleton ? recomp_load64(c, singleton) : 0;
+    A64Fn set_time = a64_lookup(0x834722d0ULL);
+    if (!set_time || !world || !recomp_load64(c, world + 0x510)) {
+        hos_log("cheats: world clock unavailable");
+        return;
+    }
+    const Ctx saved = *c;
+    c->x[0] = world;
+    c->x[1] = hour * 3600;
+    set_time(c);
+    *c = saved;
+    hos_log("cheats: requested %02u:00", hour);
+}
+
+static uint64_t oot_gameplay_view(Ctx *c) {
+    const uint64_t singleton = recomp_load64(c, 0x84ca6bc0ULL);
+    const uint64_t manager = singleton ? recomp_load64(c, singleton) : 0;
+    const uint64_t cameras = manager && recomp_load32(c, manager + 32) ? recomp_load64(c, manager + 40) : 0;
+    const uint64_t camera = cameras ? recomp_load64(c, cameras) : 0;
+    return camera ? recomp_load64(c, camera + 120) : 0;
+}
+
+static float oot_load_float(Ctx *c, uint64_t addr) {
+    const uint32_t bits = recomp_load32(c, addr);
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static _Thread_local uint64_t flight_transform_controller;
+static _Thread_local uint64_t flight_pose_actor;
+static _Thread_local float flight_transform_yaw;
+
+static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
+    int rx_option(int id, int otherwise);
+    static uint64_t flying_actor, marked_actor, marked_controller;
+    static int64_t last_tick, last_player_tick;
+    static float target[3], velocity[3], mark[3], yaw;
+    const int flying = rx_option(HOS_OPT_CHEAT_FLIGHT, 0);
+    if (!flying) flying_actor = 0;
+    const int64_t now = hos_now_ns();
+    if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
+    last_player_tick = now;
+    const int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
+    if (action >= 200) {
+        oot_edit_pouch(c, action);
+    } else if (action >= 100 && action < 124) {
+        oot_set_time(c, action - 100);
+    }
+    if (!flying && action != 2 && action != 3) return;
+
+    // Follow OneShotPhysicsCctChangePosition to Link's controller.
+    const unsigned offsets[] = {80, 32, 16, 8};
+    uint64_t controller = components;
+    for (unsigned i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
+        controller = recomp_load64(c, controller + offsets[i]);
+        if (!controller) return;
+    }
+    const uint64_t vtable = recomp_load64(c, controller);
+    if (vtable != 0x84c54f10ULL || recomp_load64(c, vtable + 0xe8) != 0x806d2530ULL) return;
+    A64Fn change_position = a64_lookup(0x806d2530ULL);
+    if (!change_position) return;
+
+    if (action == 2) {
+        for (unsigned i = 0; i < 3; i++) {
+            const uint32_t bits = recomp_load32(c, actor + 796 + i * 4);
+            memcpy(&mark[i], &bits, sizeof bits);
+        }
+        marked_actor = actor;
+        marked_controller = controller;
+        hos_log("cheats: marked position %.2f %.2f %.2f", mark[0], mark[1], mark[2]);
+    }
+    const int returning = action == 3 && marked_controller == controller;
+    if (action == 3 && !returning) hos_log("cheats: no mark for this player controller");
+    if (!flying && !returning) return;
+    const int64_t elapsed = now - last_tick;
+    if (flying_actor != actor)
+        yaw = atan2f(oot_load_float(c, actor + 816), oot_load_float(c, actor + 840));
+    if (returning) {
+        memcpy(target, mark, sizeof target);
+        memset(velocity, 0, sizeof velocity);
+        flying_actor = flying ? actor : 0;
+    } else if (flying_actor != actor || elapsed < 0 || elapsed > 250000000) {
+        for (unsigned i = 0; i < 3; i++) target[i] = oot_load_float(c, actor + 796 + i * 4);
+        memset(velocity, 0, sizeof velocity);
+        flying_actor = actor;
+        last_tick = now;
+        return;
+    } else if (elapsed == 0) {
+        return;
+    }
+    last_tick = now;
+
+    DWORD foreground = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    if (!returning) {
+        const float dt = fminf((float)elapsed * 1e-9f, 0.05f);
+        float desired[3] = {0};
+        if (foreground == GetCurrentProcessId() && !rx_option(1, 0) && !rx_option(HOS_OPT_CHEAT_CAMERA, 0)) {
+            uint64_t hos_flight_input(void);
+            const uint64_t axes = hos_flight_input();
+            const float right = (int16_t)axes / 32767.0f, forward = (int16_t)(axes >> 16) / 32767.0f;
+            const int vertical = (GetAsyncKeyState(VK_PRIOR) < 0) - (GetAsyncKeyState(VK_NEXT) < 0);
+            const uint64_t view = oot_gameplay_view(c);
+            float rx = 1, rz = 0;
+            if (view && recomp_load64(c, view) == 0x84c18a88ULL) {
+                const float x = oot_load_float(c, view + 8), z = oot_load_float(c, view + 16);
+                const float length = hypotf(x, z);
+                if (length > 0.01f) rx = x / length, rz = z / length;
+            }
+            desired[0] = rx * right + rz * forward;
+            desired[1] = vertical ? vertical : (int16_t)(axes >> 32);
+            desired[2] = rz * right - rx * forward;
+        }
+        const float length = sqrtf(desired[0] * desired[0] + desired[1] * desired[1] + desired[2] * desired[2]);
+        const float speed = 4.0f / fmaxf(1.0f, length);
+        const float blend = 1.0f - expf(-12.0f * dt);
+        for (unsigned i = 0; i < 3; i++) {
+            velocity[i] += (desired[i] * speed - velocity[i]) * blend;
+            target[i] += velocity[i] * dt;
+        }
+        if (hypotf(desired[0], desired[2]) > 0.08f) {
+            const float delta = remainderf(atan2f(desired[0], desired[2]) - yaw, 6.28318531f);
+            yaw += fmaxf(-8.0f * dt, fminf(delta, 8.0f * dt));
+        }
+    }
+
+    const Ctx saved = *c;
+    const uint64_t arg = c->x[31] - 16;
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t bits;
+        memcpy(&bits, &target[i], sizeof bits);
+        recomp_store32_sp(c, arg + i * 4, bits);
+    }
+    recomp_store32_sp(c, arg + 12, 0);
+    c->x[31] = arg;
+    c->x[0] = controller;
+    c->x[1] = arg;
+    flight_transform_yaw = yaw;
+    flight_pose_actor = flying && !returning ? actor : 0;
+    flight_transform_controller = flying && !returning ? controller : 0;
+    change_position(c);
+    flight_transform_controller = 0;
+    *c = saved;
+    if (returning) hos_log("cheats: returned to %.2f %.2f %.2f", mark[0], mark[1], mark[2]);
+}
+#endif
+
+#ifdef _WIN32
+static void oot_write_flight_rotation(Ctx *c, uint64_t matrix) {
+    const float s = sinf(flight_transform_yaw), co = cosf(flight_transform_yaw);
+    const float rotation[3][3] = {{co, 0, s}, {0, 1, 0}, {-s, 0, co}};
+    for (unsigned row = 0; row < 3; row++) {
+        for (unsigned col = 0; col < 3; col++) {
+            uint32_t bits;
+            memcpy(&bits, &rotation[row][col], sizeof bits);
+            recomp_store32(c, matrix + row * 16 + col * 4, bits);
+        }
+    }
+}
+#endif
+
+void hos_oot_flight_rotation(Ctx *c, uint64_t controller, uint64_t matrix) {
+#ifdef _WIN32
+    if (flight_transform_controller == controller) oot_write_flight_rotation(c, matrix);
+#else
+    (void)c;
+    (void)controller;
+    (void)matrix;
+#endif
+}
+
+void hos_oot_flight_pose(Ctx *c, uint64_t actor, uint64_t matrix) {
+#ifdef _WIN32
+    if (flight_pose_actor == actor) {
+        flight_pose_actor = 0;
+        oot_write_flight_rotation(c, matrix);
+    }
+#else
+    (void)c;
+    (void)actor;
+    (void)matrix;
+#endif
+}
+
+void hos_oot_lift_player(Ctx *c, uint64_t actor) {
+#ifdef _WIN32
+    flight_pose_actor = 0;
+    if (recomp_load64(c, actor) != 0x84b45e18ULL) return;
+    const uint64_t components = recomp_load64(c, actor + 624);
+    const uint64_t movement = components ? recomp_load64(c, components + 800) : 0;
+    if (movement < HOS_HEAP_BASE + 0x1d50 || recomp_load64(c, movement + 24) != actor ||
+        !hos_oot_is_player(c, movement - 0x1d50)) return;
+
+    // Link can be updated by different guest workers on successive frames.
+    static SRWLOCK cheats_lock = SRWLOCK_INIT;
+    if (!TryAcquireSRWLockExclusive(&cheats_lock)) return;
+    oot_update_player_cheats(c, actor, components);
+    ReleaseSRWLockExclusive(&cheats_lock);
+#else
+    (void)c;
+    (void)actor;
+#endif
+}
+
+#ifdef _WIN32
+static void oot_build_free_view(Ctx *c, uint64_t view, uint64_t out) {
+    int rx_option(int id, int otherwise);
+    static uint64_t active_view;
+    static int64_t last_tick;
+    static double eye[3], yaw, pitch;
+    const int64_t now = hos_now_ns();
+    const int64_t elapsed = now - last_tick;
+
+    if (!view) {
+        active_view = 0;
+        return;
+    }
+    if (active_view != view || elapsed > 500000000) {
+        double target[3];
+        memcpy(eye, A64_PTR(view + 96), sizeof eye);
+        memcpy(target, A64_PTR(view + 120), sizeof target);
+        const double x = eye[0] - target[0], y = eye[1] - target[1], z = eye[2] - target[2];
+        yaw = atan2(x, z);
+        pitch = atan2(y, hypot(x, z));
+        active_view = view;
+        hos_log("cheats: free camera at %.2f %.2f %.2f", eye[0], eye[1], eye[2]);
+    }
+    last_tick = now;
+    DWORD foreground = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground);
+    const double dt = elapsed > 0 && elapsed < 100000000 ? (double)elapsed * 1e-9 : 0;
+    const int control = foreground == GetCurrentProcessId() && !rx_option(1, 0);
+    int height = 0;
+    uint64_t hos_free_camera_input(int *height);
+    const uint64_t input = control ? hos_free_camera_input(&height) : 0;
+    if (control) {
+        yaw -= 1.6 * dt * (int16_t)(input >> 32) / 32767.0;
+        pitch -= 1.2 * dt * (int16_t)(input >> 48) / 32767.0;
+        pitch = fmax(-1.55, fmin(1.55, pitch));
+    }
+    const double sy = sin(yaw), cy = cos(yaw), sp = sin(pitch), cp = cos(pitch);
+    const double axes[3][3] = {{cy, 0, -sy}, {-sp * sy, cp, -sp * cy}, {cp * sy, sp, cp * cy}};
+    if (control) {
+        const double step = dt * (GetAsyncKeyState(VK_CONTROL) < 0 ? 30.0 : 8.0);
+        const double right = (int16_t)input / 32767.0;
+        const double forward = (int16_t)(input >> 16) / 32767.0;
+        const int key_height = (GetAsyncKeyState(VK_PRIOR) < 0) - (GetAsyncKeyState(VK_NEXT) < 0);
+        eye[1] += step * (key_height ? key_height : height);
+        for (int i = 0; i < 3; i++)
+            eye[i] += step * (right * axes[0][i] - forward * axes[2][i]);
+    }
+    for (int row = 0; row < 3; row++) {
+        const double *axis = axes[row];
+        const float values[4] = {(float)axis[0], (float)axis[1], (float)axis[2],
+            (float)-(axis[0] * eye[0] + axis[1] * eye[1] + axis[2] * eye[2])};
+        for (int col = 0; col < 4; col++) {
+            uint32_t bits;
+            memcpy(&bits, &values[col], sizeof bits);
+            recomp_store32(c, out + (row * 4 + col) * 4, bits);
+        }
+    }
+}
+#endif
+
+void hos_oot_free_view(Ctx *c, uint64_t view) {
+#ifdef _WIN32
+    int rx_option(int id, int otherwise);
+    if (!view || recomp_load64(c, view) != 0x84c18a88ULL) return;
+
+    // Camera zero supplies the gameplay view. The same matrix routine also serves other cameras.
+    if (oot_gameplay_view(c) != view) return;
+
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    const int enabled = rx_option(HOS_OPT_CHEAT_CAMERA, 0);
+    oot_build_free_view(c, enabled ? view : 0, view + 8);
+    ReleaseSRWLockExclusive(&lock);
+#else
+    (void)c;
+    (void)view;
+#endif
+}
+
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
 /* (nx2/oot_wide.py) read by the widescreen patches in the game's code; 0: the game's own 16:9 */
 volatile uint64_t hos_wide_out, hos_wide_scene;
@@ -401,6 +745,8 @@ static int game_main(int argc, char **argv) {
 #endif
     occlusion_switch();
 #ifdef _WIN32
+    const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
+    hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
     {   // (the whole process, not only the window's thread: the renderer asks the window's size from its own, and on a 4K screen at 150%
         // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. Hookshot issues 15, 18, 20)
         typedef BOOL(WINAPI * SetAware)(void *);

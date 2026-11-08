@@ -608,6 +608,19 @@ static int bound_down(int i, int mouse) {
     return 0;
 }
 
+static uint64_t flight_input;
+static uint64_t free_camera_axes;
+static int free_camera_height;
+
+uint64_t hos_flight_input(void) {
+    return __atomic_load_n(&flight_input, __ATOMIC_RELAXED);
+}
+
+uint64_t hos_free_camera_input(int *height) {
+    *height = __atomic_load_n(&free_camera_height, __ATOMIC_RELAXED);
+    return __atomic_load_n(&free_camera_axes, __ATOMIC_RELAXED);
+}
+
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
@@ -713,7 +726,28 @@ static void npad_states(Ctx *c) {
                     (unsigned long long)c->x[30]);
         }
     }
-    if (connected) read_input(&buttons, stick);
+    if (connected) {
+        read_input(&buttons, stick);
+        uint64_t axes = 0;
+        uint64_t flight = 0;
+        int height = 0;
+        if (rx_option(HOS_OPT_CHEAT_CAMERA, 0) && !rx_option(1, 0)) {
+            for (int i = 0; i < 4; i++) axes |= (uint64_t)(uint16_t)stick[i] << (16 * i);
+            height = (int)(buttons >> B_R & 1) - (int)(buttons >> B_L & 1);
+            memset(stick, 0, sizeof stick);
+            buttons &= ~((1ULL << B_L) | (1ULL << B_R));
+        } else if (rx_option(HOS_OPT_CHEAT_FLIGHT, 0) && !rx_option(1, 0)) {
+            const uint64_t climb = (1ULL << B_B) | (1ULL << B_R);
+            const int vertical = !!(buttons & climb) - (int)(buttons >> B_L & 1);
+            flight = (uint16_t)stick[0] | (uint64_t)(uint16_t)stick[1] << 16 |
+                     (uint64_t)(uint16_t)vertical << 32;
+            stick[0] = stick[1] = 0;
+            buttons &= ~(climb | (1ULL << B_L));
+        }
+        __atomic_store_n(&flight_input, flight, __ATOMIC_RELAXED);
+        __atomic_store_n(&free_camera_axes, axes, __ATOMIC_RELAXED);
+        __atomic_store_n(&free_camera_height, height, __ATOMIC_RELAXED);
+    }
     uint64_t hos_title_input(uint64_t buttons);   /* totk_title.c: the title menu's credits entries */
     if (connected) buttons = hos_title_input(buttons);
     uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */

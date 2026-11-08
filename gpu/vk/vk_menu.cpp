@@ -191,7 +191,22 @@ Row rows[] = {
      "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
+    {TAB_GAMEPLAY, "Cheats", nullptr, 0, 0, 0, nullptr,
+     "Open the private gameplay tools."},
 };
+constexpr int kCheatsRow = sizeof rows / sizeof rows[0] - 1;
+bool cheats_enabled = false;
+std::atomic<int> protect_hearts{-1};
+std::atomic<int> player_flight{0};
+std::atomic<int> free_camera{0};
+std::atomic<int> cheat_action{0};
+int clock_hour = 12;
+int pouch_item = 0;
+int pouch_delta = 1;
+int cheat_selected = 0;
+constexpr const char* pouch_items[] = {"Deku Seeds", "Deku Nuts", "Deku Sticks", "Bombs", "Arrows"};
+constexpr int kPouchItems = sizeof pouch_items / sizeof pouch_items[0];
+constexpr int kCheatRows = 8;
 constexpr int kRows = sizeof rows / sizeof rows[0];
 constexpr int kMenuWidth = 480;   // (at a scale of 1: 720 lines)
 
@@ -200,7 +215,7 @@ int tab_selected[TAB_COUNT] = {0, 0, 0};
 
 int tab_row_count(int t) {
     int c = 0;
-    for (int i = 0; i < kRows; i++) if (rows[i].tab == (MenuTab)t) c++;
+    for (int i = 0; i < kRows; i++) if (rows[i].tab == (MenuTab)t && (i != kCheatsRow || cheats_enabled)) c++;
     return c;
 }
 /// The most rows a tab has: the menu keeps that height whichever tab is shown
@@ -213,7 +228,7 @@ int max_tab_rows() {
 int tab_row_to_global(int t, int local_idx) {
     int count = 0;
     for (int i = 0; i < kRows; i++) {
-        if (rows[i].tab == (MenuTab)t) {
+        if (rows[i].tab == (MenuTab)t && (i != kCheatsRow || cheats_enabled)) {
             if (count == local_idx) return i;
             count++;
         }
@@ -504,11 +519,12 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT title = font(20 * s, FW_SEMIBOLD), body = font(16 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, title);
     SetTextColor(dc, RGB(236, 240, 236));
-    TextOutA(dc, 16 * s, 12 * s, "Hookshot", 8);
+    const char* heading = page == 2 ? "Cheats" : "Hookshot";
+    TextOutA(dc, 16 * s, 12 * s, heading, (int)strlen(heading));
     {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
         // line would run into the title)
         SIZE tsz{};
-        GetTextExtentPoint32A(dc, "Hookshot", 8, &tsz);
+        GetTextExtentPoint32A(dc, heading, (int)strlen(heading), &tsz);
         HFONT small = font(12 * s, FW_NORMAL);
         SelectObject(dc, small);
         SetTextColor(dc, RGB(140, 150, 144));
@@ -563,6 +579,41 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         const char* hint2 = "Gamepad: D-pad moves, bottom button binds, right one goes back";
         TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 6 * s, hint, (int)strlen(hint));
         TextOutA(dc, 16 * s, top + (kControls + 1) * rh + 26 * s, hint2, (int)strlen(hint2));
+        SelectObject(dc, old);
+        DeleteObject(title);
+        DeleteObject(body);
+        return;
+    }
+    if (page == 2) {
+        const char* labels[] = {"Heart protection", "No-clip flight", "Mark position",
+                                "Return to mark", "Set time", "Inventory item", "Change quantity", "Free camera"};
+        char clock_text[12], quantity[12];
+        snprintf(clock_text, sizeof clock_text, "%02d:00", clock_hour);
+        snprintf(quantity, sizeof quantity, "%+d", pouch_delta);
+        const char* values[] = {tx_onoff(protect_hearts.load() == 1), tx_onoff(player_flight.load() == 1),
+                                "", "", clock_text, pouch_items[pouch_item], quantity, tx_onoff(free_camera.load())};
+        const char* help[] = {"Protects Link's hearts. Hits can still knock him back.",
+            "Move relative to the camera. Jump, R or Page Up climbs. L or Page Down descends.",
+            "Remember Link's position for this loaded scene.",
+            "Teleport Link to the marked position in the current scene.",
+            "Choose an hour with Left or Right. Enter sets the world clock.",
+            "Choose a consumable with Left or Right.",
+            "Choose how many to add or remove. Enter applies the change.",
+            "Move and look with your usual controls. Page Up / Page Down or R / L changes height."};
+        for (int i = 0; i < kCheatRows; i++) {
+            const int y = (44 + i * 28) * s;
+            if (i == cheat_selected) fill(dc, 8 * s, y, (int)w - 16 * s, 28 * s, RGB(44, 72, 54));
+            SetTextColor(dc, i == cheat_selected ? RGB(255, 255, 255) : RGB(196, 204, 198));
+            TextOutA(dc, 16 * s, y + 4 * s, labels[i], (int)strlen(labels[i]));
+            const char* value = values[i];
+            SIZE size{};
+            GetTextExtentPoint32A(dc, value, (int)strlen(value), &size);
+            TextOutA(dc, (int)w - 16 * s - size.cx, y + 4 * s, value, (int)strlen(value));
+        }
+        SetTextColor(dc, RGB(176, 186, 180));
+        wrap_help(dc, help[cheat_selected], (int)w - 32 * s, 16 * s, (54 + kCheatRows * 28) * s, true);
+        const char* hint = "Enter applies   Esc goes back";
+        TextOutA(dc, 16 * s, (105 + kCheatRows * 28) * s, hint, (int)strlen(hint));
         SelectObject(dc, old);
         DeleteObject(title);
         DeleteObject(body);
@@ -716,6 +767,10 @@ int measure_help(int s) {
     return most;
 }
 void redraw_menu(int s) {
+    if (page == 2) {
+        gdi_draw(menu_bmp, kMenuWidth * s, (136u + kCheatRows * 28u) * s, paint_menu, s);
+        return;
+    }
     if (page == 1) {
         gdi_draw(menu_bmp, 600u * s, (uint32_t)((64 + (kControls + 1) * 24 + 52) * s), paint_menu, s);
         return;
@@ -768,6 +823,12 @@ void menu_init() {
     if (done) return;
     done = true;
     bool has_options = false;
+    const char* cheats = getenv("HOS_OOT_CHEATS");
+    cheats_enabled = cheats && !strcmp(cheats, "1");
+    if (cheats_enabled) {
+        const char* hearts = getenv("HOS_OOT_PROTECT_HEARTS");
+        protect_hearts.store(hearts && !strcmp(hearts, "1"));
+    }
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
         has_options = true;
         char line[80];
@@ -820,6 +881,10 @@ void menu_set_gpu_count(int count) {
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
+int menu_heart_protection() { return protect_hearts.load(std::memory_order_relaxed); }
+int menu_player_flight() { return player_flight.load(std::memory_order_relaxed); }
+int menu_free_camera() { return free_camera.load(std::memory_order_relaxed); }
+int menu_take_cheat_action() { return cheat_action.exchange(0, std::memory_order_relaxed); }
 
 void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
@@ -885,7 +950,8 @@ void menu_tick() {
     bool press[K_N] = {};
     for (int i = 0; i < K_N; i++) {
         const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-        press[i] = down && !held[i];
+        const bool queued = host && host->take_key_press && host->take_key_press(keys[i]);
+        press[i] = host && host->take_key_press ? mine && queued : down && !held[i];
         held[i] = down;
     }
     // (hookshot) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows,
@@ -970,6 +1036,44 @@ void menu_tick() {
             }
         }
         if (changed) redraw_menu(scale);
+    } else if (open_now.load() && page == 2) {
+        if (press[5]) page = 0, changed = true;
+        else {
+            if (press[1] || press[2]) {
+                cheat_selected = (cheat_selected + kCheatRows + (press[2] ? 1 : -1)) % kCheatRows;
+                changed = true;
+            }
+            if (cheat_selected < 2 && (press[3] || press[4] || press[7])) {
+                auto& setting = cheat_selected == 0 ? protect_hearts : player_flight;
+                setting.store(!setting.load());
+                changed = true;
+            }
+            if (cheat_selected == 4 && (press[3] || press[4])) {
+                clock_hour = (clock_hour + (press[4] ? 1 : 23)) % 24;
+                changed = true;
+            }
+            if (cheat_selected == 5 && (press[3] || press[4])) {
+                pouch_item = (pouch_item + kPouchItems + (press[4] ? 1 : -1)) % kPouchItems;
+                changed = true;
+            }
+            if (cheat_selected == 6 && (press[3] || press[4])) {
+                const int step = press[4] ? 1 : -1;
+                pouch_delta = std::clamp(pouch_delta + step, -10, 10);
+                if (!pouch_delta) pouch_delta = step;
+                changed = true;
+            }
+            if (press[7] && cheat_selected >= 2 && cheat_selected <= 4) {
+                cheat_action.store(cheat_selected == 4 ? 100 + clock_hour : cheat_selected);
+            }
+            if (press[7] && cheat_selected == 6) {
+                cheat_action.store(200 + pouch_item * 32 + pouch_delta + 10);
+            }
+            if (press[7] && cheat_selected == 7) {
+                free_camera.store(!free_camera.load());
+                changed = true;
+            }
+        }
+        if (changed) redraw_menu(scale);
     } else if (open_now.load()) {
         if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab)
@@ -980,7 +1084,8 @@ void menu_tick() {
         if (press[1]) selected = (selected + tab_count - 1) % tab_count, changed = true;
         if (press[2]) selected = (selected + 1) % tab_count, changed = true;
         Row& r = rows[tab_row_to_global(cur_tab, selected)];
-        if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
+        if (press[7] && &r == &rows[kCheatsRow]) page = 2, changed = true;
+        else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
             int v = *r.value + (press[4] ? r.step : -r.step);
