@@ -102,6 +102,13 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER:
         return 0;
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_SCREENSAVE && !(wp & SCF_ISSECURE) &&
+            renderer && GetForegroundWindow() == w && !IsIconic(w)) {
+            BOOL secure = TRUE;   /* unknown or protected policy keeps Windows' normal handling */
+            if (SystemParametersInfoA(SPI_GETSCREENSAVESECURE, 0, &secure, 0) && !secure) return 0;
+        }
+        break;
     case WM_INPUT: {
         RAWINPUT ri;
         UINT size = sizeof ri;
