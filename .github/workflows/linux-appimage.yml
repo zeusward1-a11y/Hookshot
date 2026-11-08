@@ -1,27 +1,29 @@
 # The Linux AppImage (x86_64): Hookshot Builder with the compiler, Python, libraries and the Vulkan back end it builds the
 # game with on the player's PC (scripts/linux/deps.sh, scripts/linux/appimage.sh). No game data is involved.
 # Built in Ubuntu 22.04, the oldest system it is for (glibc 2.35). A workflow artifact on every run; on a tag, also an
-# asset of that tag's release.
+# asset of that tag's release (scripts/release_upload.sh, shared with the Windows builder workflow).
 name: Linux AppImage
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['*']
   pull_request:
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: linux-appimage-${{ github.ref }}
-  cancel-in-progress: true
+  # (a pull request's older run is cancelled; a push's or a tag's never is)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   appimage:
     # (builder-parts holds the installer's parts: no AppImage there, and it must never be made "latest")
-    if: github.ref_name != 'builder-parts'
+    if: github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts'
     runs-on: ubuntu-latest
     container: ubuntu:22.04
-    timeout-minutes: 150
+    # (about 4 minutes with the dependencies cached; building them all takes longer)
+    timeout-minutes: 45
     steps:
       - name: System packages
         env:
@@ -36,16 +38,17 @@ jobs:
             build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
             libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
-            libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev
+            libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build-linux/deps
           key: linux-deps-${{ hashFiles('scripts/linux/deps.sh') }}
@@ -56,53 +59,68 @@ jobs:
         run: scripts/linux/deps.sh
 
       # work/: the lists and the play profile made on the development PC (addresses and counts, no game code). When the
-      # repository does not carry them, the ones in the latest release's HookshotBuilder.zip are used; without either
-      # the game is built all the same, a little slower in play.
+      # repository does not carry them, the ones in the latest release's app part (named by its hookshot-setup.txt) are
+      # used; without either the game is built all the same, a little slower in play.
+      # (not this tag's own release: the Windows builder workflow can make it before this step runs. A fork with no release
+      # takes upstream's. Downloads are retried: GitHub answers 504 now and then)
       - name: Play profile
         env:
           GH_TOKEN: ${{ github.token }}
+          SKIP_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: |
           if [ -f work/hot_order.txt ]; then echo "work/ is in the repository"; exit 0; fi
-          # (releases now hold HookshotBuilder.exe and hookshot-setup.txt: the profile is in the app part the list names; older ones
-          # hold HookshotBuilder.zip)
-          # (GitHub answers 504 now and then: each download is retried (curl retries 5xx and timeouts, not a 404 such as a fork with no
-          # release), and a failed one only leaves the profile out)
-          curl() { command curl --retry 5 --retry-delay 10 "$@"; }
-          latest=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/latest") || true
-          list=$(printf '%s' "$latest" | python3 -c 'import json,sys; print(next((a["browser_download_url"] for a in json.loads(sys.stdin.read() or "{}").get("assets", []) if a["name"] == "hookshot-setup.txt"), ""))') || true
-          if [ -n "$list" ]; then
-            app=$(curl -fsSL "$list" | awk '$1 == "part" && $7 ~ /HookshotBuilder-app-/ {print $7; exit}')
-            [ -n "$app" ] && { curl -fsSL -o /tmp/builder.zip "$app" || rm -f /tmp/builder.zip; }
-          fi
-          if [ ! -f /tmp/builder.zip ]; then
-            url=$(printf '%s' "$latest" | python3 -c 'import json,sys; print(next((a["url"] for a in json.loads(sys.stdin.read() or "{}").get("assets", []) if a["name"] == "HookshotBuilder.zip"), ""))') || true
-            if [ -z "$url" ]; then echo "no builder in the latest release: built without the profile"; exit 0; fi
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" -o /tmp/builder.zip "$url" ||
-              { echo "the builder did not download: built without the profile"; exit 0; }
-          fi
-          unzip -q -o /tmp/builder.zip 'HookshotBuilder/tools/work/*' -d /tmp/builder || true
-          mkdir -p work/image
-          for f in hot_funcs.txt hot_order.txt hookshot_pieces.prof image/chunks.txt; do
-            [ -f "/tmp/builder/HookshotBuilder/tools/work/$f" ] && cp "/tmp/builder/HookshotBuilder/tools/work/$f" "work/$f"
-          done
+          python3 -I scripts/release_parts.py previous /tmp/setup.txt --repo "$GITHUB_REPOSITORY" --repo NotRexed/Hookshot \
+            --skip-tag "$SKIP_TAG" ||
+            { echo "no release with a setup list: built without the profile"; exit 0; }
+          python3 -I scripts/release_parts.py profile /tmp/setup.txt work ||
+            { echo "the profile did not download: built without it"; exit 0; }
           ls -la work work/image
 
       - name: AppImage
         run: scripts/linux/appimage.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Hookshot-linux-x86_64
           path: build-linux/*.AppImage
           if-no-files-found: error
 
-      - name: Release asset
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      # (a tag's update parts, for the release job: scripts/linux/make_parts.py. Not on other runs: about 240 MB)
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          files: build-linux/*.AppImage
-          generate_release_notes: true
-          # (a release candidate, v0.2.0-rc.1, is a prerelease and never "latest". Only -rc: any '-' made new-installer a
-          # prerelease, and the latest release stayed the one before it)
-          prerelease: ${{ contains(github.ref_name, '-rc') }}
-          make_latest: ${{ !contains(github.ref_name, '-rc') }}
+          name: Hookshot-linux-parts
+          path: build-linux/parts/
+          if-no-files-found: error
+
+  release:
+    name: Release asset
+    if: startsWith(github.ref, 'refs/tags/') && github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts'
+    needs: appimage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Hookshot-linux-x86_64
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: Hookshot-linux-parts
+          path: dist/parts
+      # (the parts to the linux-parts release, which is never "latest"; a part already there is not uploaded again)
+      - name: Update parts
+        run: scripts/linux/publish_parts.sh dist/parts
+      # (the release made here or by the Windows builder workflow, whichever is first; a -rc tag is a prerelease and
+      # never "latest")
+      - name: AppImage to the release
+        run: scripts/release_upload.sh "$GITHUB_REF_NAME" dist/*.AppImage dist/parts/hookshot-linux.txt
