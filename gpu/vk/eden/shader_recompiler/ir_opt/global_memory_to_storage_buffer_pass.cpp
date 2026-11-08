@@ -1295,6 +1295,7 @@ bool MixesLoadedPointer(const IR::Value& value) {
 }
 
 thread_local bool g_follow_stage = false;   // (hookshot: the program being translated is compute, where the page table is)
+thread_local bool g_graphics_stage = false;   // (sharkiix: the program being translated is a geometry stage: vertex, tessellation, geometry, task, mesh)
 
 /// Collects the storage buffer used by a global memory instruction and the instruction itself
 void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, Environment& env,
@@ -1466,6 +1467,17 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",
                     storage_buffer->index, storage_buffer->offset);
     }
+    {   // (sharkiix, from BernabeCR93 in upstream issue 667) A graphics stage's address tracked to another constant buffer than
+        // c0 while part of it comes from memory: the far-foliage and mesh programs (95db514a35353e28, d905f52b7517c681,
+        // 51183fe750d5d0c8...) took float constants for a buffer address ("storage buffer NOT bound (reads zeros)", c5+0x60),
+        // read zeros and drew the plants without colour (white/sky-blue "mirror" ferns, glowing flowers). Left to the run-time
+        // search. RX_VK_NO_CBUF_LOAD_RULE=1: off
+        static const bool cbuf_load_rule{std::getenv("RX_VK_NO_CBUF_LOAD_RULE") == nullptr};
+        if (cbuf_load_rule && storage_buffer->index != 0 && g_graphics_stage && Origins(inst.Arg(0)).load) {
+            leave_global();
+            return;
+        }
+    }
     if (split_fallback && origins.split) {
         // (Lichii #410, Duck912, adapted) The tracked pointer is one side of a select or phi whose other side is a pointer
         // loaded from memory: bound too, so that the run-time search finds the accesses through it in every stage (the
@@ -1626,6 +1638,8 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // (hookshot)
     static const bool no_mesh{std::getenv("RX_VK_FOLLOW_MESH") == nullptr};
     g_follow_stage = program.stage == Stage::Compute || (!no_mesh && (program.stage == Stage::Task || program.stage == Stage::Mesh));
+    // (geometry stages only: with the fragment stage too, the sky drew black rectangles and the lighting went too bright at the castle)
+    g_graphics_stage = program.stage != Stage::Compute && program.stage != Stage::Fragment;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     const bool pairing{!GmLegacy()};
     std::optional<TrackingConditions> conditions;
