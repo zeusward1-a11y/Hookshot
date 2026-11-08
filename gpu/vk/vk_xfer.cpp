@@ -136,7 +136,8 @@ bool buffer_side(const NvnState& st, const Sub& s, uint64_t addr, uint64_t& size
         warn(3, "copy row stride does not fit the level's blocks: skipped");
         return false;
     }
-    size = row * hb * s.layers * s.d;
+    // The last row ends at its last block: its trailing stride padding is not accessed by Vulkan.
+    size = row * ((uint64_t)hb * s.layers * s.d - 1) + (uint64_t)wb * s.bpb;
     span = gpu_buffer_bind(addr, size, written);
     if (!addr || !span) {
         warn(3, "copy buffer is not one mapped pool span: skipped");
