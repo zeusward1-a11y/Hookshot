@@ -5564,6 +5564,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         ensure_layout(p);
         if (p.compute) computes.push_back(&p);
     });
+    const double read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     const size_t total = notes.size() + computes.size();
     // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
     // 99%", Discord 11-08) goes on to the game after PRE_STALL_S seconds with no progress, the stragglers left running; it is
@@ -5646,8 +5647,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         for (std::thread& t : threads) t.join();
         delete pre;
     }
-    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, graphics_n, computes_n,
-         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms (%.0f ms of it the caches opened, the notes "
+         "and programs read)", programs_n, graphics_n, computes_n,
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), read_ms);
 }
 
 // (hookshot) The pipelines the notes predict for the programs no note names (vk_predict.cpp), after a prepare that prepared: each built
