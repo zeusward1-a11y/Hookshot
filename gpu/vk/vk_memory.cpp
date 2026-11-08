@@ -1880,6 +1880,14 @@ void cpu_words_merge() {   // (holding cpu_words_mu)
     if (cpu_words_new.empty()) return;
     std::sort(cpu_words_new.begin(), cpu_words_new.end());
     cpu_words_new.erase(std::unique(cpu_words_new.begin(), cpu_words_new.end()), cpu_words_new.end());
+    // (the words already kept left out first: they are the same report words every frame, and merging them in again was a
+    // whole pass over the sorted vector and its temporary buffer on every write-back, ~5% of the replay thread in a heavy
+    // Kokiri view, 11-08)
+    if (!cpu_words.empty())
+        cpu_words_new.erase(std::remove_if(cpu_words_new.begin(), cpu_words_new.end(),
+                                           [](uint64_t w) { return std::binary_search(cpu_words.begin(), cpu_words.end(), w); }),
+                            cpu_words_new.end());
+    if (cpu_words_new.empty()) return;
     const size_t mid = cpu_words.size();
     cpu_words.insert(cpu_words.end(), cpu_words_new.begin(), cpu_words_new.end());
     std::inplace_merge(cpu_words.begin(), cpu_words.begin() + (ptrdiff_t)mid, cpu_words.end());
