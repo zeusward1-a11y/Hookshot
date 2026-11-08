@@ -2,7 +2,8 @@
 
 The parser, LIVE reader, input routing and Npad writer are extracted unmodified from production. Clock,
 foreground-window, keyboard, mouse and pad APIs are fakes; no real device, desktop or game is accessed.
-Each case starts a fresh process because production caches environment settings.
+Each case starts a fresh process because production caches environment settings. Frame-clock cases retain holds
+through a seven-second wall pause, test native-frame boundaries/live offsets/slot reuse, and keep default/0/empty controls.
 
 Controllers counted only while the game's window was in front, so a game streamed from a screen of its own (Sunshine
 and Moonlight), or left running behind another window, ignored the pad. The Insert menu's "Controller in background"
@@ -20,7 +21,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("foreground", "script-background", "headless", "noactivate", "live-background",
-         "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off")
+         "no-script-background", "exclusive-foreground", "exclusive-background", "pads-env", "pads-menu", "pads-off",
+         "frame-hold", "live-frame", "reuse-frame", "wall", "zero", "empty")
 
 
 def block(text, marker):
@@ -58,6 +60,7 @@ def main():
 
     api = (ROOT / "gpu/vk/vk_api.h").read_text(encoding="utf-8")
     constants = block(hid, "enum { B_A") + ";\n" + block(api, "enum { HOS_SW_A") + ";\n"
+    constants += block(api, "enum { HOS_KEY_MOVE_UP") + ";\n"   # (the keys-only controls)
     for name in ("STATE_SIZE", "NPAD_NO1", "ATTR_CONNECTED"):
         matches = re.findall(r"^#define " + name + r"\s+[^\n]+", hid, re.M)
         assert len(matches) == 1, name
@@ -67,7 +70,11 @@ def main():
     end = hid.index(script) + len(script)
     actual = "\n".join((block(hid, "static int key("), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end], block(hid, "static void stick_max("),
-        block(hid, "static int pads_in_background("), read, block(hid, "static void npad_states(")))
+        block(hid, "static int pads_in_background("),
+        # (the bound keys' helpers read_input calls: a mouse button counts only while the mouse is captured)
+        block(hid, "static int mouse_vk_slot("), re.search(r"^static int mouse_armed\[5\];", hid, re.M).group(0),
+        block(hid, "static void mouse_buttons_arm("), block(hid, "static int bound_down("),
+        read, block(hid, "static void npad_states(")))
     glue = (ROOT / "host/mkw_glue.c").read_text(encoding="utf-8")
     actual += "\n" + "\n".join(block(glue, "uint64_t " + name + "(")
                                   for name in ("hos_title_input", "hos_frame_step_buttons"))
@@ -94,9 +101,13 @@ def main():
              "-I" + str(folder), str(ROOT / "tests/input_background_test.c"), "-o", str(exe)])
         for case in ((a.case,) if a.case else CASES):
             case_env = dict(env)
-            if case not in ("live-background", "no-script-background"):
+            if case not in ("live-background", "no-script-background", "live-frame", "reuse-frame"):
                 case_env["HOS_INPUT_SCRIPT"] = "0:A+LUP/200"
-            if case.startswith("exclusive-"):
+            if case in ("frame-hold", "live-frame", "reuse-frame"):
+                case_env["HOS_INPUT_FRAME_CLOCK"] = "1"
+            elif case in ("zero", "empty"):
+                case_env["HOS_INPUT_FRAME_CLOCK"] = "0" if case == "zero" else ""
+            if case.startswith("exclusive-") or case in ("frame-hold", "wall", "zero", "empty"):
                 case_env["HOS_INPUT_EXCLUSIVE"] = "1"
             if case in ("pads-env", "pads-off"):
                 case_env["HOS_INPUT_BACKGROUND"] = "1" if case == "pads-env" else "0"
@@ -104,8 +115,8 @@ def main():
                 case_env["HOS_HEADLESS"] = "1"
             if case == "noactivate":
                 case_env["HOS_WINDOW_NOACTIVATE"] = "1"
-            if case == "live-background":
-                live = folder / "live.txt"
+            if case in ("live-background", "live-frame"):
+                live = folder / (case + ".txt")
                 live.write_bytes(b"")
                 case_env["HOS_INPUT_LIVE"] = str(live)
             run([str(exe), case], case_env)

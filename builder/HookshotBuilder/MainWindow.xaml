@@ -126,6 +126,15 @@
                 <TextBox x:Name="OutPath" Style="{StaticResource Path}" TextChanged="PathsChanged"/>
                 <Button x:Name="ChangeButton" Grid.Column="1" Style="{StaticResource Quiet}" Margin="10,0,0,0" Content="Change" Click="BrowseOut"/>
               </Grid>
+              <!-- the build files: how much, where (Storage.cs), and choosing the place -->
+              <Grid Margin="0,8,0,0">
+                <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock x:Name="WorkNote" Style="{StaticResource Note}" FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                <Button x:Name="WorkChange" Grid.Column="1" Style="{StaticResource LinkButton}" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"
+                        Content="Change" Click="BrowseWork"/>
+                <Button x:Name="WorkReset" Grid.Column="2" Style="{StaticResource LinkButton}" FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center"
+                        Content="Default" Click="ResetWork"/>
+              </Grid>
             </StackPanel>
             <StackPanel Grid.Column="2">
               <TextBlock x:Name="LanguageLabel" Style="{StaticResource Label}" Text="GAME LANGUAGE"/>
@@ -230,6 +239,14 @@
           <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,22,0,0">
             <CheckBox x:Name="DesktopTick" Style="{StaticResource Tick}" Content="Desktop shortcut" IsChecked="True" Click="ShortcutsChanged"/>
             <CheckBox x:Name="StartTick" Style="{StaticResource Tick}" Content="Start menu entry" IsChecked="True" Margin="18,0,0,0" Click="ShortcutsChanged"/>
+          </StackPanel>
+          <!-- what the builder keeps on this PC for quick updates (Storage.cs), and letting it go -->
+          <StackPanel x:Name="StorageRow" Visibility="Collapsed" HorizontalAlignment="Center" Margin="0,26,0,0" MaxWidth="560">
+            <TextBlock x:Name="StorageNote" Style="{StaticResource Note}" TextAlignment="Center" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,8,0,0">
+              <Button x:Name="FreeButton" Style="{StaticResource LinkButton}" Content="Free up space" Click="FreeSpace"/>
+              <Button Style="{StaticResource LinkButton}" Content="Show folder" Margin="18,0,0,0" Click="ShowStorage"/>
+            </StackPanel>
           </StackPanel>
         </StackPanel>
 

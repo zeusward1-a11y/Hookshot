@@ -28,7 +28,7 @@ out_of() {
 }
 
 ready() {
-    [ -n "${1:-}" ] && [ -f "$1/hookshot" ] && [ -f "$1/image.bin" ]
+    [ -n "${1:-}" ] && [ -f "$1/image.bin" ] && { [ -x "$1/bin/hookshot" ] || [ -f "$1/hookshot" ]; }
 }
 
 folder=${1:-}
@@ -60,4 +60,9 @@ for name in $names; do
 done
 
 cd "$folder"
-exec "$folder/hookshot"
+# (--play already chose Play. The game's own update question stays for a bin/hookshot the player started themselves)
+export HOOKSHOT_NO_UPDATE_CHECK=1
+if [ -x ./bin/hookshot ]; then
+    exec ./bin/hookshot
+fi
+exec ./hookshot

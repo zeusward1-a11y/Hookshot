@@ -88,6 +88,7 @@
     X(vkGetImageMemoryRequirements)                                                                                   \
     X(vkGetImageSparseMemoryRequirements)                                                                             \
     X(vkGetMemoryHostPointerPropertiesEXT)                                                                            \
+    X(vkGetMemoryFdPropertiesKHR)                                                                                     \
     X(vkGetBufferDeviceAddress)
 
 // shaders, pipelines, descriptors, draws
@@ -155,7 +156,7 @@
     X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) X(vkGetQueryPoolResults) \
     X(vkResetQueryPool) \
     X(vkCmdSetDepthClipEnableEXT) X(vkCmdSetLogicOpEXT) X(vkCmdClearAttachments) X(vkCmdSetDepthBoundsTestEnable) \
-    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT)
+    X(vkCmdSetCheckpointNV) X(vkGetQueueCheckpointDataNV) X(vkGetDeviceFaultInfoEXT) X(vkCmdWriteBufferMarkerAMD)
 
 namespace vkx {
 #define VKX_DECLARE(f) extern PFN_##f f;

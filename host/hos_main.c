@@ -23,6 +23,13 @@
 #else
 #include <windows.h>   /* (linux: host/posix's) */
 #include <sys/mman.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 #endif
 /* (linux) the separator of the paths the executable's folder is joined with */
 #ifdef _WIN32
@@ -102,6 +109,9 @@ static void *reserve_large(SIZE_T size) {
 }
 #endif
 
+#if !defined(_WIN32) && !defined(A64_MEM_ZERO)
+extern int hos_guest_memfd;   /* (below) */
+#endif
 /* The guest window lives at the constant A64_HOST_BASE (rt/a64.h), so lifted code never loads its base. */
 static int reserve_guest(void) {
 #if defined(A64_MEM_ZERO)
@@ -130,6 +140,50 @@ static int reserve_guest(void) {
        step: MAP_NORESERVE). Decommitting is madvise (host/posix/win32_posix.c VirtualFree): the pages read as zero. */
     void hos_commit_init(void);
     hos_commit_init();   /* (the crash report) */
+    /* The window is a memfd's, shared, so the Vulkan back end can hand the GPU the game's own pages as a dma-buf
+       (udmabuf, gpu/vk/vk_memory.cpp import_dma_buf) instead of a host pointer: amdgpu checks every page of a host-pointer
+       import again at each command submission, 15-45 ms a submission in Kokiri Forest. Pages of a shared mapping are freed
+       with MADV_REMOVE, not MADV_DONTNEED (hos_posix_guest_discard). HOS_GUEST_MEMFD=0: anonymous memory, as before */
+    {
+        /* (only where /dev/udmabuf can be opened: a shared mapping's pages cannot be host-pointer imports (RADV:
+           VK_ERROR_INVALID_EXTERNAL_HANDLE), so a pool udmabuf refused would be no import at all. A pool larger than udmabuf's
+           size_limit_mb (64 MB unless raised) is imported as several dma-bufs bound into one sparse buffer, so no setting is
+           needed. HOS_GUEST_MEMFD=1: the memfd all the same) */
+        const char *e = getenv("HOS_GUEST_MEMFD");
+        int usable = 0;
+        unsigned long long limit_mb = 0;
+        {
+            const int u = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+            if (u >= 0) {
+                close(u);
+                FILE *f = fopen("/sys/module/udmabuf/parameters/size_limit_mb", "r");
+                if (f) {
+                    if (fscanf(f, "%llu", &limit_mb) != 1) limit_mb = 0;
+                    fclose(f);
+                }
+                usable = limit_mb > 0;
+            }
+            if (!usable && !e)
+                hos_log("mem: guest memory stays host-pointer imports for the GPU (slow submissions on AMD): %s",
+                        u < 0 ? "/dev/udmabuf cannot be opened" : "udmabuf's size_limit_mb cannot be read");
+        }
+        if (e ? atoi(e) != 0 : usable) {
+            const int fd = (int)syscall(SYS_memfd_create, "hookshot-guest", 1u /* MFD_CLOEXEC */ | 2u /* MFD_ALLOW_SEALING */);
+            if (fd >= 0 && ftruncate(fd, (off_t)GUEST_SPACE) == 0) {
+                fcntl(fd, 1033 /* F_ADD_SEALS */, 0x0002 /* F_SEAL_SHRINK */ | 0x0004 /* F_SEAL_GROW */);
+                void *p = mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
+                               MAP_SHARED | MAP_FIXED_NOREPLACE | MAP_NORESERVE, fd, 0);
+                if (p == (void *)A64_HOST_BASE) {
+                    hos_guest_memfd = fd;
+                    hos_log("mem: the guest window is a memfd's (%d), shared with the GPU as dma-bufs", fd);
+                    return 1;
+                }
+                if (p != MAP_FAILED) munmap(p, GUEST_SPACE);
+            }
+            if (fd >= 0) close(fd);
+            hos_log("mem: no memfd for the guest window (errno %d): anonymous memory", errno);
+        }
+    }
     if (mmap((void *)A64_HOST_BASE, GUEST_SPACE, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0) != (void *)A64_HOST_BASE)
         return 0;
@@ -137,9 +191,24 @@ static int reserve_guest(void) {
        collapse khugepaged makes in them changes their mappings, which the kernel answers by pinning the pages again at the
        next submission: ~250 ms a submit on RADV while the GPU sat idle. HOS_THP=1: as before */
     if (!getenv("HOS_THP")) madvise((void *)A64_HOST_BASE, GUEST_SPACE, MADV_NOHUGEPAGE);
+#ifdef __linux__
+    /* (HOS_NO_THP=1, experiment: none outside the window either. With THP "always" 400-450 MB of the host heap's and the binary's bss are huge
+       pages, each resident whole when any of its 2 MB is touched) */
+    if (getenv("HOS_NO_THP")) prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
     return 1;
 #endif
 }
+
+#if !defined(_WIN32) && !defined(A64_MEM_ZERO)
+/* the guest window's memfd for the Vulkan back end (-1: anonymous memory), and freeing guest pages so that
+   they read as zero again on either kind of mapping */
+int hos_guest_memfd = -1;
+int hos_posix_guest_memfd(void) { return hos_guest_memfd; }
+int hos_posix_guest_discard(void *p, size_t n) {
+    return madvise(p, n, hos_guest_memfd >= 0 ? MADV_REMOVE : MADV_DONTNEED);
+}
+#endif
 
 /* The guest window, for the renderer (gpu/render/rx_buffer.cpp). */
 uint8_t *hos_guest_base(void) { return A64_MEM; }
@@ -272,12 +341,19 @@ static const char *saves_dir(const char *beside) {
 
 /* hookshot_env.txt beside the game: NAME=VALUE lines set as environment variables before anything reads them, for the
    switches players are asked to test (RX_VK_NOOPT and the rest). Lines starting with # are notes. On Linux this runs
-   before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made. */
+   before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made.
+   HOS_ENV_FILE=<path> reads that file instead: a scripted or A/B test run brings its own switches and leaves the
+   player's hookshot_env.txt as it is. */
 static void load_hookshot_env(void) {
     char path[MAX_PATH + 32];
-    DWORD n = hos_game_path_a(path, MAX_PATH);
-    while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-    memcpy(path + n, "hookshot_env.txt", 17);
+    const char *other = getenv("HOS_ENV_FILE");
+    if (other && *other) {
+        snprintf(path, sizeof path, "%s", other);
+    } else {
+        DWORD n = hos_game_path_a(path, MAX_PATH);
+        while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
+        memcpy(path + n, "hookshot_env.txt", 17);
+    }
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[512];

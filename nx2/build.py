@@ -20,6 +20,8 @@ and is not compiled twice.
 
 Usage:  python -I nx2/build.py [--jobs 1] [--only 0,7] [--opt O1] [--no-polls] [--dll] [--lib] [--standalone]
   --only: just these code_NNN.c chunks (to measure); --dll: link hookshot_game.dll; --lib: archive hookshot_game.lib
+  HOOKSHOT_TIMES=<build_times.json>: make_game.py's record of the earlier builds. With it, this run says which files it
+  really rebuilds and how long each took before (@@plan, @@file, @@eta), which the builder windows show as a countdown.
 """
 import argparse
 import concurrent.futures
@@ -176,6 +178,137 @@ def cache_put(obj, key):
         shutil.copyfile(obj, dst)
 
 
+def free_mb():
+    """The memory free now (MemAvailable on Linux, the available physical memory on Windows), in MB; None: not known"""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("len", ctypes.c_uint32), ("load", ctypes.c_uint32)] + \
+                           [(f, ctypes.c_uint64) for f in ("total", "avail", "pt", "pa", "vt", "va", "ve")]
+            m = MS()
+            m.len = ctypes.sizeof(MS)
+            return m.avail >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) >> 10
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def tree_rss(pid):
+    """(linux) The resident bytes of a process and the processes it started (a driver that runs its compiler as a child, or ccache)"""
+    with open("/proc/%d/statm" % pid) as f:
+        n = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    for task in os.listdir("/proc/%d/task" % pid):
+        try:
+            with open("/proc/%d/task/%s/children" % (pid, task)) as f:
+                for child in f.read().split():
+                    try:
+                        n += tree_rss(int(child))
+                    except (OSError, ValueError, IndexError):
+                        pass
+        except OSError:
+            pass
+    return n
+
+
+def rss_mb(proc):
+    """A running compiler's resident memory in MB (0: not known, or not started yet)"""
+    if proc is None:
+        return 0
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", ctypes.c_uint32), ("faults", ctypes.c_uint32)] + \
+                           [(f, ctypes.c_size_t) for f in ("peak_ws", "ws", "qpp", "qp", "qnpp", "qnp", "pf", "peak_pf")]
+            c = PMC()
+            c.cb = ctypes.sizeof(PMC)
+            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
+            return c.ws >> 20 if ok else 0
+        return tree_rss(proc.pid) >> 20
+    except (OSError, ValueError, AttributeError, IndexError):
+        return 0
+
+
+def mem_need(src):
+    """What compiling a file takes at its peak, in MB, a little over. Measured on a cold build (clang 23, x86-64): a chunk of lifted
+    code 0.4 GB + 50 MB per MB of C + 250 MB per MB of its largest function (1.5 GB for 24 MB of small functions, 2.2 GB for a 6 MB
+    function alone); a hot piece 0.8-1.3 GB whatever its size (-O2, the profile, inlining); the runtime's C files ~0.2 GB, the C++
+    files up to ~1 GB"""
+    name = os.path.basename(src)
+    if name.startswith("code_hot"):
+        return 1500
+    if name.startswith("code_"):
+        with open(src, "rb") as f:
+            text = f.read()
+        starts, at = [], text.find(b"\nvoid f_")
+        while at >= 0:
+            if text.endswith(b"{", 0, text.find(b"\n", at + 1)):   # (a definition, not one of the declarations above them)
+                starts.append(at)
+            at = text.find(b"\nvoid f_", at + 1)
+        starts.append(len(text))
+        largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
+        return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
+    return 1000 if src.endswith(".cpp") else 400
+
+
+class MemoryGate:
+    """(issue 418) Compilers started by the memory there is, not only by --jobs: one per CPU thread ran PCs out of memory (the kernel
+    stopped a compiler, or the whole build), and a count low enough for the biggest files and the PC's other programs left most of
+    the threads idle. A compile starts when the memory free, less what the compilers running may still take on top of what they
+    hold now (mem_need), keeps its own need and HOOKSHOT_MEM_RESERVE_GB (default 1.5) free. The floor is make_game's before this:
+    on Windows up to 4 (half the threads on smaller CPUs) always run, as Windows pages rather than fails (issues 502, 503, 511: 1-2
+    compilers on 16 GB PCs took hours); on Linux one (issue 531: Linux stops a compiler that does not fit, and it is compiled again
+    alone). The free memory is read again as compiles start and end, so a game or browser opened during the build makes later
+    compiles wait"""
+
+    def __init__(self):
+        import threading
+        self.cv = threading.Condition()
+        self.running = {}   # (src: [need, Popen or None])
+        self.reserve = float(os.environ.get("HOOKSHOT_MEM_RESERVE_GB") or 1.5) * 1024
+        self.floor = max(1, min(4, (os.cpu_count() or 2) // 2)) if os.name == "nt" else 1
+
+    def enter(self, src):
+        need = mem_need(src)
+        with self.cv:
+            while len(self.running) >= self.floor:
+                free = free_mb()
+                if free is None:
+                    break
+                owed = sum(max(0, n - rss_mb(p)) for n, p in self.running.values())
+                if free - owed - self.reserve >= need:
+                    break
+                self.cv.wait(1.0)
+            self.running[src] = [need, None]
+
+    def started(self, src, proc):
+        with self.cv:
+            self.running[src][1] = proc
+
+    def expected(self, jobs):
+        """How many compilers the memory free now is likely to hold at once (a 1.5 GB file each, the median chunk's peak),
+        between the floor and the jobs: the compile countdown's estimate"""
+        free = free_mb()
+        if free is None:
+            return jobs
+        return max(self.floor, min(jobs, int((free - self.reserve) // 1500)))
+
+    def leave(self, src):
+        with self.cv:
+            self.running.pop(src, None)
+            self.cv.notify_all()
+
+
+GATE = None   # (main's MemoryGate; None: compiles start as the jobs allow)
+
+
 FFMPEG = next((os.path.join(d, n) for d in [os.path.join(r, "ffmpeg") for r in cpm_dirs()] if os.path.isdir(d)
                for n in sorted(os.listdir(d)) if os.path.isdir(os.path.join(d, n, "lib"))
                and "linux" not in n.lower()), None)   # (hookshot: a cache with both systems' builds, cross-building)
@@ -235,24 +368,7 @@ WRITE_TRACK = [] if os.environ.get("RX_SOFT_WRITE_WATCH") == "0" else ["-DA64_WR
 # expression is rounded as written (the exact bodies and FPX1's proofs assume it). RX_MARCH=x86-64: the old baseline
 # (issue 363: a Xeon E5-2667 v2 (Ivy Bridge, no AVX2) built the game and then stopped at its first AVX2 instruction,
 # 0xc000001d. The game is built on the PC it runs on: a CPU without x86-64-v3's features gets x86-64-v2, or x86-64)
-def host_march():
-    want = ("avx2", "fma", "bmi2", "movbe")
-    try:
-        if os.name == "nt":
-            import ctypes
-            pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
-            # (PF_AVX2_INSTRUCTIONS_AVAILABLE 40; PF_SSE4_2_INSTRUCTIONS_AVAILABLE 38. Windows reports no FMA/BMI2 bit, but
-            # every AVX2 CPU has them, as x86-64-v3 counts them together)
-            if pf(40):
-                return "x86-64-v3"
-            return "x86-64-v2" if pf(38) else "x86-64"
-        flags = open("/proc/cpuinfo").read().split("flags", 1)[1].split(chr(10), 1)[0].split()
-        if all(f in flags for f in want):
-            return "x86-64-v3"
-        return "x86-64-v2" if all(f in flags for f in ("sse4_2", "popcnt", "ssse3")) else "x86-64"
-    except Exception:
-        return "x86-64-v3"
-
+from host_cpu import host_march   # (make_game.py asks it too: the AppImage's renderer)
 
 MARCH = os.environ.get("RX_MARCH") or host_march()
 if MARCH != "x86-64-v3":
@@ -280,12 +396,83 @@ def write_info(out):
     return path
 
 
+def flag_text(fl):
+    """The flags an object key is named by. Include folders are left out (their headers are in deps). The builder's
+    own folder is <root> (issue 565: versions\\<tag>\\... made every update look new). --sysroot= is <sysroot>: the
+    AppImage mount is a new /tmp/.mount_... path every start, and that path is not a change in the headers."""
+    kept = []
+    for f in fl:
+        if f.startswith("-I"):
+            continue
+        if f.startswith("--sysroot="):
+            f = "--sysroot=<sysroot>"
+        else:
+            f = f.replace(kit.ROOT, "<root>")
+        kept.append(f)
+    return " ".join(kept)
+
+
 def object_key(src, fl, deps):
-    """What an object depends on: its source, the flags without the include folders (the two builds' generated
-    headers are in different folders; their contents are in deps), and the headers. (issue 565) The builder's own folder
-    is left out of the flags (an -include names a header in it): it is versions\\<tag>\\..., another with each release"""
-    return hashlib.sha1(open(src, "rb").read() + " ".join(f.replace(kit.ROOT, "<root>") for f in fl if not f.startswith("-I")).encode() +
-                        deps).hexdigest()
+    """What an object depends on: its source, the flags (flag_text), and the headers."""
+    return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps).hexdigest()
+
+
+def times_from(path):
+    """The seconds each module took on this PC, from make_game.py's build_times.json, or {} when there is no record to
+    use (a first build, one half written, or one another version of the tools wrote): the countdown then falls back to
+    the rate this PC's other measurements ran at."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): float(v) for k, v in data["seconds"].items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def eta_left(pending, jobs):
+    """How long the rest of the compile takes, in seconds, with this many compilers: the work spread over them, with
+    the longest file still left as the floor (each file is still one compiler)."""
+    if not pending:
+        return 0.0
+    return max(max(pending), sum(pending) / max(1, jobs))
+
+
+def per_file_seconds(jobs, history):
+    """One expected duration for each job, in order: the seconds this PC measured for that module before, or, for a
+    module it never compiled (a new release adds or renames files), the rate those measurements ran at. On a PC with
+    no measurements at all, the first build uses the rates a full build on the development PC showed."""
+    sizes = [max(0.0, os.path.getsize(src) / (1 << 20)) for _, src, *_ in jobs]
+    measured = [(history[os.path.basename(src)], mb) for (_, src, *_), mb in zip(jobs, sizes)
+                if os.path.basename(src) in history and mb > 0]
+    rate = sum(secs for secs, _ in measured) / sum(mb for _, mb in measured) if measured else None
+    out = []
+    for (_, src, *_), mb in zip(jobs, sizes):
+        name = os.path.basename(src)
+        if name in history:
+            out.append(max(0.05, history[name]))
+        elif rate is not None:
+            out.append(max(0.5, rate * mb))
+        else:   # (seconds per MB measured on a full build: the eight hot files, the game chunks, the rest)
+            out.append(23.5 * mb if name.startswith("code_hot") else 3.4 * mb + 1 if name.startswith("code_") else 1.3)
+    return out
+
+
+def plan_jobs(jobs):
+    """Which jobs this run really compiles, and every job's object key. A job whose object is stamped with its key, or
+    whose key is in the object cache (the other target's build), is only linked in: not work, and not in the countdown.
+    The keys go to compile_one, which then does not hash every source a second time."""
+    work, keys = [], {}
+    for cc, src, obj, fl, deps in jobs:
+        key = object_key(src, fl, deps)
+        keys[(src, obj)] = key
+        stamp = obj + ".sha1"
+        if os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key:
+            continue
+        if os.path.exists(os.path.join(OBJ_CACHE, key + ".o")):
+            continue
+        work.append((cc, src, obj, fl, deps))
+    return work, keys
 
 
 def migrate_stamps(gen, obj_dir, fl, deps):
@@ -310,9 +497,33 @@ def migrate_stamps(gen, obj_dir, fl, deps):
             cache_put(obj, key)
 
 
+PLANNED = {}   # (src, obj) -> the object key plan_jobs worked out, so compile_one does not hash every source again
+
+
+# (hookshot) the order of the compile: the longest first (LPT), so no long one starts late and runs alone at the end. The lift's
+# estimate (gen/chunk_costs.txt, nx2/chunks.py fn_cost: functions cost with the square of their size) where it is there, else the size.
+# HOT_COST: how much longer the hot flags (-O2, the profile, the hot callees inlined) take for the same estimate. Fitted to a cold build
+# on a Ryzen 9 7900X; by size alone the hot pieces (9 MB, up to 333 s) started after every 25 MB chunk (45 s)
+HOT_COST = 4
+
+
+def chunk_costs(gen):
+    try:
+        with open(os.path.join(gen, "chunk_costs.txt")) as f:
+            return {name: int(n) for name, _, n in (line.partition(" ") for line in f) if n.strip().isdigit()}
+    except OSError:
+        return {}
+
+
+def compile_cost(src, costs):
+    """A file's compile time, roughly (see HOT_COST)"""
+    name = os.path.basename(src)
+    return costs.get(name, os.path.getsize(src)) * (HOT_COST if name.startswith("code_hot") else 1)
+
+
 def compile_one(job):
     cc, src, obj, fl, deps = job
-    key = object_key(src, fl, deps)
+    key = PLANNED.get((src, obj)) or object_key(src, fl, deps)
     stamp = obj + ".sha1"
     if os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key:
         return src, 0.0, None
@@ -327,10 +538,18 @@ def compile_one(job):
             shutil.copyfile(cached, obj)
         open(stamp, "w").write(key)
         return src, 0.0, None
+    if GATE:
+        GATE.enter(src)
     t = time.time()
-    with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
-        no_throttle(getattr(p, "_handle", None))
-        out, err = p.communicate()
+    try:
+        with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+            no_throttle(getattr(p, "_handle", None))
+            if GATE:
+                GATE.started(src, p)
+            out, err = p.communicate()
+    finally:
+        if GATE:
+            GATE.leave(src)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
         return src, time.time() - t, r.stderr[-4000:]
@@ -394,8 +613,9 @@ def main():
             srcs += [os.path.join(NX2_RT, "eden_shim.c"), write_info(out)]
     if os.environ.get("RX_VK_ONLY"):   # (no lift needed: the back end alone)
         srcs = [s for s in srcs if os.path.exists(s)]
-    # biggest first, so the long ones do not end up alone at the end
-    srcs.sort(key=lambda s: -os.path.getsize(s))
+    # the longest first, so the long ones do not end up alone at the end (compile_cost)
+    costs = chunk_costs(gen)
+    srcs.sort(key=lambda s: -compile_cost(s, costs))
     # (hookshot) code_hot.c, the lift's hot functions together (A64_HOT_FUNCS + A64_HOT_CHUNK=1): at RX_HOT_OPT
     # (default O2), so the hot callees inline into their hot callers
     hot_fl = [("-" + os.environ.get("RX_HOT_OPT", "O2")) if f == "-" + a.opt else f for f in fl]
@@ -414,7 +634,7 @@ def main():
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
     fp = lambda b: hashlib.sha1(b).hexdigest()[:10]
-    norm = lambda f: " ".join(x.replace(kit.ROOT, "<root>") for x in f if not x.startswith("-I")).encode()
+    norm = lambda f: flag_text(f).encode()
     code = hashlib.sha1()
     for code_src in sorted(x for x in srcs if os.path.basename(x).startswith("code_")):
         code.update(os.path.basename(code_src).encode() + open(code_src, "rb").read())
@@ -510,6 +730,22 @@ def main():
     vk_only = bool(os.environ.get("RX_VK_ONLY"))   # (the renderer alone, the game's objects as they are)
     if vk_only:
         jobs = list(vk_jobs)
+    # (the builder's compile timer: HOOKSHOT_TIMES is make_game.py's record of the earlier builds on this PC. With it,
+    # this run says which files it really rebuilds and how long each took before, and the builder shows the rest of the
+    # compile as a countdown that follows this PC's own measurements. Run by hand, it prints none of these lines.)
+    global GATE
+    GATE = None if os.environ.get("HOOKSHOT_MEM_GATE") == "0" else MemoryGate()
+    eta_jobs = GATE.expected(a.jobs) if GATE else a.jobs   # (the countdown with the compilers the memory holds, not --jobs)
+    counted, expected, pending = os.environ.get("HOOKSHOT_TIMES"), {}, []
+    if counted:
+        work_jobs, keys = plan_jobs(jobs)
+        PLANNED.update(keys)
+        estimate = per_file_seconds(work_jobs, times_from(counted))
+        pending = list(estimate)
+        for job, seconds in zip(work_jobs, estimate):
+            expected.setdefault(job[1], []).append(seconds)
+        print("@@plan %d %d" % (len(work_jobs), len(jobs)), flush=True)
+        print("@@eta %d" % eta_left(pending, eta_jobs), flush=True)
     print("%d files, %d jobs, %s" % (len(jobs), a.jobs, " ".join(f for f in fl if f.startswith("-D") or f.startswith("-O"))),
           flush=True)
     t0, failed = time.time(), []
@@ -523,6 +759,12 @@ def main():
                       % (os.path.basename(src), size, secs, err[-1500:]), flush=True)
             else:
                 print("  %-16s %4d MB  %6.0fs  (%.0fs)" % (os.path.basename(src), size, secs, time.time() - t0), flush=True)
+            if counted:
+                print("@@file %s %.1f %s" % (os.path.basename(src), secs,
+                                             "failed" if err else "cached" if secs <= 0 else "new"), flush=True)
+                if not err and expected.get(src):
+                    pending.remove(expected[src].pop())
+                    print("@@eta %d" % eta_left(pending, eta_jobs), flush=True)
     # (a compiler that ran out of memory beside the others dies "due to signal": a player's 24 MB code_021.c, 2026-11-08. The
     # files that failed are compiled again one at a time, with all the memory, before the build gives up)
     still = 0
@@ -535,6 +777,11 @@ def main():
             print("FAILED %s (%d MB, %.0fs, alone too):\n%s" % (os.path.basename(src), size, secs, err), flush=True)
         else:
             print("  %-16s %4d MB  %6.0fs  (%.0fs, alone)" % (os.path.basename(src), size, secs, time.time() - t0), flush=True)
+        if counted:
+            print("@@file %s %.1f %s" % (os.path.basename(src), secs, "failed" if err else "again"), flush=True)
+            if not err and expected.get(src):
+                pending.remove(expected[src].pop())
+                print("@@eta %d" % eta_left(pending, eta_jobs), flush=True)
     print("compiled in %.0fs, %d failed" % (time.time() - t0, still), flush=True)
     if still:
         return 1

@@ -26,6 +26,9 @@ enum { HOS_PAD_SOUTH, HOS_PAD_EAST, HOS_PAD_WEST, HOS_PAD_NORTH, HOS_PAD_BACK, H
        HOS_PAD_LSTICK, HOS_PAD_RSTICK, HOS_PAD_LSHOULDER, HOS_PAD_RSHOULDER, HOS_PAD_UP, HOS_PAD_DOWN, HOS_PAD_LEFT,
        HOS_PAD_RIGHT, HOS_PAD_LTRIGGER, HOS_PAD_RTRIGGER, HOS_PAD_N };
 enum { HOS_BIND_PAD, HOS_BIND_KEY };
+/* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
+enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
+       HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
 
 /* what the executable gives the back end */
 typedef struct MkwVkHost {
@@ -73,7 +76,8 @@ typedef struct MkwVkHost {
     uint32_t (*pad_raw)(void);
     /* (hookshot) the controls, for the Insert menu's Controls page. button: the Switch's, HOS_SW_*; set HOS_BIND_PAD:
        the gamepad input that presses it (a HOS_PAD_* position, -1 none; slot 0 only); set HOS_BIND_KEY: the keys that
-       do (Windows key codes, 0 none; slots 0 and 1). bind with button -1: all back to their defaults */
+       do (Windows key codes, 0 none; slots 0 and 1; a mouse button's too, and HOS_KEY_* past the Switch's buttons).
+       bind with button -1: all back to their defaults */
     int (*binding)(int set, int button, int slot);
     void (*bind)(int set, int button, int slot, int code);
     /// The guest camera aspect explicitly applied at startup (0: its default aspect)
@@ -115,11 +119,15 @@ typedef struct MkwVkRenderer {
     void (*nvn_texture_created)(const nvn_tex *t);
     /* the CPU set an event's value: in order with the submits (the GPU's waits on it) */
     void (*nvn_event_signal)(uint64_t gpu, uint32_t value);
-    int (*option)(int id);   /* (hookshot, the Insert menu) 0: game time follows the clock, 1: the menu is open, 2: dynamic resolution, 3: its fixed scale in percent, 4: the controllers count behind other windows, 5: text speed (0 normal to 3 instant) */
+    int (*option)(int id);   /* (hookshot, the Insert menu) 0: game time follows the clock, 1: the menu is open, 2: dynamic resolution, 3: its fixed scale in percent, 4: the controllers count behind other windows, 5: text speed (0 normal to 3 instant), 6: native mouse look (host/mouse_native.c),
+                                7: the mouse's sensitivity in percent, 8: its up and down swapped (host/nn_hid.c) */
     /* a submit with its queue */
     void (*nvn_submit_q)(const uint64_t *handles, int n, uint64_t queue);
     /* (hookshot) a fence of one queue: the value its own last submission signals (nvnQueueFenceSync) */
     uint64_t (*nvn_fence_q)(uint64_t queue);
+    /* (hookshot, the Insert menu) a setting changed from the game's side, kept in the options file: 7 the mouse's sensitivity
+       in percent (the - and = keys, host/nn_hid.c) */
+    void (*option_set)(int id, int value);
 } MkwVkRenderer;
 
 /* the DLL's one export: null when Vulkan is not usable (the executable then falls back to WebGPU) */

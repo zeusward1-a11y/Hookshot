@@ -357,7 +357,12 @@ void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, cons
     vk ? vk->nvn_write_texels(t, level, layer0, r, src, row, img)
        : wgr_nvn_write_texels(t, level, layer0, r, src, row, img);
 }
-void rx_nvn_invalidate(uint64_t gpu, uint64_t size) { vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size); }
+void rx_nvn_invalidate(uint64_t gpu, uint64_t size) {
+    /* The callback can wait for replay or GPU write-back: let another guest thread use this core meanwhile. */
+    const int away = hos_vcore_away();
+    vk ? vk->nvn_invalidate(gpu, size) : wgr_nvn_invalidate(gpu, size);
+    if (away) hos_vcore_back();
+}
 int rx_guest_imported(uint64_t lo, uint64_t hi) {
     /* (mkw-recomp 16bc3bc: it takes the back end's pool lock, which the replay holds at times: no virtual core held) */
     const int away = hos_vcore_away();
@@ -367,6 +372,7 @@ int rx_guest_imported(uint64_t lo, uint64_t hi) {
 }
 /* (nvn_native.c: the CPU set an event's value) in order with the submits, for the GPU's waits on it */
 int rx_option(int id, int otherwise) { return vk && vk->option ? vk->option(id) : otherwise; }
+void rx_option_set(int id, int value) { if (vk && vk->option_set) vk->option_set(id, value); }
 void rx_nvn_event_signal(uint64_t gpu, uint32_t value) {
     if (vk && vk->nvn_event_signal) vk->nvn_event_signal(gpu, value);
 }

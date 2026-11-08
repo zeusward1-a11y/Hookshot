@@ -47,7 +47,7 @@ struct TestEnvironment final : Environment {
 }
 
 static std::vector<u32> emit_program(bool is_signed, u64 address, bool support_int64,
-                                     bool lower_address, Stage stage = Stage::Compute) {
+                                     bool lower_address, Stage stage = Stage::Compute, bool with_single_ssbo = false) {
     ObjectPool<IR::Inst> inst_pool;
     IR::Block block{inst_pool};
     IR::Program program;
@@ -87,10 +87,19 @@ static std::vector<u32> emit_program(bool is_signed, u64 address, bool support_i
     if (lower_address) Optimization::LowerInt64ToInt32(program);
     Optimization::CollectShaderInfoPass(env, program);
     if (!program.info.uses_global_memory) fail("CollectShaderInfoPass did not see the actual global load");
+    if (with_single_ssbo) {
+        program.info.constant_buffer_descriptors.push_back({0, 1});
+        program.info.storage_buffers_descriptors.push_back({0, 0, 1, false});
+        program.info.used_constant_buffer_types |= IR::Type::U32 | IR::Type::U32x2;
+    }
 
     Profile profile{};
     profile.supported_spirv = 0x00010600;
     profile.support_int64 = support_int64;
+    if (with_single_ssbo) {
+        profile.support_descriptor_aliasing = true;
+        profile.min_ssbo_alignment = 16;
+    }
     return EmitSPIRV(profile, program);
 }
 
@@ -102,6 +111,7 @@ struct Instruction {
 struct ModuleInfo {
     std::vector<Instruction> instructions;
     std::map<u32, u32> integer_widths;
+    std::map<u32, bool> signed_integer_types;
     std::map<u32, u64> constants;
 };
 
@@ -115,6 +125,7 @@ static ModuleInfo inspect(const std::vector<u32>& code) {
         std::vector<u32> words(code.begin() + at + 1, code.begin() + at + count);
         if (op == spv::Op::OpTypeInt && words.size() >= 3) {
             result.integer_widths[words[0]] = words[1];
+            result.signed_integer_types[words[0]] = words[2] != 0;
         } else if (op == spv::Op::OpConstant && words.size() >= 3) {
             const u32 type = words[0], id = words[1];
             const auto width_it = result.integer_widths.find(type);
@@ -147,10 +158,275 @@ static std::vector<u32> save_module(const std::string& name, std::vector<u32> co
     return code;
 }
 
-static void check_case(bool is_signed, u64 address, const char* name, Stage stage = Stage::Compute) {
+struct SingleSsboScenario {
+    u64 descriptor_address;
+    u32 descriptor_size;
+    u32 descriptor_words;
+    bool expected_in_range;
+};
+
+static void check_single_ssbo_range(const ModuleInfo& module, u64 address,
+                                    const SingleSsboScenario& scenario, const char* name) {
+    u32 u64_type = 0;
+    u32 u32x2_type = 0;
+    for (const auto& inst : module.instructions) {
+        const auto& w = inst.words;
+        if (inst.op == spv::Op::OpTypeInt && w.size() >= 3 && w[1] == 64 && w[2] == 0)
+            u64_type = w[0];
+        if (inst.op == spv::Op::OpTypeVector && w.size() >= 3 && w[2] == 2) {
+            const auto component = module.integer_widths.find(w[1]);
+            if (component != module.integer_widths.end() && component->second == 32) {
+                const auto signedness = module.signed_integer_types.find(w[1]);
+                if (signedness != module.signed_integer_types.end() && !signedness->second)
+                    u32x2_type = w[0];
+            }
+        }
+    }
+    if (!u64_type || !u32x2_type) fail("single-SSBO fixture lacks U64 or U32x2 types");
+
+    u32 input_address = 0;
+    for (const auto& inst : module.instructions) {
+        const auto& w = inst.words;
+        const auto width = w.empty() ? module.integer_widths.end() : module.integer_widths.find(w[0]);
+        if (inst.op == spv::Op::OpConstant && w.size() >= 3 && width != module.integer_widths.end() &&
+            width->second == 64 && constant(module, w[1], "missing IR address constant") == address)
+            input_address = w[1];
+    }
+    if (!input_address) fail("single-SSBO fixture lost its actual IR address constant");
+
+    u32 aligned_call_address = 0;
+    u64 helper_argument = 0;
+    for (const auto& inst : module.instructions) {
+        const auto& w = inst.words;
+        if (inst.op == spv::Op::OpBitwiseAnd && w.size() >= 4 && w[2] == input_address &&
+            constant(module, w[3], "missing 4-byte alignment mask") == ~u64{3}) {
+            aligned_call_address = w[1];
+            helper_argument = constant(module, w[2], "missing global address") &
+                              constant(module, w[3], "missing global alignment mask");
+        }
+    }
+    if (!aligned_call_address) fail("single-SSBO fixture did not align its real U16/S16 address");
+
+    u32 helper_function = 0;
+    for (const auto& inst : module.instructions) {
+        const auto& w = inst.words;
+        const auto width = w.empty() ? module.integer_widths.end() : module.integer_widths.find(w[0]);
+        if (inst.op == spv::Op::OpFunctionCall && w.size() >= 4 && w[3] == aligned_call_address &&
+            width != module.integer_widths.end() && width->second == 32)
+            helper_function = w[2];
+    }
+    if (!helper_function) fail("single-SSBO fixture did not call the global U32 helper");
+
+    std::vector<const Instruction*> body;
+    bool in_helper = false;
+    for (const auto& inst : module.instructions) {
+        const auto& w = inst.words;
+        if (inst.op == spv::Op::OpFunction && w.size() >= 2 && w[1] == helper_function) {
+            in_helper = true;
+            continue;
+        }
+        if (in_helper && inst.op == spv::Op::OpFunctionEnd) break;
+        if (in_helper) body.push_back(&inst);
+    }
+    if (body.empty()) fail("could not inspect the called global U32 helper body");
+
+    std::map<u32, const Instruction*> loads;
+    std::map<u32, const Instruction*> converts;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpLoad && w.size() >= 3) loads[w[1]] = inst;
+        if (inst->op == spv::Op::OpUConvert && w.size() >= 3) converts[w[1]] = inst;
+    }
+
+    u32 unaligned_address = 0;
+    u32 address_load = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op != spv::Op::OpBitcast || w.size() < 3 || w[0] != u64_type) continue;
+        const auto source = loads.find(w[2]);
+        if (source != loads.end() && source->second->words[0] == u32x2_type) {
+            unaligned_address = w[1];
+            address_load = w[2];
+        }
+    }
+    if (!unaligned_address) fail("could not find the loaded, unaligned SSBO guest address");
+
+    u32 aligned_ssbo_base = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpBitwiseAnd && w.size() >= 4 && w[0] == u64_type &&
+            w[2] == unaligned_address && constant(module, w[3], "missing SSBO alignment mask") == ~u64{15})
+            aligned_ssbo_base = w[1];
+    }
+    if (!aligned_ssbo_base) fail("single-SSBO helper did not align the descriptor base to 16 bytes");
+
+    u32 raw_end = 0;
+    u32 size_load = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op != spv::Op::OpIAdd || w.size() < 4 || w[0] != u64_type) continue;
+        const auto size = converts.find(w[3]);
+        if (w[2] == unaligned_address && size != converts.end() && size->second->words[0] == u64_type) {
+            raw_end = w[1];
+            size_load = size->second->words[2];
+        }
+    }
+    if (!raw_end || !size_load) fail("single-SSBO logical end is not computed from original address plus size");
+
+    u32 array_length = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpArrayLength && w.size() >= 4) array_length = w[1];
+    }
+    if (!array_length) fail("single-SSBO range no longer caps itself to OpArrayLength");
+
+    u32 byte_length = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpShiftLeftLogical && w.size() >= 4 && w[2] == array_length &&
+            constant(module, w[3], "missing descriptor-word shift") == 2)
+            byte_length = w[1];
+    }
+    u32 descriptor_bytes = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpUConvert && w.size() >= 3 && w[2] == byte_length && w[0] == u64_type)
+            descriptor_bytes = w[1];
+    }
+    if (!byte_length || !descriptor_bytes) fail("OpArrayLength is not converted to the descriptor byte length");
+
+    u32 bound_end = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpIAdd && w.size() >= 4 && w[0] == u64_type &&
+            w[2] == aligned_ssbo_base && w[3] == descriptor_bytes)
+            bound_end = w[1];
+    }
+    if (!bound_end) fail("descriptor byte length is not added to the aligned SSBO base");
+
+    u32 bound_is_shorter = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpULessThan && w.size() >= 4 &&
+            w[2] == bound_end && w[3] == raw_end)
+            bound_is_shorter = w[1];
+    }
+    if (!bound_is_shorter) fail("descriptor cap does not compare its end against the logical end");
+
+    u32 capped_end = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpSelect && w.size() >= 5 && w[0] == u64_type &&
+            w[2] == bound_is_shorter && w[3] == bound_end && w[4] == raw_end)
+            capped_end = w[1];
+    }
+    if (!capped_end) fail("single-SSBO helper does not select the lesser of logical and bound ends");
+
+    u32 helper_parameter = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpFunctionParameter && w.size() >= 2 && w[0] == u64_type)
+            helper_parameter = w[1];
+    }
+    u32 lower_check = 0;
+    u32 upper_check = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpUGreaterThanEqual && w.size() >= 4 &&
+            w[2] == helper_parameter && w[3] == aligned_ssbo_base)
+            lower_check = w[1];
+        if (inst->op == spv::Op::OpULessThan && w.size() >= 4 &&
+            w[2] == helper_parameter && w[3] == capped_end)
+            upper_check = w[1];
+    }
+    u32 membership = 0;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpLogicalAnd && w.size() >= 4 &&
+            w[2] == lower_check && w[3] == upper_check)
+            membership = w[1];
+    }
+    bool is_actual_branch = false;
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpBranchConditional && w.size() >= 3 && w[0] == membership)
+            is_actual_branch = true;
+    }
+    if (!helper_parameter || !lower_check || !upper_check || !membership || !is_actual_branch)
+        fail("capped end is not used by the called helper's range branch");
+
+    std::map<u32, u64> values;
+    const auto get_value = [&](u32 id) -> std::optional<u64> {
+        const auto value = values.find(id);
+        if (value != values.end()) return value->second;
+        const auto literal = module.constants.find(id);
+        if (literal != module.constants.end()) return literal->second;
+        return std::nullopt;
+    };
+    for (const Instruction* inst : body) {
+        const auto& w = inst->words;
+        if (inst->op == spv::Op::OpFunctionParameter && w.size() >= 2 && w[1] == helper_parameter) {
+            values[w[1]] = helper_argument;
+        } else if (inst->op == spv::Op::OpLoad && w.size() >= 3 && w[1] == address_load) {
+            values[w[1]] = scenario.descriptor_address;
+        } else if (inst->op == spv::Op::OpLoad && w.size() >= 3 && w[1] == size_load) {
+            values[w[1]] = scenario.descriptor_size;
+        } else if (inst->op == spv::Op::OpArrayLength && w.size() >= 4 && w[1] == array_length) {
+            values[w[1]] = scenario.descriptor_words;
+        } else if (inst->op == spv::Op::OpBitcast && w.size() >= 3) {
+            if (const auto value = get_value(w[2])) values[w[1]] = *value;
+        } else if (inst->op == spv::Op::OpBitwiseAnd && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs) values[w[1]] = *lhs & *rhs;
+        } else if (inst->op == spv::Op::OpUConvert && w.size() >= 3) {
+            if (const auto value = get_value(w[2])) values[w[1]] = *value;
+        } else if (inst->op == spv::Op::OpIAdd && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs) values[w[1]] = *lhs + *rhs;
+        } else if (inst->op == spv::Op::OpShiftLeftLogical && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs && *rhs < 64) values[w[1]] = *lhs << *rhs;
+        } else if (inst->op == spv::Op::OpULessThan && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs) values[w[1]] = *lhs < *rhs;
+        } else if (inst->op == spv::Op::OpUGreaterThanEqual && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs) values[w[1]] = *lhs >= *rhs;
+        } else if (inst->op == spv::Op::OpLogicalAnd && w.size() >= 4) {
+            const auto lhs = get_value(w[2]);
+            const auto rhs = get_value(w[3]);
+            if (lhs && rhs) values[w[1]] = *lhs && *rhs;
+        } else if (inst->op == spv::Op::OpSelect && w.size() >= 5) {
+            const auto condition = get_value(w[2]);
+            const auto yes = get_value(w[3]);
+            const auto no = get_value(w[4]);
+            if (condition && yes && no) values[w[1]] = *condition ? *yes : *no;
+        }
+    }
+    const auto in_range = get_value(membership);
+    if (!in_range) fail("could not evaluate the called helper's emitted range branch");
+    const bool actual_in_range = *in_range != 0;
+    if (actual_in_range != scenario.expected_in_range) {
+        fail("single-SSBO helper range branch disagrees with the concrete descriptor scenario");
+    }
+
+    std::printf("PASS: %s helper branch is %s with descriptor %016llx+%x and %u words\n",
+                name, actual_in_range ? "in range" : "out of range",
+                static_cast<unsigned long long>(scenario.descriptor_address),
+                scenario.descriptor_size, scenario.descriptor_words);
+}
+
+static void check_case(bool is_signed, u64 address, const char* name, Stage stage = Stage::Compute,
+                       std::optional<SingleSsboScenario> ssbo_scenario = std::nullopt) {
     std::string filename;
     for (const char* c = name; *c; ++c) filename += (*c == ' ' ? '-' : *c);
-    const auto module = inspect(save_module(filename, emit_program(is_signed, address, true, false, stage)));
+    const auto module = inspect(save_module(
+        filename, emit_program(is_signed, address, true, false, stage, ssbo_scenario.has_value())));
     const u64 aligned = address & ~u64{3};
     const u32 expected_bit_offset = static_cast<u32>((address & 3u) << 3);
     u32 address_id = 0, aligned_id = 0, low_lane_id = 0, low_id = 0, bit_offset_id = 0;
@@ -217,6 +493,8 @@ static void check_case(bool is_signed, u64 address, const char* name, Stage stag
     }
     if (is_signed ? (!saw_s_extract || saw_u_extract) : (!saw_u_extract || saw_s_extract))
         fail("wrong signed/unsigned extraction operation for the requested IR opcode");
+
+    if (ssbo_scenario) check_single_ssbo_range(module, address, *ssbo_scenario, name);
 
     std::printf("PASS: %s emitted aligned global32 helper + %s16 extraction (base=%016llx offset=%u)\n",
                 name, is_signed ? "signed " : "unsigned ", static_cast<unsigned long long>(aligned),
@@ -342,6 +620,23 @@ int main(int argc, char** argv) {
     check_case(false, 0x0000000100000002ull, "unsigned offset 2 high address");
     check_case(true, 0x0000007f00000ffeull, "signed guest-page end 0xffe");
     check_case(false, 0x0000007f00000ffeull, "unsigned guest-page end 0xffe");
+    // These supply concrete cbuf/descriptor inputs to the evaluator for the
+    // actual emitted helper branch, including the descriptor-length cap.
+    const SingleSsboScenario offset_four{0x1004, 2, 4, true};
+    check_case(true, 0x0000000000001004ull, "single SSBO signed halfword at offset four", Stage::Compute, offset_four);
+    check_case(false, 0x0000000000001004ull, "single SSBO unsigned halfword at offset four", Stage::Compute, offset_four);
+    check_case(false, 0x0000000000001008ull, "single SSBO following word misses logical range", Stage::Compute,
+               SingleSsboScenario{0x1004, 2, 4, false});
+    check_case(true, 0x0000000000001000ull, "single SSBO aligned-base control", Stage::Compute,
+               SingleSsboScenario{0x1000, 2, 4, true});
+    check_case(false, 0x0000000000001004ull, "single SSBO descriptor cap admits first word", Stage::Compute,
+               SingleSsboScenario{0x1004, 0x40, 2, true});
+    check_case(false, 0x0000000000001008ull, "single SSBO descriptor cap excludes end", Stage::Compute,
+               SingleSsboScenario{0x1004, 0x40, 2, false});
+    check_case(false, 0x0000000000001004ull, "single SSBO zero-length descriptor", Stage::Compute,
+               SingleSsboScenario{0x1004, 2, 0, false});
+    check_case(true, 0x0000000100001004ull, "single SSBO high-64-bit base", Stage::Compute,
+               SingleSsboScenario{0x0000000100001004ull, 2, 4, true});
     check_write_case(true, 0x0000000100000000ull, 16, "signed 16-bit store high address");
     check_write_case(false, 0x0000000100000002ull, 16, "unsigned 16-bit store offset 2");
     check_write_case(true, 0x0000000100000003ull, 8, "signed 8-bit store offset 3");

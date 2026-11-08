@@ -18,6 +18,7 @@
 #include "vk_internal.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include <sirit/sirit.h>
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 namespace {

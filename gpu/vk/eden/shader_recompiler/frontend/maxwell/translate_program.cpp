@@ -110,7 +110,9 @@ void AddGlobalTables(IR::Program& program) {
     // (EvilOOT) the program's own tables first: the search takes the first buffer that holds an address, and the pointer
     // table's regions are whole pools for compute (vk_bank.cpp pointer_table), bound GPU-only. Searched before the precise
     // entries, the culling setup's count writes went through the pool's binding and the launches never saw them.
-    for (u32 i = 0; i < program.info.num_global_tables; ++i) {
+    // (hookshot, as Lichii #421) none past MAX_SSBOS: the list is a static_vector, and one more threw bad_alloc
+    const auto room{[&] { return program.info.storage_buffers_descriptors.size() < Info::MAX_SSBOS; }};
+    for (u32 i = 0; i < program.info.num_global_tables && room(); ++i) {
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = program.info.global_tables[i].first,
             .cbuf_offset = program.info.global_tables[i].second,
@@ -118,7 +120,8 @@ void AddGlobalTables(IR::Program& program) {
             .is_written = program.info.stores_global_memory,
         });
     }
-    if ((program.stage == Stage::Task || program.stage == Stage::Mesh || compute_table) && program.info.uses_global_memory) {
+    if ((program.stage == Stage::Task || program.stage == Stage::Mesh || compute_table) && program.info.uses_global_memory &&
+        room()) {
         program.info.storage_buffers_descriptors.push_back({
             .cbuf_index = 0U,
             .cbuf_offset = 0x880U,
@@ -175,6 +178,9 @@ void AddNVNStorageBuffers(IR::Program& program) {
             it->is_written |= program.info.stores_global_memory;
             continue;
         }
+        if (descs.size() >= Info::MAX_SSBOS) {
+            break;   // (hookshot, as Lichii #421: no bad_alloc; the slots left out read 0)
+        }
         descs.push_back({
             .cbuf_index = driver_cbuf,
             .cbuf_offset = offset,
@@ -191,7 +197,7 @@ void AddNVNStorageBuffers(IR::Program& program) {
     // (compute only: the driver crashed compiling a mesh program with it; and only the program vk_shader.cpp names when
     // RX_VK_MISS_LOG_PROG is set: Optimization::g_nvn2_miss_log_this)
     if (miss_log && (program.stage == Stage::Compute || program.stage == Stage::Mesh || program.stage == Stage::Task) &&
-        Optimization::g_nvn2_miss_log_this) {
+        Optimization::g_nvn2_miss_log_this && descs.size() < Info::MAX_SSBOS) {
         descs.push_back({
             .cbuf_index = driver_cbuf,
             .cbuf_offset = 0xff0U,
@@ -517,7 +523,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
 
-    Optimization::GlobalMemoryToStorageBufferPass(program, normalized_host_info);
+    Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
     Optimization::GeometryCompactionPass(program, normalized_host_info);
     Optimization::TexturePass(env, program, normalized_host_info);
 

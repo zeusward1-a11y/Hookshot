@@ -211,10 +211,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 // (ISBEWR's data too: not counted, a mesh program's output held in a high GPR was read from the plain register,
                 // never written, while what computes it wrote the extended one: vertices past the first 32 came out undefined.
                 // SUST and SURED's data as well, the same field. (amd-fix, Lichii #149) RED's too: a reduction's data in a high GPR
-                // read the plain register, never written)
+                // read the plain register, never written. (Lichii #588) TXD's four gradients (0xb6c) and the global atomic's
+                // data (0x9a8) too: both are registers at bit 32)
                 const bool register_field = bit != 32 || insn.Bits(9, 3) == 1 || opcode == 0xb60 || opcode == 0xb66 ||
                                             opcode == 0x927 || opcode == 0xb9b || opcode == 0x59f || opcode == 0x983 ||
-                                            opcode == 0x98e || (renameable & (1U << f));
+                                            opcode == 0x98e || opcode == 0xb6c || opcode == 0x9a8 || (renameable & (1U << f));
                 if (reg >= 255 || reg + 3 < reserved_base) continue;   // (a quad below may reach up)
                 if (register_field && reg >= reserved_base) any_high = true;
             }
@@ -1371,6 +1372,23 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
                 (u64{insn.Bits(32, 8)} << 20) | (u64{static_cast<u32>(offset) & 0xfffff} << 28) |
                 (u64{1} << 48));
+            break;
+        }
+        case 0x3a9: { // (hookshot) ATOMG.E.CAS.STRONG.GPU PT, Rd, [Ra], Rb, Rc: U32, Rb the comparator, Rc the value.
+            // Maxwell's ATOM.E.CAS takes them as the pair Rb, Rb+1: copied to R250/R251 unless they are one already.
+            const u32 address = insn.Bits(24, 8), comparator = insn.Bits(32, 8), value = insn.Bits(64, 8);
+            const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
+            if ((insn.words[2] & ~0xffU) != 0x001ee100 || (address & 1) || address >= 246 ||
+                offset < -0x80000 || offset > 0x7ffff)
+                return fail(index, "native global compare-and-swap mode");
+            u32 pair = comparator;
+            if ((comparator & 1) || value != comparator + 1 || comparator >= 246) {
+                emit(0x5c98000000000000ULL | predicate | 250 | (u64{15} << 39) | (u64{comparator} << 20));
+                emit(0x5c98000000000000ULL | predicate | 251 | (u64{15} << 39) | (u64{value} << 20));
+                pair = 250;
+            }
+            emit(0xeef0000000000000ULL | predicate | dest | (u64{address} << 8) | (u64{pair} << 20) |
+                (u64{static_cast<u32>(offset) & 0xfffff} << 28) | (u64{1} << 48));
             break;
         }
         case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer plus an offset.

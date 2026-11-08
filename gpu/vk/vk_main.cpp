@@ -15,6 +15,8 @@
 #include "vk_api.h"
 #include "vk_draw.h"
 #include "vk_internal.h"
+#include "gpu_choice.h"
+#include "vk_menu.h"
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -54,10 +56,7 @@ void load_device(VkDevice device) {
 
 namespace mkwvk {
 
-
-
-
-
+std::vector<std::string> gpu_device_names;
 const MkwVkHost* host;
 int64_t prof_ns[PROF_COUNT];
 Device dev;
@@ -122,33 +121,63 @@ bool create_instance() {
 }
 
 bool pick_device() {
+    menu_init();
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(dev.instance, &n, nullptr);
     std::vector<VkPhysicalDevice> all(n);
     vkEnumeratePhysicalDevices(dev.instance, &n, all.data());
-    // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
-    // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
-    // processor graphics' driver, which the card's own update leaves as it was: on an RX 7700S that older driver
-    // (amdvlk64.dll 32.0.11036.4002) crashed in its shader compiler (0xc0000409) on the game's compute pipelines while
-    // the card's 32.0.32015.7029 built them. The same kind of GPU twice: the one with the newer driver wins.
-    // RX_VK_DEVICE=<n>: that device, as listed in the log
-    int best = -1, best_score = -1;
-    uint32_t best_driver = 0;
-    const char* want = getenv("RX_VK_DEVICE");
+
+    std::vector<uint32_t> valid_gpus;
+    gpu_device_names.clear();
     for (uint32_t i = 0; i < n; i++) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(all[i], &p);
         logf("vk: device %u: %s, Vulkan %u.%u, driver %#x, type %d", i, p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion),
              VK_API_VERSION_MINOR(p.apiVersion), p.driverVersion, (int)p.deviceType);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
-        if (want && *want) {
-            if ((uint32_t)atoi(want) == i) best = (int)i, best_score = 3;
+        if (p.apiVersion >= VK_API_VERSION_1_3) {
+            valid_gpus.push_back(i);
+            gpu_device_names.push_back(p.deviceName);
+        }
+    }
+    menu_set_gpu_count((int)valid_gpus.size());
+
+    // (AMD laptops) With AMD graphics in the processor and an AMD card, Windows has two AMD drivers installed, one an
+    // adapter, and each one's Vulkan driver lists every AMD GPU: the card shows up twice. It came first through the
+    // processor graphics' driver, which the card's own update leaves as it was: on an RX 7700S that older driver
+    // (amdvlk64.dll 32.0.11036.4002) crashed in its shader compiler (0xc0000409) on the game's compute pipelines while
+    // the card's 32.0.32015.7029 built them. The same kind of GPU twice: the one with the newer driver wins.
+    // RX_VK_DEVICE=<n> or opts.gpu_device: that device, as listed in the log
+    int best = -1, best_score = -1;
+    uint32_t best_driver = 0;
+    int target_raw_idx = -1;
+    if (const char* want = getenv("RX_VK_DEVICE")) {
+        if (*want) target_raw_idx = atoi(want);
+    } else if (const int k = gpu_choice::menu_device(opts.gpu_device, (int)valid_gpus.size()); k >= 0) {
+        target_raw_idx = (int)valid_gpus[k];
+    }
+
+    for (uint32_t i : valid_gpus) {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(all[i], &p);
+        if (target_raw_idx >= 0) {
+            if ((int)i == target_raw_idx) best = (int)i, best_score = 3;
             continue;
         }
         const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
                           p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
         if (score > best_score || (score == best_score && p.driverVersion > best_driver))
             best = (int)i, best_score = score, best_driver = p.driverVersion;
+    }
+    if (best < 0 && target_raw_idx >= 0) {
+        logf("vk: preferred device %d not available or lacks Vulkan 1.3, falling back to auto selection", target_raw_idx);
+        for (uint32_t i : valid_gpus) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(all[i], &p);
+            const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 :
+                              p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+            if (score > best_score || (score == best_score && p.driverVersion > best_driver))
+                best = (int)i, best_score = score, best_driver = p.driverVersion;
+        }
     }
     if (best < 0) {
         logf("vk: no Vulkan 1.3 GPU");
@@ -172,6 +201,8 @@ bool create_device() {
     };
     optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
     optional(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, dev.external_memory_host);
+    optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, dev.external_memory_fd);   // (guest memory as udmabufs: vk_memory.cpp import_dma_buf)
+    if (dev.external_memory_fd) optional(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, dev.dma_buf_import);
     optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, dev.pipeline_library);
     if (dev.pipeline_library) optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, dev.graphics_pipeline_library);
     optional(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, dev.custom_border_color);
@@ -192,6 +223,9 @@ bool create_device() {
     // RX_VK_CHECKPOINTS=0: off
     if (!getenv("RX_VK_CHECKPOINTS") || strcmp(getenv("RX_VK_CHECKPOINTS"), "0") != 0)
         optional(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, dev.checkpoints);
+    // (asked for only: a marker written twice a draw, where the NV ones are not there to hide a race)
+    if (const char* c = getenv("RX_VK_CHECKPOINTS"); !dev.checkpoints && c && strcmp(c, "0") != 0 && strcmp(c, "ext") != 0)
+        optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
 
@@ -249,11 +283,29 @@ bool create_device() {
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
-    // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default now: the GPU
+    // (bounds-checked buffer access: an out-of-range access dropped instead of faulting the device. On by default: the GPU
     // culling pass 53caac5f faulted the device while a save loaded, about one start in three, and the scene's lighting read garbage
     // for single frames (the black flashes); with it, neither in A/B runs at the same GPU time. Lichii's OoT branch keeps it on too.
-    // RX_VK_ROBUST=0: off, null descriptors only)
-    static const bool robust = !getenv("RX_VK_ROBUST") || atoi(getenv("RX_VK_ROBUST")) != 0;
+    // The 'Robust buffers' row of hookshot_options.ini chooses (0 Auto: on, on every vendor; 1 Off; 2 On); RX_VK_ROBUST=0 or 1
+    // over it. Off is null descriptors only: some NVIDIA cards ran slower with it on, issues 394, 418, 419)
+    static const bool robust = []() -> bool {
+        if (const char* e = getenv("RX_VK_ROBUST")) return atoi(e) != 0;
+        char exe[MAX_PATH];
+        const DWORD n = game_module_path(exe, MAX_PATH);   // (the game folder, not bin beside the launcher: vk_paths.h)
+        std::string ini(exe, n);
+        ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "hookshot_options.ini";
+        int v = 0;   // (Auto)
+        if (FILE* f = fopen(ini.c_str(), "r")) {
+            char line[80];
+            while (fgets(line, sizeof line, f))
+                if (!strncmp(line, "robust_buffers=", 15)) {
+                    v = atoi(line + 15);
+                    break;
+                }
+            fclose(f);   // (once: the PR closed it twice when the row said Auto)
+        }
+        return v != 1;   // (Auto and On: on)
+    }();
     const bool robust_ok = robust && robust2.robustBufferAccess2 && f.features.robustBufferAccess;
     robust2.robustBufferAccess2 = robust_ok ? VK_TRUE : VK_FALSE;
     robust2.robustImageAccess2 = VK_FALSE;
@@ -303,6 +355,7 @@ bool create_device() {
     dev.features = f.features;
     dev.sparse_images = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding &&
                         f.features.sparseResidencyImage2D && !(getenv("RX_VK_SPARSE") && !atoi(getenv("RX_VK_SPARSE")));
+    dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
     ci.queueCreateInfoCount = 1;
@@ -317,6 +370,7 @@ bool create_device() {
 
     load_device(dev.device);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
@@ -332,26 +386,59 @@ bool create_device() {
 
 bool create_swapchain(uint32_t width, uint32_t height) {
     VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
+    if (result != VK_SUCCESS) {
+        logf("vk: querying surface capabilities failed (VkResult %d)", (int)result);
+        return false;
+    }
     if (caps.currentExtent.width != UINT32_MAX) width = caps.currentExtent.width, height = caps.currentExtent.height;
+    logf("vk: surface caps images %u..%u extent %ux%u..%ux%u usage %#x alpha %#x transform %#x",
+         caps.minImageCount, caps.maxImageCount, caps.minImageExtent.width, caps.minImageExtent.height,
+         caps.maxImageExtent.width, caps.maxImageExtent.height, caps.supportedUsageFlags,
+         caps.supportedCompositeAlpha, caps.supportedTransforms);
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        logf("vk: surface does not support transfer-destination swapchain images");
+        return false;
+    }
     if (!width || !height) return false;
     uint32_t n = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, nullptr);
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, nullptr);
+    if (result != VK_SUCCESS || !n) {
+        logf("vk: querying surface formats failed (VkResult %d, count %u)", (int)result, n);
+        return false;
+    }
     std::vector<VkSurfaceFormatKHR> formats(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(dev.physical, dev.surface, &n, formats.data());
     VkSurfaceFormatKHR fmt = formats[0];
     for (const auto& f : formats)   // (an UNORM target: the game's window textures are presented as they are)
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) fmt = f;
-    // immediate when there is one (the game paces itself: nn_vi.c), else FIFO
-    vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
-    std::vector<VkPresentModeKHR> modes(n);
-    vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, modes.data());
+    // mailbox when the driver has it (latest frame, no tear). The game paces itself (nn_vi.c).
+    n = 0;
+    result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, nullptr);
+    std::vector<VkPresentModeKHR> modes;
+    if (result == VK_SUCCESS && n) {
+        modes.resize(n);
+        result = vkGetPhysicalDeviceSurfacePresentModesKHR(dev.physical, dev.surface, &n, modes.data());
+    }
+    if (result != VK_SUCCESS || modes.empty())
+        logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
     VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
-    for (auto m : modes)   // (RX_VK_FIFO=1: as on a card or driver with vsync forced, or no mailbox)
-        if (m == VK_PRESENT_MODE_MAILBOX_KHR && !getenv("RX_VK_FIFO")) mode = m;
-    // (hookshot) no mailbox (AMD's Windows driver has none): immediate before FIFO, which held anything under 60 fps to 30 (40 fps became 30 here)
-    for (auto m : modes)
-        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR && (getenv("RX_VK_IMMEDIATE") || mode == VK_PRESENT_MODE_FIFO_KHR) && !getenv("RX_VK_FIFO")) mode = m;
+    const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
+    if (!force_fifo) {
+        for (auto m : modes)
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
+        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
+        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
+        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
+        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+#ifdef _WIN32
+        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
+#else
+        if (want_immediate)
+#endif
+            for (auto m : modes)
+                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+    }
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
@@ -360,21 +447,50 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     ci.imageColorSpace = fmt.colorSpace;
     ci.imageExtent = {width, height};
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;   // (copied from, for RX_VK_DUMP)
+    ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // The renderer copies into swapchain images. Readback is optional and only available on surfaces that allow it.
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+        ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
+        for (VkCompositeAlphaFlagBitsKHR alpha : {VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+                                                  VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+                                                  VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR})
+            if (caps.supportedCompositeAlpha & alpha) { ci.compositeAlpha = alpha; break; }
+    }
     ci.presentMode = mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = dev.swapchain;
     VkSwapchainKHR sc;
-    if (vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc) != VK_SUCCESS) return false;
+    result = vkCreateSwapchainKHR(dev.device, &ci, nullptr, &sc);
+    if (result != VK_SUCCESS) {
+        logf("vk: vkCreateSwapchainKHR failed (VkResult %d, extent %ux%u, format %d, usage %#x, mode %d, images %u)",
+             (int)result, width, height, (int)fmt.format, ci.imageUsage, (int)mode, ci.minImageCount);
+        return false;
+    }
+    if (vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr) != VK_SUCCESS || !n) {
+        vkDestroySwapchainKHR(dev.device, sc, nullptr);
+        return false;
+    }
+    std::vector<VkSemaphore> rendered(n, VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (auto& semaphore : rendered) {
+        if (vkCreateSemaphore(dev.device, &si, nullptr, &semaphore) != VK_SUCCESS) {
+            for (auto made : rendered)
+                if (made) vkDestroySemaphore(dev.device, made, nullptr);
+            vkDestroySwapchainKHR(dev.device, sc, nullptr);
+            return false;
+        }
+    }
     if (dev.swapchain) {
         queue_flush_locked();
         vkDeviceWaitIdle(dev.device);
+        for (auto semaphore : dev.swap_rendered) vkDestroySemaphore(dev.device, semaphore, nullptr);
         vkDestroySwapchainKHR(dev.device, dev.swapchain, nullptr);
     }
     dev.swapchain = sc;
+    dev.swap_rendered = std::move(rendered);
     dev.swap_format = fmt.format;
     dev.swap_extent = {width, height};
     vkGetSwapchainImagesKHR(dev.device, sc, &n, nullptr);
@@ -486,21 +602,36 @@ int start(void* hwnd) {
     if (!create_swapchain((uint32_t)(r.right - r.left), (uint32_t)(r.bottom - r.top))) return 0;
 #else
     const MkwVkWindow* w = (const MkwVkWindow*)hwnd;
-    if (w->version != MKWVK_WINDOW_VERSION || !w->create_surface(w->window, (void*)dev.instance, (void*)&dev.surface)) {
-        logf("vk: the window's surface could not be made");
+    if (w->version != MKWVK_WINDOW_VERSION) {
+        logf("vk: unsupported SDL window bridge version %u (expected %u)", w->version, MKWVK_WINDOW_VERSION);
+        return 0;
+    }
+    if (!w->create_surface(w->window, (void*)dev.instance, (void*)&dev.surface)) {
+        logf("vk: SDL_Vulkan_CreateSurface failed; check SDL_VIDEODRIVER and the Vulkan window-system extensions");
         return 0;
     }
     VkBool32 ok = VK_FALSE;
-    vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
-    if (!ok) {
-        logf("vk: the GPU's queue cannot present to the window");
+    VkResult present = vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
+    if (present != VK_SUCCESS || !ok) {
+        logf("vk: queue-family present support failed (VkResult %d, supported %u)", (int)present, ok);
         return 0;
     }
     int width = 0, height = 0;
     w->drawable_size(w->window, &width, &height);
-    if (!create_swapchain((uint32_t)width, (uint32_t)height)) return 0;
+    if (width <= 0 || height <= 0) {
+        logf("vk: SDL returned zero drawable size %dx%d", width, height);
+        return 0;
+    }
+    if (!create_swapchain((uint32_t)width, (uint32_t)height)) {
+        logf("vk: swapchain creation failed for drawable %dx%d", width, height);
+        return 0;
+    }
 #endif
-    return started_up() ? 1 : 0;
+    if (!started_up()) {
+        logf("vk: renderer startup failed after window and swapchain initialization");
+        return 0;
+    }
+    return 1;
 }
 
 // (the window's thread: only noted. The swapchain is remade by whoever presents next, in present_image: made here, it went from under a

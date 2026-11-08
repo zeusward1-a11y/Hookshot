@@ -9,7 +9,7 @@
        tag <tag>
        part <sha256> <bytes> <folder under the install> <top folder in the zip to rename, or -> <new name, or -> <url>
        run <the builder, relative to the install>
-   Build: clang -O2 -mwindows setup.c setup_rc.o -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lole32 -o HookshotBuilder-Setup.exe */
+   Build: clang -O2 -mwindows -municode setup.c setup_rc.o -lwinhttp -lbcrypt -lcomctl32 -lshell32 -lole32 -o HookshotBuilder-Setup.exe */
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE
 #define UNICODE

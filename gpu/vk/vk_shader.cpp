@@ -9,8 +9,13 @@
 // A program's stages are emitted with one Backend::Bindings, so their descriptors share one set in Eden's order
 // (per stage: uniform buffers, storage buffers, texture buffers, image buffers, textures, images), which
 // vk_pipeline.cpp lays out from the stages' Info the same way.
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/file.h>
+#endif
 #include <io.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <stdexcept>
 #include <cstdio>
@@ -407,6 +412,20 @@ public:
         return !off && (stage == Shader::Stage::VertexA || stage == Shader::Stage::VertexB);
     }
     bool HasNativeInstructions() const override { return true; }   // (lowered NVN2 programs: Lichii's passes ask)
+    bool IsNativeProgram() const override { return true; }   // (Fritchii's storage buffer pass asks: EDEN_NX2_GM_NATIVE=0 off)
+    /// (Fritchii's storage buffer pass) whether the 8 bytes at c<index>+offset are a buffer's address now: in a memory pool
+    /// the game made. A texture handle and a float next to it (0x10001c00a, c5+0x60 of OoT's mesh programs) are not; nor is
+    /// anything in c1, the program's own constants. Answered once per word (the pass asks per access).
+    bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
+        if (index == 1) return false;
+        const uint64_t key = (uint64_t)index << 32 | offset;
+        if (const auto it = pointer_answers.find(key); it != pointer_answers.end()) return it->second;
+        const uint64_t v = ReadCbufValue(index, offset) | (uint64_t)ReadCbufValue(index, offset + 4) << 32;
+        // (4-byte aligned: a pointer the program reads words through. vk_bank.cpp's pointer table asks the same)
+        const bool pointer = v && !(v & 3) && host->gpu_guest(v) && gpu_pool_end(v) > v;
+        pointer_answers.emplace(key, pointer);
+        return pointer;
+    }
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override {
         if (bank != 0 || !HasHLEMacroState()) return std::nullopt;
         switch (offset) {
@@ -429,6 +448,7 @@ private:
     const NvnState& s;
     const Code& nvn;
     uint32_t local_memory = 0;
+    std::unordered_map<uint64_t, bool> pointer_answers;   // (IsCbufStorageBufferPointer's)
 };
 
 Shader::Profile make_profile() {
@@ -829,6 +849,26 @@ void disk_init() {
         const DWORD n = game_module_path(exe, MAX_PATH);
         std::string path(exe, n);
         path = path.substr(0, path.find_last_of("\\/") + 1) + "hookshot_programs.bin";
+        // (one Hookshot at a time on a cache: a second one, started while the first wrote, took the record being written for one
+        // cut short and cut the file there, under the first, whose list of records then named bytes written over since. Held
+        // until the process ends)
+        {
+            uint64_t h = 0xCBF29CE484222325ull;
+            for (const char ch : path) h = (h ^ (uint8_t)tolower((unsigned char)ch)) * 1099511628211ull;
+            char name[64];
+            snprintf(name, sizeof name, "Local\\HookshotProgramCache_%016llx", (unsigned long long)h);
+#ifdef _WIN32
+            const HANDLE held = CreateMutexA(nullptr, FALSE, name);
+            const bool taken = !held || GetLastError() == ERROR_ALREADY_EXISTS;
+#else   // (linux: a lock on a file beside the cache, let go when the process ends)
+            const int fd = open((path + ".lock").c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+            const bool taken = fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0;
+#endif
+            if (taken) {
+                logf("vk: program cache %s: another Hookshot is using it: this one runs without it", path.c_str());
+                return;
+            }
+        }
         const uint64_t stamp = disk_stamp();
         int64_t good = 0, whole = 0;
         if (FILE* f = fopen(path.c_str(), "rb")) {
@@ -879,18 +919,35 @@ template <class V> void put_list(std::vector<uint8_t>& o, const V& v) {
     put(o, (uint64_t)v.size());
     for (const auto& e : v) put(o, e);
 }
+// (a record is read within its own bytes: one made wrong, a count that ran past them, read on into the heap until it met an
+// unmapped page, a crash in program_cache_load. Past the end, bad is set, the gets give zeros, and the record is left out)
 struct Reader {
     const uint8_t* p;
+    const uint8_t* end;
+    bool bad = false;
+    bool has(uint64_t n) {
+        if (!bad && n > (uint64_t)(end - p)) bad = true;
+        return !bad;
+    }
     template <class T> T get() {
-        alignas(T) uint8_t b[sizeof(T)];
-        std::memcpy(b, p, sizeof(T));
-        p += sizeof(T);
+        alignas(T) uint8_t b[sizeof(T)]{};
+        if (has(sizeof(T))) {
+            std::memcpy(b, p, sizeof(T));
+            p += sizeof(T);
+        }
         return *(T*)b;
     }
-    template <class V> void list(V& v) {
+    /// a count of elements of size elem, no more than the bytes left could hold (0 when bad)
+    uint64_t count(size_t elem) {
         const uint64_t n = get<uint64_t>();
+        if (!bad && n > (uint64_t)(end - p) / (elem ? elem : 1)) bad = true;
+        return bad ? 0 : n;
+    }
+    template <class V> void list(V& v) {
+        const uint64_t n = count(sizeof(typename V::value_type));
         v.clear();
-        for (uint64_t i = 0; i < n; i++) v.push_back(get<typename V::value_type>());
+        v.reserve((size_t)n);
+        for (uint64_t i = 0; i < n && !bad; i++) v.push_back(get<typename V::value_type>());
     }
 };
 
@@ -910,6 +967,7 @@ void put_info(std::vector<uint8_t>& o, const Shader::Info& i) {
     for (const auto& h : i.handle_programs) put_list(o, h);
 }
 void get_info(Reader& r, Shader::Info& i) {
+    if (!r.has(sizeof i)) return;   // (left as constructed: the record is bad, and left out)
     alignas(Shader::Info) static thread_local uint8_t fresh[sizeof(Shader::Info)];
     std::memcpy(fresh, (const void*)&i, sizeof i);   // (those members as constructed, here)
     std::memcpy((void*)&i, r.p, sizeof i);
@@ -930,11 +988,11 @@ void get_info(Reader& r, Shader::Info& i) {
     r.list(i.image_buffer_descriptors);
     r.list(i.texture_descriptors);
     r.list(i.image_descriptors);
-    for (uint64_t n = r.get<uint64_t>(); n; n--) {
+    for (uint64_t n = r.count(2 * sizeof(Shader::IR::Attribute)); n && !r.bad; n--) {
         const auto k = r.get<Shader::IR::Attribute>();
         i.legacy_stores_mapping[k] = r.get<Shader::IR::Attribute>();
     }
-    i.handle_programs.resize((size_t)r.get<uint64_t>());
+    i.handle_programs.resize((size_t)r.count(sizeof(uint64_t)));   // (each at least its own count)
     for (auto& h : i.handle_programs) r.list(h);
 }
 
@@ -986,7 +1044,7 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             _fseeki64(disk_in, d.at, SEEK_SET);
             if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
         }
-        Reader r{data.data()};
+        Reader r{data.data(), data.data() + data.size()};
         auto p = std::make_unique<Program>();
         p->key = key;
         const uint32_t kind = r.get<uint32_t>();
@@ -995,9 +1053,9 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         p->variant = answers_hash(*p);
         p->workgroup = r.get<std::array<uint32_t, 3>>();
         p->shared_memory = r.get<uint32_t>();
-        const uint64_t n = r.get<uint64_t>();
-        bool ok = true;
-        for (uint64_t k = 0; k < n; k++) {
+        const uint64_t n = r.count(1);
+        bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
+        for (uint64_t k = 0; ok && k < n; k++) {
             p->stages.emplace_back();
             Stage& st = p->stages.back();
             st.nvn_stage = r.get<int>();
@@ -1006,10 +1064,20 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
             r.list(spirv);
             r.list(st.c1);
             get_info(r, st.info);
+            if (r.bad || spirv.empty()) {
+                ok = false;
+                break;
+            }
             st.module = make_module(spirv);
             ok = ok && st.module;
         }
-        if (!ok) continue;
+        if (!ok) {
+            static int logged;
+            if (r.bad && logged++ < 20)
+                logf("vk: program cache: the record of program %016llx at %lld (%zu bytes) is not whole: left out, translated again",
+                     (unsigned long long)key, (long long)d.at, d.size);
+            continue;
+        }
         p->ready.store(true, std::memory_order_release);
         variants.push_back(std::move(p));
         st_cache_hits++;
@@ -1484,6 +1552,27 @@ uint64_t prog_stage_sig(const nvn_prog& p) {
     for (int i = 0; i < 6; i++) h = h * 1099511628211ull ^ p.sd[i].data ^ (p.sd[i].control << 1);
     return h ^ p.serial;
 }
+// (hookshot) The stages whose bindings a graphics program's answers are read from, one bit a stage, when each answer is a handle in c2 of the
+// stage itself (a handle program reads uniform memory, another bank other state): then the pick stands while those stages' textures,
+// samplers and images do (NvnState::tex_gen), whatever else was bound. ~0: not so, the pick stands while nothing at all was bound anew
+uint32_t answer_stage_mask(const Program& p) {
+    uint32_t mask = 0;
+    for (const Program::Answer& a : p.answers) {
+        const Stage& st = p.stages[a.stage];
+        if (st.nvn_stage < 0 || st.nvn_stage > 4) return ~0u;
+        bool c2;
+        if (a.image) {
+            const auto& d = st.info.image_descriptors[a.desc];
+            c2 = d.handle_program == ~0U && d.cbuf_index == 2;
+        } else {
+            const auto& d = st.info.texture_descriptors[a.desc];
+            c2 = d.handle_program == ~0U && d.cbuf_index == 2 && (!d.has_secondary || d.secondary_cbuf_index == 2);
+        }
+        if (!c2) return ~0u;
+        mask |= 1u << st.nvn_stage;
+    }
+    return mask;
+}
 struct ProgFast {
     bool on = false;
     int kind = 0;
@@ -1492,6 +1581,8 @@ struct ProgFast {
     uint32_t vattr[16]{};
     uint8_t ct[8]{};
     const Program* p = nullptr;
+    uint32_t amask = ~0u;           // (answer_stage_mask of p, ~0 for a compute program)
+    uint64_t tex_gen[kNvnStages]{};   // (the stages' tex_gen it was kept at)
 };
 thread_local ProgFast prog_fast[2];
 
@@ -1499,17 +1590,32 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
     if (!s.has_prog) return nullptr;
     if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
     const bool compute = kind == ProgramKind::Compute;
-    static int64_t st_hit, st_none, st_differ, st_calls;   // (logged now and then: how the cache does)
+    static int64_t st_hit, st_none, st_differ, st_calls, st_by_tex;   // (logged now and then: how the cache does)
     if (++st_calls % 200000 == 0)
-        logf("vk: program picks: %lld kept, %lld new, %lld with other textures (of %lld)", (long long)st_hit,
-             (long long)st_none, (long long)st_differ, (long long)st_calls);
+        logf("vk: program picks: %lld kept (%lld by the last picks' textures, a uniform buffer bound since), %lld new, %lld with other textures (of %lld)",
+             (long long)st_hit, (long long)st_by_tex, (long long)st_none, (long long)st_differ, (long long)st_calls);
     const uint64_t stages = prog_stage_sig(s.prog);
     const uint64_t bind = s.bind_gen, reg = registrations_generation(), ub = ub_generation();
-    for (const ProgFast& f : prog_fast)   // (the draw before this one, and the one that took turns with it)
-        if (f.on && f.p && f.p->ready.load(std::memory_order_acquire) && !f.p->failed &&
-            prog_same((int)kind, s.prog.serial, stages, bind, reg, ub, s.nvattr, s.vattr, color_types, f.kind, f.serial,
-                      f.stages, f.bind, f.reg, f.ub, f.nvattr, f.vattr, f.ct))
+    // (hookshot) the pair of the last picks stood only while nothing at all was bound anew, and OoT binds a uniform buffer for nearly every
+    // draw: a draw of the same program with the same textures found its program through the full pick (the key, the answers' handles, a
+    // compare). It stands now while the textures its answers are read from do (answer_stage_mask). RX_VK_PICK_BIND_GEN=1: as before
+    static const bool by_bind = getenv("RX_VK_PICK_BIND_GEN") != nullptr;
+    for (const ProgFast& f : prog_fast) {   // (the draw before this one, and the one that took turns with it)
+        if (!(f.on && f.p && f.p->ready.load(std::memory_order_acquire) && !f.p->failed)) continue;
+        uint64_t fbind = f.bind;
+        bool by_tex = false;
+        if (fbind != bind && !by_bind && !compute && f.amask != ~0u) {
+            by_tex = true;
+            for (int k = 0; k < kNvnStages; k++)
+                if ((f.amask >> k & 1) && f.tex_gen[k] != s.tex_gen[k]) by_tex = false;
+            if (by_tex) fbind = bind;
+        }
+        if (prog_same((int)kind, s.prog.serial, stages, bind, reg, ub, s.nvattr, s.vattr, color_types, f.kind, f.serial,
+                      f.stages, fbind, f.reg, f.ub, f.nvattr, f.vattr, f.ct)) {
+            st_by_tex += by_tex && f.bind != bind;
             return st_hit++, f.p;
+        }
+    }
     const uint64_t key = (compute ? 0x5EED : pick_inputs(s, color_types)) * 1099511628211ull ^ s.prog.serial;
     Pick& pk = picks[key];
     auto keep = [&](const Program* p) {
@@ -1518,6 +1624,8 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
         ProgFast& f = prog_fast[0];
         f.on = true, f.kind = (int)kind, f.serial = s.prog.serial, f.stages = stages, f.bind = bind, f.reg = reg, f.ub = ub;
         f.nvattr = s.nvattr, f.p = p;
+        f.amask = compute ? ~0u : answer_stage_mask(*p);
+        std::memcpy(f.tex_gen, s.tex_gen, sizeof f.tex_gen);
         std::memcpy(f.vattr, s.vattr, sizeof f.vattr);
         std::memcpy(f.ct, color_types, sizeof f.ct);
         return p;

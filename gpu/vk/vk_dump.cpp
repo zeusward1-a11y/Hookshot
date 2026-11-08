@@ -11,6 +11,7 @@
 #include <direct.h>
 
 #include "vk_dump.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 namespace {

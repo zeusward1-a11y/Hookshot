@@ -20,7 +20,9 @@ def main():
     start=s.index('        const uint64_t value = ',s.index('void do_present('));end=s.index('\n',s.index('        present_value = 0;',start))
     present=s[start:end]
     source_submit=block(s,'void submit_q(');source_present=block(s,'void present(')
-    ordered_submit=next(l for l in source_submit.splitlines() if 'submit_job(h, ++q_values, queue);' in l)
+    # (8c28ed7 takes the value first, for the queue it belongs to, then submits it: both lines, as the source has them)
+    ordered_submit='\n'.join(next(l for l in source_submit.splitlines() if text in l)
+                             for text in ('const uint64_t value = ++q_values;','submit_job(h, value, queue);'))
     ordered_present=next(l for l in source_present.splitlines() if 'present_value = ++q_values;' in l)
     enqueue=next(l for l in block(s,'void enqueue(').splitlines() if 'j.value = ++q_values;' in l)
     fixture=r'''#include <algorithm>

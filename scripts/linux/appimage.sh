@@ -22,7 +22,7 @@ PY=$DEPS/python/bin/python3
 # ---- the Vulkan back end, built here once (it needs no game) ----
 VKW=$B/vk-work
 rm -rf "$VKW/sa/build/hookshot_vk.so"
-OOT_WORK=$VKW RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
+OOT_WORK=$VKW RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 "$PY" -I nx2/build.py --standalone --jobs "${JOBS:-$(nproc)}"
 VK=$VKW/sa/build/hookshot_vk.so
 [ -f "$VK" ] || { echo "hookshot_vk.so was not built"; exit 1; }
 
@@ -62,6 +62,7 @@ find "$T" -name __pycache__ -prune -exec rm -rf {} +
 
 # ---- what it builds with ----
 cp -a "$DEPS/python" "$APPDIR/usr/python"
+cp "$DEPS/tk/libtcl9tk9.0.so" "$DEPS/tk/libXft.so.2" "$DEPS/tk/libXrender.so.1" "$APPDIR/usr/python/lib/"
 mkdir -p "$L/emsdk"
 cp -a "$DEPS/emsdk/upstream" "$L/emsdk/"
 cp -a "$DEPS/ffmpeg" "$L/ffmpeg"
@@ -106,6 +107,9 @@ cp builder/linux/hookshot-builder.desktop "$APPDIR/"
 cp assets/hookshot.png "$APPDIR/hookshot.png"
 mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp assets/hookshot.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hookshot.png"
+
+# (the update list, beside AppRun and not inside a hashed part: hookshot-linux.txt names each part's checksum)
+python3 scripts/linux/make_parts.py "$APPDIR" "$VERSION" "$B/parts"
 
 OUT=$B/Hookshot-$VERSION-x86_64.AppImage
 rm -f "$OUT"

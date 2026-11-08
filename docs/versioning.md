@@ -80,8 +80,9 @@ Every push to `main` or `next` runs the [Release workflow](../.github/workflows/
 2. takes the highest bump in the table above;
 3. runs `scripts/changelog.py` to put the new entry at the top of `changelog.txt`;
 4. commits `changelog.txt` as `chore(release): <version> [skip ci] [skip release]`;
-5. tags the release commit. The tag starts the Linux AppImage workflow, which publishes the GitHub release with the
-   AppImage attached.
+5. tags the release commit. The tag starts the Linux AppImage and Windows builder workflows: the first to finish makes
+   the GitHub release, and each attaches its files (the AppImage; `HookshotBuilder.exe`, the setup, and
+   `hookshot-setup.txt`, with the new parts in the `builder-parts` release). `scripts/release_upload.sh` is shared by both.
 
 A merge with no releasable commit (only docs, chores, and so on) makes no release. A release is never edited by hand,
 never re-tagged and never deleted. Require the *Game-free source regressions* workflow on `main` and `next` (branch
@@ -89,9 +90,9 @@ protection): the release then runs for a commit whose tests have passed.
 
 The workflow pushes back to the repository, so it needs a token with `contents: write` that may bypass `main`'s branch
 protection. Use a `RELEASE_TOKEN` secret (a fine-grained personal access token) rather than the built-in
-`GITHUB_TOKEN`: a tag pushed with `GITHUB_TOKEN` does not start another workflow, and the Linux AppImage workflow
-publishes the release from the tag. With only `GITHUB_TOKEN`, build the AppImage with `workflow_dispatch` and create the
-release by hand.
+`GITHUB_TOKEN`: a tag pushed with `GITHUB_TOKEN` does not start another workflow, and the Linux AppImage and Windows
+builder workflows publish the release from the tag. With only `GITHUB_TOKEN`, build both with `workflow_dispatch` and
+create the release by hand.
 
 ## The first tag: 0.1.0
 
@@ -136,7 +137,7 @@ patch. The project does not keep maintenance branches for older minor versions: 
 | `hookshot_log.txt` and the Insert menu | `nx2/version.py`: `HOOKSHOT_VERSION`, then `VERSION`/`version.txt`, then `git describe --tags --match "v[0-9]*"` |
 | `hookshot_version.txt` in a build | the `VERSION` file written when the tools are packaged (`nx2/make_game.py`) |
 | AppImage file name | `git describe --tags --match "v[0-9]*"` (`scripts/linux/appimage.sh`) |
-| `HookshotBuilder.exe` | the MSBuild `Version` passed at publish time (`dotnet publish -p:Version=<version>`); the `csproj`'s `0.1.0` is only the default for a local build |
+| `HookshotBuilder.exe` | the MSBuild `Version` passed at publish time (`dotnet publish -p:Version=<version>`, the Windows builder workflow); the `csproj`'s `0.1.0` is only the default for a local build |
 
 `nx2/version.py` also appends a fingerprint of the source files, `(source 1a2b3c4d)`. It is not a version: it tells
 two builds of the same release apart, and it is the only identifier a build from a modified checkout has.

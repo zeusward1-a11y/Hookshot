@@ -6,6 +6,8 @@
 #   Hookshot.AppImage --play <folder>  start the game in that folder
 #   Hookshot.AppImage <folder>         the same
 #   Hookshot.AppImage --cli <args>     nx2/make_game.py itself, e.g. --cli --nup game.nup --out ~/Games/Hookshot
+#   Hookshot.AppImage --launch <dir>  the game folder's launcher: Play, and Update when a newer release is out
+#   Hookshot.AppImage --update <dir>  download the new release (only the parts that changed) and build that folder again
 HERE="$(dirname "$(readlink -f "$0")")"
 LIB="$HERE/usr/lib/hookshot"
 export HOOKSHOT_TOOLS="$HERE/usr/share/hookshot"
@@ -14,6 +16,12 @@ export HOOKSHOT_SYSROOT="$LIB/sysroot"
 export HOOKSHOT_FFMPEG="$LIB/ffmpeg"
 export HOOKSHOT_VK_PREBUILT="$LIB/hookshot_vk.so"
 export HOOKSHOT_SDL2="$LIB/libSDL2-2.0.so.0"
+# (written into the game folder's hookshot_version.txt, so its launcher finds this builder)
+if [ -n "${APPIMAGE:-}" ]; then
+    export HOOKSHOT_BUILDER_EXE="$APPIMAGE"
+else
+    export HOOKSHOT_BUILDER_EXE="$HERE/AppRun"
+fi
 PY="$HERE/usr/python/bin/python3"
 if [ "${1:-}" = "--cli" ]; then
     shift

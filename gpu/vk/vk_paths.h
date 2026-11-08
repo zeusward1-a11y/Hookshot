@@ -3,8 +3,16 @@
 // game_module_path answers as GetModuleFileNameA(nullptr, ...) does, with the folder's path when the exe is in a "bin" folder
 // beside image.bin.
 #pragma once
-#include <cstring>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
+#undef min
+#undef max
+#include <cstring>
 
 namespace mkwvk {
 inline DWORD game_module_path(char* buf, DWORD size) {

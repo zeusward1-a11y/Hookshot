@@ -59,6 +59,7 @@ struct Program {
     };
     std::vector<Answer> answers;
     uint64_t variant = 0;   // (a hash of the answers: key alone names all the variants of these stages)
+    mutable std::atomic<int64_t> wm_sig{-1};   // (hookshot: what its write masks are made from, vk_draw.cpp program_wm_sig; -1: not asked yet)
 };
 
 enum class ProgramKind { Graphics, Compute, Mesh };

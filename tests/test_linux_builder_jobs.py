@@ -1,6 +1,8 @@
 """Exercise the production Linux build method without importing Tk or starting a build."""
 import ast
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -8,6 +10,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "builder" / "linux" / "hookshot_builder.py"
@@ -28,9 +31,9 @@ def value(text):
 
 
 class BuildHarness:
-    def __init__(self, folder, environ, kind="nup", fallback=2):
+    def __init__(self, folder, environ, kind="nup"):
         self.environ = dict(environ)
-        self.default_calls, self.events, self.processes = [], [], []
+        self.events, self.processes = [], []
         self.folder = folder
         nup = folder / "synthetic.nup"
         nup.touch()
@@ -41,10 +44,6 @@ class BuildHarness:
             out=value(str(folder / "out")), kind=value(kind), nup=value(str(nup)),
             romfs=value(str(romfs)), exefs=value(str(exefs)), language=value("English (US)"),
             cfg={"previous": "kept"}, show_progress=lambda: self.events.append(("progress",)), read=lambda proc: None)
-
-        def default_jobs(gb_per_job):
-            self.default_calls.append(gb_per_job)
-            return fallback
 
         def start_process(command, **kwargs):
             self.events.append(("process",))
@@ -57,7 +56,9 @@ class BuildHarness:
 
         namespace = {
             "os": SimpleNamespace(path=os.path, environ=self.environ), "ROOT": str(ROOT),
-            "sys": sys, "make_game": make_game, "toolchain": SimpleNamespace(default_jobs=default_jobs),
+            "sys": sys, "make_game": make_game,
+            # (toolchain.default_jobs is only asked for RX_JOBS now: it answers RX_JOBS as the real one does)
+            "toolchain": SimpleNamespace(default_jobs=lambda: max(1, int(self.environ["RX_JOBS"]))),
             "messagebox": SimpleNamespace(showerror=lambda title, text: self.events.append(("error", title, text))),
             "save_config": lambda cfg: self.events.append(("save", dict(cfg))),
             "time": SimpleNamespace(time=lambda: 123.0),
@@ -77,12 +78,12 @@ class BuilderBuildJobsTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.folder = Path(self.temporary.name)
 
-    def assert_started(self, harness, jobs):
+    def assert_started(self, harness, jobs=None):
         self.assertEqual([event[0] for event in harness.events], ["save", "progress", "process", "thread", "start"])
         gui = harness.gui
         source = ["--nup", gui.nup.get()] if gui.kind.get() == "nup" else ["--romfs", gui.romfs.get(), "--exefs", gui.exefs.get()]
         expected = [sys.executable, "-I", str(ROOT / "nx2" / "make_game.py")] + source + [
-            "--out", gui.out.get(), "--language", "en-US", "--jobs", str(jobs)]
+            "--out", gui.out.get(), "--language", "en-US"] + ([] if jobs is None else ["--jobs", str(jobs)])
         self.assertEqual(len(harness.processes), 1)
         command, options = harness.processes[0]
         self.assertEqual(command, expected)
@@ -92,44 +93,48 @@ class BuilderBuildJobsTests(unittest.TestCase):
                                                   romfs=gui.romfs.get(), exefs=gui.exefs.get(), out=gui.out.get(), language="en-US"))
         self.assertEqual(harness.events[3][1], dict(target=gui.read, args=(gui.proc,), daemon=True))
 
-    def test_positive_hookshot_jobs_wins_over_legacy_fallback(self):
+    def test_positive_hookshot_jobs_is_passed_on(self):
         harness = BuildHarness(self.folder, {"HOOKSHOT_JOBS": "4", "RX_JOBS": "2"})
         harness.run()
         self.assert_started(harness, 4)
-        self.assertEqual(harness.default_calls, [])
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": "4", "RX_JOBS": "2"})
 
-    def test_zero_delegates_to_existing_fallback_for_extracted_folders(self):
+    def test_zero_falls_back_to_rx_jobs_for_extracted_folders(self):
         harness = BuildHarness(self.folder, {"HOOKSHOT_JOBS": "0", "RX_JOBS": "2"}, kind="folders")
         harness.run()
         self.assert_started(harness, 2)
-        self.assertEqual(harness.default_calls, [3.5])
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": "0", "RX_JOBS": "2"})
 
-    def test_unset_delegates_to_existing_fallback(self):
+    def test_unset_falls_back_to_rx_jobs(self):
         harness = BuildHarness(self.folder, {"RX_JOBS": "2"})
         harness.run()
         self.assert_started(harness, 2)
-        self.assertEqual(harness.default_calls, [3.5])
         self.assertEqual(harness.environ, {"RX_JOBS": "2"})
 
-    def test_empty_delegates_without_changing_inherited_environment(self):
+    def test_empty_falls_back_to_rx_jobs_without_changing_inherited_environment(self):
         harness = BuildHarness(self.folder, {"HOOKSHOT_JOBS": "", "RX_JOBS": "2"})
         harness.run()
         self.assert_started(harness, 2)
-        self.assertEqual(harness.default_calls, [3.5])
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": "", "RX_JOBS": "2"})
 
-    def test_no_override_keeps_the_default_memory_selection(self):
-        harness = BuildHarness(self.folder, {}, fallback=3)
+    # (issue 531) Neither set: no --jobs, so make_game chooses from the free memory, as on Windows
+    def test_no_override_leaves_the_choice_to_make_game(self):
+        for environ in ({}, {"HOOKSHOT_JOBS": "0"}, {"HOOKSHOT_JOBS": "", "RX_JOBS": ""}):
+            with self.subTest(environ=environ):
+                harness = BuildHarness(self.folder, environ)
+                harness.run()
+                self.assert_started(harness)
+
+    def test_invalid_rx_jobs_stops_before_build_side_effects(self):
+        harness = BuildHarness(self.folder, {"RX_JOBS": "n"})
         harness.run()
-        self.assert_started(harness, 3)
-        self.assertEqual(harness.default_calls, [3.5])
+        self.assertEqual(harness.processes, [])
+        self.assertEqual(harness.gui.cfg, {"previous": "kept"})
+        self.assertEqual([event[0] for event in harness.events], ["error"])
 
     def assert_invalid(self, raw):
         harness = BuildHarness(self.folder, {"HOOKSHOT_JOBS": raw, "RX_JOBS": "2"})
         harness.run()
-        self.assertEqual(harness.default_calls, [])
         self.assertEqual(harness.gui.cfg, {"previous": "kept"})
         self.assertEqual(harness.processes, [])
         self.assertFalse(hasattr(harness.gui, "started"))
@@ -146,6 +151,55 @@ class BuilderBuildJobsTests(unittest.TestCase):
 
     def test_nonnumeric_override_stops_before_build_side_effects(self):
         self.assert_invalid("n")
+
+
+class MakeGameJobsTests(unittest.TestCase):
+    """make_game's own choice, which the Linux window now leaves to it (issue 531)"""
+
+    def choose(self, cpus, free_gb, os_name):
+        with mock.patch.object(make_game.os, "cpu_count", return_value=cpus), \
+                mock.patch.object(make_game, "free_memory_gb", return_value=free_gb), \
+                mock.patch.object(make_game.os, "name", os_name), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return make_game.default_jobs()
+
+    def test_one_a_cpu_thread_and_the_memory_gate_decides(self):
+        # (nx2/build.py's MemoryGate starts each compiler when the memory free holds it, so the count is not fitted to the free
+        # memory at the start; the window chose 7 from 32 GB total at 3.5 GB each on a 16-thread PC)
+        self.assertEqual(self.choose(16, 24.0, "posix"), 16)
+        self.assertEqual(self.choose(16, 24.0, "nt"), 16)
+        self.assertEqual(self.choose(32, 3.0, "posix"), 32)
+
+    def test_the_gate_floor_is_windows_only(self):
+        # (Windows pages rather than fails; Linux stops a compiler that does not fit)
+        import build
+        with mock.patch.object(build.os, "cpu_count", return_value=16), mock.patch.object(build.os, "name", "nt"):
+            self.assertEqual(build.MemoryGate().floor, 4)
+        with mock.patch.object(build.os, "cpu_count", return_value=16), mock.patch.object(build.os, "name", "posix"):
+            self.assertEqual(build.MemoryGate().floor, 1)
+
+    def test_memory_not_known_is_one_a_thread(self):
+        self.assertEqual(self.choose(12, None, "posix"), 12)
+
+    def chosen(self, given, environ):
+        calls = []
+        with mock.patch.dict(make_game.os.environ, environ, clear=True), \
+                mock.patch.object(make_game, "default_jobs", side_effect=lambda: calls.append(1) or 9):
+            return make_game.chosen_jobs(given), calls
+
+    def test_jobs_given_wins_and_nothing_is_worked_out(self):
+        # (the "compilers at once" line was printed even when --jobs was given, with a number the build did not use)
+        self.assertEqual(self.chosen(5, {"HOOKSHOT_JOBS": "3"}), (5, []))
+
+    def test_hookshot_jobs_then_automatic(self):
+        self.assertEqual(self.chosen(0, {"HOOKSHOT_JOBS": "3"}), (3, []))
+        self.assertEqual(self.chosen(0, {"HOOKSHOT_JOBS": "0"}), (9, [1]))
+        self.assertEqual(self.chosen(0, {"HOOKSHOT_JOBS": ""}), (9, [1]))
+        self.assertEqual(self.chosen(0, {}), (9, [1]))
+
+    def test_invalid_hookshot_jobs_stops_with_its_message(self):
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+            self.chosen(0, {"HOOKSHOT_JOBS": "n"})
 
 
 if __name__ == "__main__":

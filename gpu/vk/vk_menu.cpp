@@ -14,6 +14,7 @@
 
 #include "vk_paths.h"
 #include "vk_menu.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
 #endif
@@ -25,7 +26,15 @@ Options opts;
 
 namespace {
 
+enum MenuTab {
+    TAB_GRAPHICS = 0,
+    TAB_GAMEPLAY = 1,
+    TAB_CONTROLS = 2,
+    TAB_COUNT = 3
+};
+
 struct Row {
+    MenuTab tab;
     const char* name;
     int* value;
     int lo, hi, step;
@@ -37,6 +46,12 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_mousecam(int v) { return v ? "Native" : "As the stick"; }
+const char* tx_sens(int v) {
+    static char b[12];
+    snprintf(b, sizeof b, "%.2f", v / 100.0);
+    return b;
+}
 const char* tx_upscale(int v) {
     static const char* t[] = {"Off", "Catmull-Rom", "Lanczos"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
@@ -59,6 +74,23 @@ const char* tx_text_speed(int v) {
 }
 const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
 const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9 (restart)"; }
+int gpu_device_at_start = 0;   // (the row's value the game started with: menu_set_gpu_count)
+const char* tx_gpu(int v) {
+    static char buf[300];
+    const int idx = v - 1;
+    if (v <= 0) snprintf(buf, sizeof buf, "Auto");
+    else if (idx < (int)gpu_device_names.size()) snprintf(buf, sizeof buf, "%d: %s", idx, gpu_device_names[idx].c_str());
+    else snprintf(buf, sizeof buf, "%d: Device %d", idx, idx);
+    // (a GPU other than the one in use: it takes a restart, said where the choice is, as Handheld and Ultrawide say it.
+    // The whole name shows: the selected row slides through it, see marquee_pos)
+    if (v != gpu_device_at_start) strncat(buf, " (restart)", sizeof buf - strlen(buf) - 1);
+    return buf;
+}
+const char* tx_pad_layout(int v);
+const char* tx_robust(int v) {
+    static const char* t[] = {"Auto (restart)", "Off (restart)", "On (restart)"};
+    return (unsigned)v < 3 ? t[v] : t[0];
+}
 const char* tx_preset(int v) {
     static const char* t[] = {"Custom", "Minimum (4GB)", "Low (6GB)", "Balanced (8GB)", "High (12GB)", "Ultra (16GB+)"};
     return t[std::min(std::max(v, 0), 5)];
@@ -102,47 +134,100 @@ void apply_preset(int p) {
 }
 
 Row rows[] = {
-    {"Quality preset", &opts.preset, 0, 5, 1, tx_preset,
+    // Graphics (11 rows)
+    {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
      "Automatically configures resolution, upscaling, frame generation, and dynamic VRAM limits tailored to your GPU tier."},
-    {"Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
+    {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "Fills the whole screen with the game, without the window's border. The same as F11."},
-    {"Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
+    {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
+     "Selects which graphics card Vulkan uses. Auto picks the best dedicated GPU. Applies after restart."},
+    {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes extra frames between the game's own (2x up to 8x), for smoother motion. Adds a little input delay, and fast motion or camera cuts "
      "can show artifacts."},
-    {"Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
+    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
-    {"Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
+    {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
      "faster."},
-    {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
+    {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
-    {"Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
+    {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
-    {"Game speed", &opts.realtime, 0, 1, 1, tx_speed,
+    {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
+     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
+    {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
+     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
+    {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
+     "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; "
+     "Off can be faster on some NVIDIA cards. Applies after restart."},
+
+    // Gameplay (3 rows)
+    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
+     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
+    {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed,
      "Per frame: the game slows down whenever it runs below 60 fps. Real time: it keeps normal speed down to 15 fps by taking "
      "longer steps."},
-    {"Handheld profile", &opts.handheld, 0, 1, 1, tx_handheld,
-     "Runs the game as if the console were undocked: lower resolutions, lighter on the GPU. Applies after a restart."},
-    {"Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
-     "Monitor's shape widens the camera to fill a screen wider than 16:9. The HUD is still stretched. Applies after a restart."},
-    {"FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
-     "Shows frames per second in the top right corner. With frame generation on, it also shows the game's own rate."},
-    {"Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
-     "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
-     "apps. The keyboard and mouse still need the game's window."},
-    {"Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
+    {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear. Normal is the game's own pace, with its pauses. Instant shows "
      "each page at once, as pressing A does."},
 
-    {"Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
+    // Controls (8 rows)
+    {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
+     "On: the controller keeps playing the game while another window has the focus, for streaming or playing beside other "
+     "apps. The keyboard and mouse still need the game's window."},
+    {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam,
+     "Native: the captured mouse turns the camera itself, one to one, as in a PC game. As the stick: the mouse stands in for "
+     "the right stick, with its curve and top speed."},
+    {TAB_CONTROLS, "Mouse sensitivity", &opts.mouse_sens, 10, 500, 10, tx_sens,
+     "How far the camera turns for a given mouse movement, for either Mouse camera. At 1.00 native look turns a tenth of a "
+     "degree a count. The - and = keys change it in the game too."},
+    {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff,
+     "Swaps up and down for the mouse: moving it forward tilts the camera down."},
+    {TAB_CONTROLS, "Invert camera X", &opts.invert_cam_x, 0, 1, 1, tx_onoff,
+     "Inverts horizontal look (left/right) on the right analog stick."},
+    {TAB_CONTROLS, "Invert camera Y", &opts.invert_cam_y, 0, 1, 1, tx_onoff,
+     "Inverts vertical look (up/down) on the right analog stick."},
+    {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
+     "Nintendo (default Switch order), Xbox / PC (A for action/talk), or Swap Face. Individual bindings switch this to Custom."},
+    {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (hookshot: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
 };
 constexpr int kRows = sizeof rows / sizeof rows[0];
-constexpr int kMenuWidth = 360;   // (at a scale of 1: 720 lines)
+constexpr int kMenuWidth = 480;   // (at a scale of 1: 720 lines)
+
+int cur_tab = TAB_GRAPHICS;
+int tab_selected[TAB_COUNT] = {0, 0, 0};
+
+int tab_row_count(int t) {
+    int c = 0;
+    for (int i = 0; i < kRows; i++) if (rows[i].tab == (MenuTab)t) c++;
+    return c;
+}
+/// The most rows a tab has: the menu keeps that height whichever tab is shown
+int max_tab_rows() {
+    int most = 0;
+    for (int t = 0; t < TAB_COUNT; t++) most = std::max(most, tab_row_count(t));
+    return most;
+}
+
+int tab_row_to_global(int t, int local_idx) {
+    int count = 0;
+    for (int i = 0; i < kRows; i++) {
+        if (rows[i].tab == (MenuTab)t) {
+            if (count == local_idx) return i;
+            count++;
+        }
+    }
+    return 0;
+}
 
 std::atomic<bool> open_now{false};
-int selected = 0;
 bool menu_refresh = false;
+// (a value too long for its row, a GPU's name: the selected row's slides through it, a character a step, resting at
+// each end; the other rows end it with "...". paint_menu says how far it can slide, menu_tick moves it)
+int marquee_pos = 0, marquee_max = 0;
+int64_t marquee_next = 0;
+constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // (ns)
 std::string ini_path() {
     char exe[MAX_PATH];
     const DWORD n = game_module_path(exe, MAX_PATH);
@@ -157,9 +242,44 @@ const char* ini_key(const Row& r) {
     return k;
 }
 // (hookshot) the controls, kept by the host (host/nn_hid.c reads them back from here): pad_<button>, key_<button>
-const char* const bind_names[HOS_SW_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus", "minus",
-                                          "left", "up", "right", "down"};
+const char* const bind_names[HOS_KEY_N] = {"a", "b", "x", "y", "ls", "rs", "l", "r", "zl", "zr", "plus", "minus",
+                                           "left", "up", "right", "down", "move_up", "move_down", "move_left",
+                                           "move_right", "cam_up", "cam_down", "cam_left", "cam_right"};
 bool can_bind() { return host && host->binding && host->bind && host->pad_raw; }
+const char* tx_pad_layout(int v) {
+    static const char* t[] = {"Nintendo (Def)", "Xbox / PC", "Swap Face", "Custom"};
+    return t[std::min(std::max(v, 0), 3)];
+}
+void apply_pad_layout(int layout) {
+    if (!can_bind()) return;
+    if (layout == 0) { // Nintendo (Default: Bottom=B, Right=A, Top=X, Left=Y)
+        host->bind(HOS_BIND_PAD, HOS_SW_A, 0, HOS_PAD_EAST);
+        host->bind(HOS_BIND_PAD, HOS_SW_B, 0, HOS_PAD_SOUTH);
+        host->bind(HOS_BIND_PAD, HOS_SW_X, 0, HOS_PAD_NORTH);
+        host->bind(HOS_BIND_PAD, HOS_SW_Y, 0, HOS_PAD_WEST);
+    } else if (layout == 1) { // Xbox / PC Standard (Bottom=A, Right=B, Left=X, Top=Y)
+        host->bind(HOS_BIND_PAD, HOS_SW_A, 0, HOS_PAD_SOUTH);
+        host->bind(HOS_BIND_PAD, HOS_SW_B, 0, HOS_PAD_EAST);
+        host->bind(HOS_BIND_PAD, HOS_SW_X, 0, HOS_PAD_WEST);
+        host->bind(HOS_BIND_PAD, HOS_SW_Y, 0, HOS_PAD_NORTH);
+    } else if (layout == 2) { // Swap Face Buttons (Bottom=A, Right=B, Top=X, Left=Y)
+        host->bind(HOS_BIND_PAD, HOS_SW_A, 0, HOS_PAD_SOUTH);
+        host->bind(HOS_BIND_PAD, HOS_SW_B, 0, HOS_PAD_EAST);
+        host->bind(HOS_BIND_PAD, HOS_SW_X, 0, HOS_PAD_NORTH);
+        host->bind(HOS_BIND_PAD, HOS_SW_Y, 0, HOS_PAD_WEST);
+    }
+}
+int detect_pad_layout() {
+    if (!can_bind()) return opts.pad_layout;
+    const int a = host->binding(HOS_BIND_PAD, HOS_SW_A, 0);
+    const int b = host->binding(HOS_BIND_PAD, HOS_SW_B, 0);
+    const int x = host->binding(HOS_BIND_PAD, HOS_SW_X, 0);
+    const int y = host->binding(HOS_BIND_PAD, HOS_SW_Y, 0);
+    if (a == HOS_PAD_EAST && b == HOS_PAD_SOUTH && x == HOS_PAD_NORTH && y == HOS_PAD_WEST) return 0;
+    if (a == HOS_PAD_SOUTH && b == HOS_PAD_EAST && x == HOS_PAD_WEST && y == HOS_PAD_NORTH) return 1;
+    if (a == HOS_PAD_SOUTH && b == HOS_PAD_EAST && x == HOS_PAD_NORTH && y == HOS_PAD_WEST) return 2;
+    return 3;
+}
 void save() {
     // (hookshot) the lines that are not the menu's are kept: the controls, pad_ and key_ (host/nn_hid.c)
     std::string kept;
@@ -172,26 +292,34 @@ void save() {
     if (FILE* f = fopen(ini_path().c_str(), "w")) {
         for (const Row& r : rows)
             if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
-        fprintf(f, "options_version=2\n");   // (game_speed below 2 was only ever the old default, see menu_init)
+        // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
+        // host/nn_hid.c binds_load)
+        fprintf(f, "options_version=3\n");
         if (!can_bind()) fputs(kept.c_str(), f);
-        for (int i = 0; i < HOS_SW_N && can_bind(); i++)
-            fprintf(f, "pad_%s=%d\nkey_%s=%d,%d\n", bind_names[i], host->binding(HOS_BIND_PAD, i, 0), bind_names[i],
-                    host->binding(HOS_BIND_KEY, i, 0), host->binding(HOS_BIND_KEY, i, 1));
+        for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
+            if (i < HOS_SW_N) fprintf(f, "pad_%s=%d\n", bind_names[i], host->binding(HOS_BIND_PAD, i, 0));
+            fprintf(f, "key_%s=%d,%d\n", bind_names[i], host->binding(HOS_BIND_KEY, i, 0), host->binding(HOS_BIND_KEY, i, 1));
+        }
         fclose(f);
     }
 }
 
 // ---- (hookshot) the Controls page: what presses each of the Switch's buttons, a gamepad input and up to two keys ----
 struct Control {
-    int button;   // HOS_SW_*
+    int button;   // HOS_SW_*, or HOS_KEY_* (keys only)
     const char* name;
 };
 const Control controls[] = {{HOS_SW_A, "A"}, {HOS_SW_B, "B"}, {HOS_SW_X, "X"}, {HOS_SW_Y, "Y"}, {HOS_SW_L, "L"},
                             {HOS_SW_R, "R"}, {HOS_SW_ZL, "ZL"}, {HOS_SW_ZR, "ZR"}, {HOS_SW_PLUS, "Plus"},
                             {HOS_SW_MINUS, "Minus"}, {HOS_SW_LS, "Left stick press"}, {HOS_SW_RS, "Right stick press"},
                             {HOS_SW_UP, "D-pad up"}, {HOS_SW_DOWN, "D-pad down"}, {HOS_SW_LEFT, "D-pad left"},
-                            {HOS_SW_RIGHT, "D-pad right"}};
+                            {HOS_SW_RIGHT, "D-pad right"}, {HOS_KEY_MOVE_UP, "Move forward"},
+                            {HOS_KEY_MOVE_DOWN, "Move back"}, {HOS_KEY_MOVE_LEFT, "Move left"},
+                            {HOS_KEY_MOVE_RIGHT, "Move right"}, {HOS_KEY_CAM_UP, "Camera up"},
+                            {HOS_KEY_CAM_DOWN, "Camera down"}, {HOS_KEY_CAM_LEFT, "Camera left"},
+                            {HOS_KEY_CAM_RIGHT, "Camera right"}};
 constexpr int kControls = sizeof controls / sizeof controls[0];   // (then "Reset to defaults")
+bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_SW_N; }   // (no gamepad input for those)
 const char* pad_name(int p) {
     static const char* t[HOS_PAD_N] = {"Bottom button", "Right button", "Left button", "Top button", "Select / Back",
                                        "Home", "Start", "Left stick press", "Right stick press", "L1 / LB", "R1 / RB",
@@ -236,6 +364,11 @@ const char* key_name(int vk) {
     case VK_OEM_5: return "\\";
     case VK_OEM_6: return "]";
     case VK_OEM_7: return "'";
+    case VK_LBUTTON: return "Left click";
+    case VK_RBUTTON: return "Right click";
+    case VK_MBUTTON: return "Middle click";
+    case 0x05: return "Mouse 4";   // (VK_XBUTTON1)
+    case 0x06: return "Mouse 5";
     }
     return snprintf(b, sizeof b, "Key %d", vk), b;
 }
@@ -250,7 +383,8 @@ const std::vector<int>& bindable_keys() {
         for (int c : {VK_SPACE, VK_SHIFT, VK_CONTROL, VK_MENU, VK_TAB, VK_RETURN, VK_BACK, VK_CAPITAL, VK_UP, VK_DOWN,
                       VK_LEFT, VK_RIGHT, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_ADD, VK_SUBTRACT, VK_MULTIPLY,
                       VK_DIVIDE, VK_DECIMAL, VK_OEM_1, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
-                      VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7})
+                      VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_LBUTTON, VK_RBUTTON, VK_MBUTTON,
+                      0x05, 0x06})   // (the mouse's buttons too: they count while the mouse is captured)
             k.push_back(c);
     }
     return k;
@@ -411,7 +545,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             const Control& c = controls[i];
             TextOutA(dc, 16 * s, y + 3 * s, c.name, (int)strlen(c.name));
             for (int col = 0; col < 2; col++) {
-                std::string v = col == 0 ? pad_name(host->binding(HOS_BIND_PAD, c.button, 0)) : keys_text(c.button);
+                std::string v = col == 0 ? (keys_only(i) ? "-" : pad_name(host->binding(HOS_BIND_PAD, c.button, 0)))
+                                         : keys_text(c.button);
                 if (sel && col == ccol && listening) v = col == 0 ? "Press a button..." : "Press a key...";
                 if (sel && col == ccol) {
                     SIZE sz{};
@@ -433,28 +568,100 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         DeleteObject(body);
         return;
     }
-    const int rh = 28 * s, top = 44 * s;
-    for (int i = 0; i < kRows; i++) {
-        const int y = top + i * rh;
-        if (i == selected) fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
-        SetTextColor(dc, i == selected ? RGB(255, 255, 255) : RGB(196, 204, 198));
-        TextOutA(dc, 16 * s, y + 4 * s, rows[i].name, (int)strlen(rows[i].name));
-        char v[40];
-        if (!rows[i].value) snprintf(v, sizeof v, ">");   // (a page)
-        else snprintf(v, sizeof v, i == selected ? "<  %s  >" : "%s", rows[i].text(*rows[i].value));
-        SIZE sz{};
-        GetTextExtentPoint32A(dc, v, (int)strlen(v), &sz);
-        TextOutA(dc, (int)w - 16 * s - sz.cx, y + 4 * s, v, (int)strlen(v));
+    // the tab strip: Graphics, Gameplay, Controls (Q and E, the bumpers or Tab change it: menu_tick)
+    const int tab_y = 44 * s;
+    const int tab_h = 32 * s;
+    fill(dc, 0, tab_y, (int)w, tab_h, RGB(22, 28, 25));
+    HFONT small_font = font(12 * s, FW_SEMIBOLD);
+    SelectObject(dc, small_font);
+    SetTextColor(dc, RGB(110, 135, 120));
+    TextOutA(dc, 16 * s, tab_y + 8 * s, "[Q / LB]", 8);
+    const char* rb_hint = "[E / RB]";
+    SIZE rbsz{};
+    GetTextExtentPoint32A(dc, rb_hint, (int)strlen(rb_hint), &rbsz);
+    TextOutA(dc, (int)w - 16 * s - rbsz.cx, tab_y + 8 * s, rb_hint, (int)strlen(rb_hint));
+    HFONT tab_font = font(13 * s, FW_BOLD);
+    SelectObject(dc, tab_font);
+    const char* const tab_titles[TAB_COUNT] = {"GRAPHICS", "GAMEPLAY", "CONTROLS"};
+    const int center_start = 85 * s;
+    const int center_width = (int)w - 170 * s;
+    const int tab_slot_w = center_width / TAB_COUNT;
+    for (int t = 0; t < TAB_COUNT; t++) {
+        const bool active = (t == cur_tab);
+        int slot_x = center_start + t * tab_slot_w;
+        SIZE tsz{};
+        GetTextExtentPoint32A(dc, tab_titles[t], (int)strlen(tab_titles[t]), &tsz);
+        int text_x = slot_x + (tab_slot_w - tsz.cx) / 2;
+        int text_y = tab_y + 8 * s;
+        if (active) {   // (a pill behind it and a golden underline)
+            fill(dc, text_x - 10 * s, tab_y + 3 * s, tsz.cx + 20 * s, tab_h - 6 * s, RGB(38, 64, 48));
+            fill(dc, text_x - 10 * s, tab_y + tab_h - 2 * s, tsz.cx + 20 * s, 2 * s, RGB(235, 205, 95));
+            SetTextColor(dc, RGB(255, 255, 255));
+        } else {
+            SetTextColor(dc, RGB(135, 150, 142));
+        }
+        TextOutA(dc, text_x, text_y, tab_titles[t], (int)strlen(tab_titles[t]));
     }
-    const int help_top = top + kRows * rh + 8 * s;
+    SelectObject(dc, body);
+    DeleteObject(tab_font);
+    DeleteObject(small_font);
+    fill(dc, 0, tab_y + tab_h, (int)w, std::max(1, s), RGB(52, 68, 58));
+
+    const int rh = 28 * s, top = tab_y + tab_h + 8 * s;
+    const int tab_count = tab_row_count(cur_tab);
+    marquee_max = 0;   // (set again below while the selected row's value is too long)
+    for (int i = 0; i < tab_count; i++) {
+        const Row& r = rows[tab_row_to_global(cur_tab, i)];
+        const int y = top + i * rh;
+        const bool sel = i == tab_selected[cur_tab];
+        if (sel) {
+            fill(dc, 8 * s, y, (int)w - 16 * s, rh, RGB(44, 72, 54));
+            fill(dc, 8 * s, y, 3 * s, rh, RGB(96, 210, 120));   // (a green marker at its left)
+        }
+        SetTextColor(dc, sel ? RGB(255, 255, 255) : RGB(196, 204, 198));
+        TextOutA(dc, 18 * s, y + 4 * s, r.name, (int)strlen(r.name));
+        // (the value right-aligned, kept clear of the row's name: see marquee_pos)
+        SIZE nsz{};
+        GetTextExtentPoint32A(dc, r.name, (int)strlen(r.name), &nsz);
+        const int room = (int)w - 18 * s - (18 * s + (int)nsz.cx + 12 * s);
+        const std::string label = r.value ? r.text(*r.value) : ">";   // (">": a page)
+        const bool arrows = r.value && sel;
+        auto width = [&](const std::string& t) {
+            SIZE z{};
+            GetTextExtentPoint32A(dc, t.c_str(), (int)t.size(), &z);
+            return (int)z.cx;
+        };
+        auto framed = [&](const std::string& t) { return arrows ? "<  " + t + "  >" : t; };
+        std::string v = framed(label);
+        if (width(v) > room && arrows) {   // (slides: the longest piece from marquee_pos that fits)
+            size_t start = label.size();   // (the last start that still shows the name's end)
+            while (start > 0 && width(framed(label.substr(start - 1))) <= room) start--;
+            marquee_max = (int)start;
+            const size_t from = (size_t)std::min(marquee_pos, marquee_max);
+            size_t n = label.size() - from;
+            while (n > 1 && width(framed(label.substr(from, n))) > room) n--;
+            v = framed(label.substr(from, n));
+        } else if (width(v) > room) {   // (not selected: cut with "...")
+            std::string t = label;
+            while (t.size() > 1 && width(v) > room) {
+                t.pop_back();
+                while (!t.empty() && t.back() == ' ') t.pop_back();
+                v = t + "...";
+            }
+        } else if (arrows) {
+            marquee_max = 0;
+        }
+        TextOutA(dc, (int)w - 18 * s - width(v), y + 4 * s, v.c_str(), (int)v.size());
+    }
+    const int help_top = top + max_tab_rows() * rh + 8 * s;   // (the same height whichever tab is shown)
     fill(dc, 16 * s, help_top - 4 * s, (int)w - 32 * s, std::max(1, s), RGB(52, 64, 56));
     HFONT help = font(14 * s, FW_NORMAL);
     SelectObject(dc, help);
     SetTextColor(dc, RGB(176, 186, 180));
-    wrap_help(dc, rows[selected].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
+    wrap_help(dc, rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
     SelectObject(dc, body);
     SetTextColor(dc, RGB(140, 150, 144));
-    const char* hint = "Arrows change   Insert, F1 or Home closes";
+    const char* hint = "Arrows change   Q/E or LB/RB: tabs   Insert, F1 or Home closes";   // (fits 448 px at 16 px)
     TextOutA(dc, 16 * s, help_top + 4 * s + help_px + 10 * s, hint, (int)strlen(hint));
     SelectObject(dc, old);
     DeleteObject(title);
@@ -515,8 +722,9 @@ void redraw_menu(int s) {
     }
     static int measured_at = 0;
     if (measured_at != s) help_px = measure_help(s), measured_at = s;
-    // (title and rows, the rule and the help text, the hint line)
-    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s), (uint32_t)((44 + kRows * 28 + 12 + 10 + 30) * s + help_px), paint_menu, s);
+    // (title, the tab strip, the most rows a tab has, the rule and the help text, the hint line)
+    gdi_draw(menu_bmp, (uint32_t)(kMenuWidth * s), (uint32_t)((44 + 32 + 8 + max_tab_rows() * 28 + 8 + 10 + 30) * s + help_px),
+             paint_menu, s);
 }
 
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
@@ -559,7 +767,9 @@ void menu_init() {
     static bool done;
     if (done) return;
     done = true;
+    bool has_options = false;
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
+        has_options = true;
         char line[80];
         bool has_resolution = false;
         bool v2 = false;
@@ -580,6 +790,14 @@ void menu_init() {
         // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
         if (!v2) opts.realtime = 1;
     }
+    // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
+    // low-VRAM hardware without requiring the menu to render first.
+    if (!has_options && getenv("RX_VK_LOW_SPEC") && atoi(getenv("RX_VK_LOW_SPEC")) != 0) {
+        apply_preset(1);
+        opts.framegen = 0;
+        opts.upscale = 0;
+        opts.sharpness = 0;
+    }
     if (opts.preset > 0) sync_preset_budgets(opts.preset);
     if (opts.framegen == 1) opts.framegen = 2;
     if (const char* e = getenv("RX_VK_FRAMEGEN_MULT")) opts.framegen = std::min(std::max(atoi(e), 2), 8);
@@ -589,6 +807,16 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
+}
+
+void menu_set_gpu_count(int count) {
+    for (Row& r : rows) {
+        if (r.value == &opts.gpu_device) {
+            r.hi = count;
+            if (opts.gpu_device > count) opts.gpu_device = 0;
+        }
+    }
+    gpu_device_at_start = opts.gpu_device;
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
@@ -637,12 +865,19 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
     return have;
 }
 
+void menu_option_set(int id, int value) {
+    if (id != 7) return;
+    opts.mouse_sens = std::min(std::max(value, 10), 500);   // (the keys work while the menu is closed: it shows it when opened)
+    save();
+}
+
 void menu_tick() {
     fullscreen_tick();
-    enum { K_N = 10 };
+    enum { K_N = 13 };
     static bool held[K_N];
     static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
-                                  VK_RETURN, VK_DELETE, VK_BACK};
+                                  VK_RETURN, VK_DELETE, VK_BACK,
+                                  'Q', 'E', VK_TAB};   // (the tabs: Q and E, Tab and Shift+Tab)
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
@@ -666,6 +901,9 @@ void menu_tick() {
         press[1] |= pad(HOS_PAD_UP), press[2] |= pad(HOS_PAD_DOWN), press[3] |= pad(HOS_PAD_LEFT);
         press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(HOS_PAD_EAST), press[7] |= pad(HOS_PAD_SOUTH);
     }
+    bool tab_left = press[10] || pad(HOS_PAD_LSHOULDER) || pad(HOS_PAD_LTRIGGER);
+    bool tab_right = press[11] || press[12] || pad(HOS_PAD_RSHOULDER) || pad(HOS_PAD_RTRIGGER);
+    if (press[12] && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) tab_left = true, tab_right = false;
     const int scale = scale_of(dev.swap_extent.height);
     bool changed = scale != cur_scale || menu_refresh;
     menu_refresh = false;
@@ -673,6 +911,9 @@ void menu_tick() {
     if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
+        // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
+        // layout is not applied over them at start)
+        if (open_now.load()) opts.pad_layout = detect_pad_layout();
     }
     if (open_now.load() && page == 1) {   // (hookshot) the Controls page
         if (!can_bind()) page = 0;
@@ -685,6 +926,7 @@ void menu_tick() {
                     while (!(p >> bit & 1)) bit++;
                     host->bind(HOS_BIND_PAD, controls[csel].button, 0, bit);
                     listening = 0, changed = true;
+                    opts.pad_layout = detect_pad_layout();
                     save();
                 }
             } else {
@@ -706,14 +948,22 @@ void menu_tick() {
             if (press[5]) page = 0, changed = true;
             if (press[1]) csel = (csel + kControls) % (kControls + 1), changed = true;
             if (press[2]) csel = (csel + 1) % (kControls + 1), changed = true;
-            if ((press[3] || press[4]) && csel < kControls) ccol ^= 1, changed = true;
+            if ((press[3] || press[4]) && csel < kControls && !keys_only(csel)) ccol ^= 1, changed = true;
+            if (keys_only(csel)) ccol = 1;   // (the stick's and the camera's directions: keys only)
             if (press[7]) {
-                if (csel == kControls) host->bind(HOS_BIND_PAD, -1, 0, 0), save();
+                if (csel == kControls) {
+                    host->bind(HOS_BIND_PAD, -1, 0, 0);
+                    opts.pad_layout = 0;
+                    save();
+                }
                 else listening = ccol ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
                 changed = true;
             }
             if ((press[8] || press[9]) && csel < kControls) {
-                if (ccol == 0) host->bind(HOS_BIND_PAD, controls[csel].button, 0, -1);
+                if (ccol == 0) {
+                    host->bind(HOS_BIND_PAD, controls[csel].button, 0, -1);
+                    opts.pad_layout = detect_pad_layout();
+                }
                 else for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, controls[csel].button, k, 0);
                 changed = true;
                 save();
@@ -722,23 +972,48 @@ void menu_tick() {
         if (changed) redraw_menu(scale);
     } else if (open_now.load()) {
         if (press[5]) open_now = false;
-        if (press[7] && !rows[selected].value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
-        if (press[1]) selected = (selected + kRows - 1) % kRows, changed = true;
-        if (press[2]) selected = (selected + 1) % kRows, changed = true;
-        if ((press[3] || press[4] || press[7]) && rows[selected].value) {   // (Enter, or the bottom face button, as Right)
-            Row& r = rows[selected];
+        // (the tabs: LB and RB, Q and E, or Tab)
+        if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
+        else if (tab_right) cur_tab = (cur_tab + 1) % TAB_COUNT, changed = true;
+        const int tab_count = tab_row_count(cur_tab);
+        int& selected = tab_selected[cur_tab];
+        if (press[1]) selected = (selected + tab_count - 1) % tab_count, changed = true;
+        if (press[2]) selected = (selected + 1) % tab_count, changed = true;
+        Row& r = rows[tab_row_to_global(cur_tab, selected)];
+        if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
+        if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
             int v = *r.value + (press[4] ? r.step : -r.step);
             if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
-            *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-            if (r.value == &opts.preset) {
+            if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
+            if (r.value == &opts.pad_layout) {
+                if (v > 2) v = press[4] ? 0 : 2;
+                if (v < 0) v = 2;
+                *r.value = v;
+                apply_pad_layout(*r.value);
+            } else if (r.value == &opts.preset) {
+                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
                 apply_preset(*r.value);
-            } else if (r.value != &opts.fullscreen && r.value != &opts.show_fps) {
-                opts.preset = 0; // Custom
-                sync_preset_budgets(0);
+            } else {
+                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+                if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
+                    r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
+                    r.value != &opts.mouse_sens && r.value != &opts.mouse_invert) {   // (the controls are not the preset's)
+                    opts.preset = 0; // Custom
+                    sync_preset_budgets(0);
+                }
             }
             changed = true;
             save();
+        }
+        const int64_t now = prof_now();
+        if (changed) {   // (a new row or value: its name from the start, after a rest)
+            marquee_pos = 0, marquee_next = now + kMarqueeRest;
+        } else if (marquee_max > 0 && now >= marquee_next) {
+            if (marquee_pos >= marquee_max) marquee_pos = 0, marquee_next = now + kMarqueeRest;   // (back to the start)
+            else if (++marquee_pos >= marquee_max) marquee_next = now + kMarqueeRest;            // (rest at the end)
+            else marquee_next = now + kMarqueeStep;
+            changed = true;
         }
         if (changed) redraw_menu(scale);
     }

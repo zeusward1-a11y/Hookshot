@@ -71,6 +71,11 @@ The game does not come ready-made: it is built on your PC from your copy.
 python -I nx2/make_game.py --nup "C:\path\your-game.nup" --out "C:\Games\Hookshot" --language en-US
 ```
 
+Add `--log "C:\path\build.log"` to save the build output and errors while still seeing them in the terminal.
+The log is UTF-8, is flushed as output arrives, and replaces an existing file at that path. Choose an existing
+parent folder; if the log cannot be opened, the build stops before it starts. The same option works on Linux,
+and with `--check` or `--update`.
+
 Or with folders:
 
 ```powershell
@@ -87,9 +92,10 @@ A build takes about 40 minutes, and you can use your PC in the meantime.
    make it executable (`chmod +x`) and start it. It is Hookshot Builder with everything it needs inside: the compiler,
    the libraries and the Vulkan renderer. Nothing else has to be installed.
 2. Choose your `.nup` (or your `romfs` and `exefs` folders), a language and a folder for the game, and build.
-3. When it finishes, press Play. The game is also added to your applications menu. The same AppImage starts that
-   game without opening the builder: `./Hookshot-<version>-x86_64.AppImage --play`, or `--play ~/Games/Hookshot`
-   for a different folder. The game itself is `hookshot` in the folder you chose: it runs without the AppImage.
+3. When it finishes, press Play. The game is also added to your applications menu. `hookshot` in the folder is the
+   launcher (Play, and Update when a newer release is out). The game itself is `bin/hookshot`. The same AppImage
+   starts that game without the window: `./Hookshot-<version>-x86_64.AppImage --play`, or `--play ~/Games/Hookshot`
+   for a different folder. A folder built from a source checkout has no launcher: `hookshot` there is the game.
 
 From the command line: `./Hookshot-<version>-x86_64.AppImage --cli --nup ~/your-game.nup --out ~/Games/Hookshot`
 (the same options as `make_game.py`).
@@ -102,21 +108,31 @@ beside the game from an earlier build is moved there once.
 To choose how many files compile at once, launch the builder from a terminal with, for example,
 `HOOKSHOT_JOBS=2 ./Hookshot-<version>-x86_64.AppImage` (replace the filename with the one you downloaded).
 Or run `export HOOKSHOT_JOBS=2` and launch the AppImage from that same terminal. Use a positive whole number;
-`0`, an empty value or leaving it unset keeps automatic selection. The Linux builder's automatic selection still
-uses `RX_JOBS` when set, otherwise its existing memory limit. The `--cli` route also accepts `--jobs 2`.
+`0`, an empty value or leaving it unset keeps automatic selection. The Linux builder still uses `RX_JOBS` when set;
+otherwise it chooses as on Windows: one compiler per CPU thread, as many as the free memory holds at 2 GB each (a file
+whose compiler runs out of memory is compiled again alone). The `--cli` route also accepts `--jobs 2`.
 These are build settings: `hookshot_env.txt` is read by the running game, not by the builder.
 Switches to test (`RX_VK_NOOPT=1` and the others) go in `hookshot_env.txt` beside the game, one `NAME=VALUE` a line,
-as on Windows.
+as on Windows. A test run can name another file with `HOS_ENV_FILE=<path>`; the game then reads that one
+instead and leaves `hookshot_env.txt` alone.
 
 `RX_VK_MOVIE_UPSCALE=linear` replaces the movie's neural upscale with the existing linear path. The default `auto` behavior
 keeps the networks and falls back only when movie GPU time exceeds the existing 40 ms trigger. This switch does not change
 the gameplay upscaler and can make movie images look softer. It works on Windows and Linux; `RX_VK_NETWORK_KEEP=all` takes
 precedence and keeps the movie networks enabled.
 
+For a first run on a 4 GB card such as a GTX 1650, put `RX_VK_LOW_SPEC=1` in `hookshot_env.txt` beside the game.
+This opts into the existing Minimum (4 GB) budget and 50% dynamic-resolution tier, disables frame generation and
+post-process upscaling, and leaves any existing `hookshot_options.ini` unchanged. Once the game has started, the
+same settings can be adjusted in the Insert menu. The profile also avoids the Vulkan capture helper threads, which
+reduces CPU contention on a six-core CPU; set `RX_VK_CAPTURE_THREADS=1` or `2` explicitly if a particular scene
+benefits from parallel capture.
+
 Building it yourself without the AppImage: `clang` and `lld` (LLVM 23 or newer reads the play profile; an older one
 builds without it), Python 3 with `lz4`, `numpy`, `capstone`, `unicorn` and `zstandard`, FFmpeg's development files
-(with dav1d, for the movies) and SDL2. Then `python -I nx2/make_game.py ...` as above, with `RX_CPM` pointing at a folder
-with Vulkan-Headers, SPIRV-Headers and VulkanMemoryAllocator in CPM's layout (`scripts/linux/deps.sh` makes one).
+(with dav1d, for the movies) and SDL3 (SDL2 works too). Then `python -I nx2/make_game.py ...` as above, with
+`RX_CPM` pointing at a folder with Vulkan-Headers, SPIRV-Headers and VulkanMemoryAllocator in CPM's layout
+(`scripts/linux/deps.sh` makes one).
 `scripts/linux/deps.sh` and `scripts/linux/appimage.sh` make the AppImage.
 
 ### Updating to a newer release
@@ -128,14 +144,15 @@ saves and settings are kept. What changed in each release is in [changelog.txt](
 2. To be safe, copy your saves somewhere first: the `user` folder beside `hookshot.exe` on Windows, or
    `~/.local/share/hookshot` on Linux.
 3. Get the new release:
-   - **Hookshot Builder:** download the new HookshotBuilder zip and extract it to a new folder (with its `tools`
-     folder). The old builder folder can then be deleted.
-   - **Linux:** download the new AppImage and make it executable. The old one can be deleted, the game is not removed with it.
+   - **Windows:** open `hookshot.exe` in the game folder and press Update, or run `HookshotBuilder.exe`. Only the
+     parts of the builder that changed are downloaded, and only the game files that changed are compiled.
+   - **Linux:** open `hookshot` in the game folder (or the AppImage) and press Update. The same: parts whose checksum
+     did not change are kept, and the game is compiled again only where its code changed. The first AppImage is still
+     the whole builder. A release from before this list was published downloads the parts once.
    - **Command line:** `git pull` in your clone, and take the `tools` folder's contents (see
      [What you need](#what-you-need)) from the new HookshotBuilder zip, as they can change between releases.
-4. Build again with the same `.nup` (or `romfs` and `exefs` folders) and **the same game folder** as before. With the
-   same `.nup`, the game is not read again, but the translation and the compile still run, so it takes about as long
-   as the first build.
+4. Update builds again into **the same game folder**. With the same game files, they are not read again. A part of the
+   builder that did not change is not downloaded, and a compiled file whose source did not change is not compiled again.
 5. Start the game as before.
 
 What a new build keeps and what it replaces in the game folder:
@@ -151,7 +168,8 @@ What a new build keeps and what it replaces in the game folder:
 - Nothing to install for the build itself: Hookshot Builder brings its own compiler ([llvm-mingw](https://github.com/mstorsjo/llvm-mingw),
   as TotK Recomp does), Python and libraries. Visual Studio and the Windows SDK are no longer needed.
 - 64-bit Windows 10 or 11.
-- A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver. Only NVIDIA has been tested.
+- A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver. Mesh shaders are required by the
+  current renderer; older GPUs without them are not supported by a vertex/geometry fallback. Only NVIDIA has been tested.
 - 16 GB of RAM or more. A run uses about 10 GB.
 - About 60 GB free while building.
 - **Your copy of the game at the supported version:** program `0400486024DEC000`, update v131072, build `e0f3ccfa`.
@@ -207,6 +225,7 @@ and changes, the bottom face button changes too, and the right one closes the me
 | Option | Choices |
 |---|---|
 | Quality preset | Custom, Minimum (4GB), Low (6GB), Balanced (8GB), High (12GB), Ultra (16GB+) |
+| GPU device | Auto, or each graphics card by name (after a restart) |
 | Frame generation | Off, 2x, 3x, 4x |
 | Frame pacing | Off, On |
 | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% |
@@ -219,6 +238,10 @@ and changes, the bottom face button changes too, and the right one closes the me
 
 With Game speed on Per frame, the game runs slower whenever it is below 60 fps. Real time keeps it at normal speed.
 Upscaling and Sharpness also work when Frame generation is Off.
+
+GPU device matters on a PC with more than one graphics card (a laptop's integrated and dedicated GPUs, or a second
+card for Lossless Scaling). Auto prefers a dedicated one, and only cards with Vulkan 1.3 are listed. `hookshot_log.txt`
+lists every card as `vk: device <n>`; `RX_VK_DEVICE=<n>` chooses one for a single run and wins over the menu.
 
 ### Controls
 
@@ -239,8 +262,11 @@ key_a=69,13
 6 Start, 7 and 8 the stick presses, 9 and 10 the shoulder buttons, 11 to 14 the D-pad (up, down, left, right), 15 and
 16 the triggers, -1 none. `key_<button>` is one or two
 [Windows key codes](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes) in decimal (69 is
-<kbd>E</kbd>, 13 <kbd>Enter</kbd>), 0 none. The buttons are `a` `b` `x` `y` `l` `r` `zl` `zr` `plus` `minus` `ls`
-`rs` `left` `up` `right` `down`. A button the file leaves out keeps its default.
+<kbd>E</kbd>, 13 <kbd>Enter</kbd>), 0 none; the mouse's buttons are 1 (left), 2 (right), 4 (middle), 5 and 6 (side
+buttons), and count while the mouse is captured. The buttons are `a` `b` `x` `y` `l` `r` `zl` `zr` `plus` `minus` `ls`
+`rs` `left` `up` `right` `down`, and for keys only the left stick's and the camera's directions: `move_up`
+`move_down` `move_left` `move_right` `cam_up` `cam_down` `cam_left` `cam_right`. A button the file leaves out keeps
+its default.
 
 ## Mods
 

@@ -176,7 +176,8 @@ def main():
         if not a.no_polls:
             poll.install()
         gen = os.path.join(out_dir, "gen")
-        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone)
+        files = chunks.write(L, gen, os.path.join(a.work, "image"), a.rechunk and not a.standalone,
+                             counters=[] if a.no_polls else [poll.stats])
         import oot_patches
         oot_patches.apply(gen)
         a64_rtgen.write(gen)

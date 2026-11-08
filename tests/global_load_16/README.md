@@ -2,19 +2,28 @@
 
 This fixture builds a small `IR::Program`, runs the real shader-info pass and
 `EmitSPIRV`, then checks both the emitted instructions and the generated module
-with `spirv-val`. It covers signed and unsigned 8- and 16-bit loads at naturally
-aligned offsets, preservation of high guest-address bits, and an access at byte
-offset `0xffe` whose helper word base is `0xffc`. It also covers the narrow
-stores: they insert into the aligned 32-bit word with a compare-exchange loop,
-so two invocations writing different halves of one word do not lose each other's
-value. A mesh-stage load and store cover the stage the #192 crash came from.
-The existing zero-result behavior when the profile lacks 64-bit integer support
-is checked too.
+with `spirv-val`. It covers signed and unsigned halfword loads at naturally
+aligned offsets, preservation of high guest-address bits, and a page-end access
+at byte offset `0xffe` whose helper word base is `0xffc`. Narrow 8- and 16-bit
+stores use an aligned-word compare-exchange loop and bit-field insert. A
+mesh-stage load and store preserve the upstream regression cases. The existing
+zero-result behavior without 64-bit integer support is checked too.
 
-The test intentionally does not cover odd guest addresses, SSBO range behavior,
-or real AMD hardware. It tests the SPIR-V backend's lowering contract only.
-The game-free workflow checks out the pinned SPIR-V-Headers revision and uses
-the system SPIR-V Tools validator.
+Eight single-storage-buffer scenarios trace the actual called U32 helper's
+range branch. Its logical end must use the original descriptor address plus
+size, then be capped by `OpArrayLength`. Concrete cbuf/descriptor inputs cover
+a hit at `0x1004` with size 2 and alignment 16, a miss at `0x1008`, an aligned-base
+control, short and zero-length descriptor caps, signed/unsigned loads and a
+high 64-bit base. These eight scenarios and the eleven upstream cases emit
+nineteen modules in total.
+
+The fixture checks the emitted SPIR-V dependency chain; it does not execute a
+shader or driver, and does not validate odd guest addresses or AMD hardware. It
+tests the SPIR-V backend's lowering contract only.
+The workflow checks out the pinned SPIR-V-Headers revision and uses the system
+SPIR-V Tools validator with `--uniform-buffer-standard-layout`: the single-SSBO
+fixture profiles use four-byte array strides in a uniform block. This validation
+option describes those fixture profiles; it does not test device feature enablement.
 
 Reproduce it with Clang in C++20 mode, as in the Linux workflow. The focused
 target includes project compatibility headers with a function-local static

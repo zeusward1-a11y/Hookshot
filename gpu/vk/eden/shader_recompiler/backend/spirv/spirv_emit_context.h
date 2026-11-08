@@ -355,6 +355,7 @@ public:
     };
     std::vector<GlobalTableVars> ssbo_tables;
     std::array<Id, 9> atomic_global_func_u32{};
+    Id atomic_global_cas_func_u32{};   // (hookshot) (address, comparator, value) -> the old value
 
     Id load_global_func_u32{};
     Id load_global_func_u32x2{};
@@ -363,6 +364,7 @@ public:
     Id write_global_func_u32x2{};
     Id write_global_func_u32x4{};
     Id write_global_cas_loop_func{};
+    Id atomic_global_add_f32_func{};   // (hookshot) (address, value) -> the old value
 
     bool need_input_position_indirect{};
     Id input_position{};

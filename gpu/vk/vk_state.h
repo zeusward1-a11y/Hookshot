@@ -29,6 +29,9 @@ struct NvnState {
     nvn_p_set_rt rt{};
     uint64_t rt_serial = 0;      // bumped at each NOP_SET_RT (the draw path resolves the targets once per change)
     uint64_t bind_gen = 0;       // bumped when a binding the descriptors read changes (a rebind of the same values does not)
+    // (hookshot) what bind_gen was when a stage's textures, samplers or images (tex_gen) or its storage buffers (ssbo_gen) last changed: the
+    // driver banks c2 and c0 of a graphics stage are made from those alone, so a draw after another uniform buffer's bind keeps its banks
+    uint64_t tex_gen[kNvnStages] = {}, ssbo_gen[kNvnStages] = {};
     float viewport[16][4]{};
     float depth_near = 0.0f, depth_far = 1.0f;
     int32_t scissor[4]{0, 0, 0, 0};

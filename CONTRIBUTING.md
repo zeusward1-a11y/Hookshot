@@ -124,29 +124,23 @@ local artifacts; they are never committed.
 
 ### Game-free checks
 
-These need no dump and are what CI runs. The exact commands are the `run:` lines in
-[`source-regressions.yml`](.github/workflows/source-regressions.yml); for example:
+These need no dump and are what CI runs, on every pull request and every push to `main`. One command runs them all:
 
 ```powershell
-python -I -B nx2/test_nup_paths.py
-python -I -B nx2/test_version.py
-python -I -B tests/test_make_game_cache.py
-python -I -B tests/test_failure_reason.py
-python -I -B tests/test_dispatch_clock.py
+python -I -B tests/run_all.py
 ```
 
-Some checks compile a small C or C++ fixture on the fly and need a compiler: `tests/test_audio_deadline.py`,
-`tests/test_fps_overlay_order.py`, `tests/test_fps_rate.py`, `tests/test_framegen_gate.py`,
-`tests/test_import_hold.py`, `tests/test_movie_upscale_policy.py`, `tests/test_pool_span.py`,
-`tests/test_prof_clock.py`, `tests/test_rumble_refresh.py`, `tests/test_submitted_page.py`,
-`tests/test_table_track.py`, `tests/test_ub_memo.py`, `tests/test_upscale_label.py` and
-`nx2/test_import_windows.py`. Pass `--cxx clang++` (or `g++`) to choose one; `tests/test_import_hold.py` skips when
-no compiler is found. CI marks most of these as Linux-only, so on Windows run the ones you touched by hand. A few
-other checks, such as `tests/test_desc_clock.py`, only read the source and need nothing extra.
+It runs every `tests/test_*.py` and `nx2/test_*.py` in its own process, the C++ unit tests under `gpu/vk/tests` and a
+byte-compile of every tracked Python file, goes on after a failure, and ends with a table (slowest first) and every
+failure's output. Name a check to run only the ones whose path contains it (`python -I -B tests/run_all.py ub_`). A new
+`test_*.py` file is picked up by itself: no workflow to edit.
 
-There are also builder and Linux checks that CI does not wire up yet, such as `tests/test_builder_status.py`,
-`tests/test_desktop_exec.py`, `tests/test_sdl_audio_library.py` and the Windows-only `tests/test_cpp_preflight.py`.
-Run them by hand if you change what they cover.
+Some checks compile a small C or C++ fixture and need a compiler (`g++`, `gcc` or `clang++` on PATH), the SPIR-V
+validator (`spirv-val`), the SPIR-V or Vulkan headers (`HOOKSHOT_SPIRV_HEADERS` / `HOOKSHOT_VULKAN_HEADERS`, or the CPM
+cache in `RX_CPM` or `build-linux/deps/cpm`), or the `zstandard` package. A check whose tool is missing is skipped and
+says so; CI passes `--strict`, which fails it instead. The skip list at the top of `tests/run_all.py` names the checks
+that cannot run in CI (a GPU, the game, a Visual Studio prompt) and the few that run on Linux only; `--no-skip` runs
+them anyway.
 
 ### Checks that need your dump or a run
 

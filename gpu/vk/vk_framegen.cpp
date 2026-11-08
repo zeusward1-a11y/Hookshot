@@ -26,6 +26,7 @@
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_synth_comp_spv.h"
+#include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
 extern std::atomic<uint32_t> present_kind;   // (vk_replay.cpp: the frame log's)

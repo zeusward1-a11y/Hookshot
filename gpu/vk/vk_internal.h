@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "vk_loader.h"
@@ -24,6 +25,7 @@ typedef struct VmaAllocation_T* VmaAllocation;   // (vk_mem_alloc.h's handle)
 
 namespace mkwvk {
 
+extern std::vector<std::string> gpu_device_names;
 extern const MkwVkHost* host;
 void logf(const char* fmt, ...);
 void queue_flush_locked();   // (vk_replay.cpp, RX_VK_BATCH: held submits out; dev.present_mu held)
@@ -39,13 +41,15 @@ struct Device {
     uint32_t queue_family = 0;
     VkQueue queue = VK_NULL_HANDLE;
     // extensions in use
-    bool mesh_shader = false, external_memory_host = false, pipeline_library = false,
+    bool mesh_shader = false, external_memory_host = false, external_memory_fd = false, dma_buf_import = false, pipeline_library = false,
          graphics_pipeline_library = false, custom_border_color = false, dynamic_state3 = false,
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
          conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
          checkpoints = false,   // (RX_VK_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints)
+         buffer_marker = false, // (RX_VK_CHECKPOINTS=1 without the NV extension: VK_AMD_buffer_marker, AMD and Intel)
          device_fault = false,  // (VK_EXT_device_fault: what a lost device faulted on)
          sparse_images = false, // (sparse resident 2D images on the queue: the terrain's huge arrays)
+         sparse_buffers = false, // (sparse-bound buffers on the queue: a pool imported as several dma-bufs)
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
          native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
@@ -62,6 +66,7 @@ struct Device {
     VkFormat swap_format = VK_FORMAT_UNDEFINED;
     VkExtent2D swap_extent{};
     std::vector<VkImage> swap_images;
+    std::vector<VkSemaphore> swap_rendered;   // present waits belong to acquired images, not frame slots
     std::mutex present_mu;   // (the swapchain: presents and resizes)
     std::atomic<uint64_t> swap_resize{0};   // (a new window size, width << 32 | height: the next present makes the swapchain)
 };
@@ -100,6 +105,8 @@ void memory_end_submission(VkCommandBuffer cmd);
 /// The game made a memory pool (gpu address, bytes): imported in the background, before it is used
 /// RX_VK_CHECKPOINTS: the draws the GPU reached, logged once the device is lost (vk_draw.cpp)
 void checkpoints_report();
+/// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
+void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS
@@ -158,8 +165,9 @@ uint32_t memory_page_stamp(uint64_t gpu); // (that address's page only)
 uint64_t gpu_pool_end(uint64_t gpu);   // (hookshot) where the memory pool holding that address ends, 0: in none (vk_memory.cpp)
 uint64_t gpu_pool_start(uint64_t gpu); // (EvilOOT) and where it begins
 bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation,
-                          void** mapped);   // (vk_vma.cpp: cached host memory, mapped)
+                          void** mapped, bool dedicated = false);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
+void invalidate_mapped(VmaAllocation allocation, uint64_t size);   // (the CPU is to read what the GPU wrote: a no-op in coherent memory)
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
 void memory_protect_gpu(uint64_t guest, uint64_t size);  // (RX_VK_PROTECT_BARE=1: pages a shader writes through a table pointer)
 /// (vk_replay.cpp) guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
@@ -198,13 +206,17 @@ bool has_stencil(VkFormat f);
 
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
-bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation);
+bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false);
 void destroy_image(VkImage image, VmaAllocation allocation);
+/// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none
+uint64_t allocation_size(VmaAllocation allocation);
+/// (dedicated: its own memory object, not a share of a 64 MB block: for the 16 to 32 MB ones that fit two to a block and leave
+/// the rest of it free; RX_VK_BLOCK_BUFFERS=1: as before)
 bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, VkBuffer& buffer,
-                   VmaAllocation& allocation, void** mapped);
+                   VmaAllocation& allocation, void** mapped, bool dedicated = false);
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation);
 /// A buffer in VRAM only (within the driver's budget), or false
-bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation);
+bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buffer, VmaAllocation& allocation, bool dedicated = false);
 /// Device-local memory this process uses and what the driver allows it now (VK_EXT_memory_budget), summed over the
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);

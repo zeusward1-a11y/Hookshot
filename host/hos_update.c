@@ -146,6 +146,166 @@ void hos_update_check(void) {
     }
     MessageBoxW(NULL, L"Hookshot Builder could not be started. The game starts as it is.", L"Hookshot update", MB_OK | MB_ICONWARNING | MB_TOPMOST);
 }
+#elif defined(__linux__)
+#include "hos_paths.h"
+#include <ctype.h>
+#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/* (the same offer as Windows, when the player started bin/hookshot itself. The launcher sets HOOKSHOT_NO_UPDATE_CHECK
+   and asks in its own window. curl and zenity do the network and the question; without either, the game just starts) */
+
+static int read_value(const char *path, const char *name, char *out, size_t cap) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    char line[1024];
+    const size_t n = strlen(name);
+    int found = 0;
+    while (!found && fgets(line, sizeof line, f)) {
+        char *s = line;
+        if (strncmp(s, name, n) || s[n] != '=') continue;
+        s += n + 1;
+        size_t len = strlen(s);
+        while (len && (s[len - 1] == '\n' || s[len - 1] == '\r' || s[len - 1] == ' ')) s[--len] = 0;
+        if (len && len < cap) memcpy(out, s, len + 1), found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
+static int safe_tag(const char *s) {
+    size_t n = strlen(s);
+    if (!n || n > 80) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)s[i]) && !strchr("._+-", s[i])) return 0;
+    return 1;
+}
+
+static int pipe_tag(const char *cmd, char *tag, size_t cap) {
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    char buf[8192];
+    size_t n = fread(buf, 1, sizeof buf - 1, p);
+    pclose(p);
+    buf[n] = 0;
+    const char *k = strstr(buf, "\"tag_name\"");
+    if (k && (k = strchr(k + 10, '"'))) {
+        const char *e = strchr(++k, '"');
+        if (e && e > k && (size_t)(e - k) < cap) {
+            memcpy(tag, k, (size_t)(e - k));
+            tag[e - k] = 0;
+            return safe_tag(tag);
+        }
+    }
+    if (!strncmp(buf, "tag ", 4)) {
+        const char *s = buf + 4;
+        size_t len = strcspn(s, "\r\n");
+        if (len && len < cap) {
+            memcpy(tag, s, len);
+            tag[len] = 0;
+            return safe_tag(tag);
+        }
+    }
+    return 0;
+}
+
+static int latest_tag(char *tag, size_t cap) {
+    if (pipe_tag("curl -fsSL --max-time 4 --retry 2 -A Hookshot-update-check "
+                 "-H \"Accept: application/vnd.github+json\" "
+                 "https://api.github.com/repos/NotRexed/Hookshot/releases/latest 2>/dev/null", tag, cap))
+        return 1;
+    return pipe_tag("curl -fsSL --max-time 8 --retry 2 -A Hookshot-update-check "
+                    "https://github.com/NotRexed/Hookshot/releases/latest/download/hookshot-linux.txt 2>/dev/null", tag, cap);
+}
+
+/* the builder an update installed (builder/linux/linux_update.py): <data>/hookshot/builder/versions/<current>/AppRun. The
+   builder= line names the AppImage that built the folder, which the player may have deleted since */
+static int installed_builder(char *out, size_t cap) {
+    const char *home = getenv("HOOKSHOT_BUILDER_HOME"), *data = getenv("XDG_DATA_HOME"), *user = getenv("HOME");
+    char root[MAX_PATH * 2], path[MAX_PATH * 2 + 64], tag[128];
+    if (home && *home) snprintf(root, sizeof root, "%s/hookshot/builder", home);
+    else if (data && *data) snprintf(root, sizeof root, "%s/hookshot/builder", data);
+    else if (user && *user) snprintf(root, sizeof root, "%s/.local/share/hookshot/builder", user);
+    else return 0;
+    snprintf(path, sizeof path, "%s/current", root);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    const int got = fgets(tag, sizeof tag, f) != NULL;
+    fclose(f);
+    if (!got) return 0;
+    tag[strcspn(tag, "\r\n ")] = 0;
+    if (!safe_tag(tag)) return 0;
+    if (snprintf(out, cap, "%s/versions/%s/AppRun", root, tag) >= (int)cap) return 0;
+    return access(out, X_OK) == 0;
+}
+
+void hos_update_check(void) {
+    const char *off = getenv("HOOKSHOT_NO_UPDATE_CHECK");
+    if (off && strcmp(off, "0")) return;
+    char path[MAX_PATH + 64], have[128], builder[MAX_PATH * 2], skipped[128] = "", tag[128];
+    DWORD n = hos_game_path_a(path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+    while (n && path[n - 1] != '/') n--;
+    if (!n) return;
+    path[n] = 0;
+    char dir[MAX_PATH];
+    memcpy(dir, path, n);
+    dir[n] = 0;
+    snprintf(path, sizeof path, "%shookshot_version.txt", dir);
+    if (!read_value(path, "version", have, sizeof have) || !safe_tag(have)) return;
+    snprintf(path, sizeof path, "%suser/hookshot_update_skip.txt", dir);
+    read_value(path, "skip", skipped, sizeof skipped);
+    if (!latest_tag(tag, sizeof tag)) {
+        fprintf(stderr, "update: the latest release could not be asked for (offline?)\n");
+        return;
+    }
+    fprintf(stderr, "update: this folder is %s, the latest release is %s\n", have, tag);
+    if (!strcmp(tag, have) || !strcmp(tag, skipped)) return;
+    snprintf(path, sizeof path, "%shookshot_version.txt", dir);
+    const int has_builder = installed_builder(builder, sizeof builder) ||
+                            (read_value(path, "builder", builder, sizeof builder) && access(builder, X_OK) == 0);
+    char text[1600], cmd[4096];
+    snprintf(text, sizeof text,
+             has_builder
+                 ? "A new version of Hookshot is out: %s (this game is %s). Update now? The game closes, and Hookshot Builder downloads only what changed and builds this folder again. Your saves and settings stay."
+                 : "A new version of Hookshot is out: %s (this game is %s). The builder that made this folder was not found. Open the download page?",
+             tag, have);
+    snprintf(cmd, sizeof cmd, "zenity --list --title=Hookshot --hide-header --column= --text='%s' 'Update now' 'Not now' 'Skip this version'", text);
+    FILE *pick = popen(cmd, "r");
+    if (!pick) return;
+    char answer[64] = "";
+    if (!fgets(answer, sizeof answer, pick)) answer[0] = 0;
+    pclose(pick);
+    if (!strncmp(answer, "Skip", 4)) {
+        snprintf(path, sizeof path, "%suser", dir);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%suser/hookshot_update_skip.txt", dir);
+        FILE *f = fopen(path, "wb");
+        if (f) fprintf(f, "skip=%s\n", tag), fclose(f);
+        return;
+    }
+    if (strncmp(answer, "Update", 6)) return;
+    if (!has_builder) {
+        if (fork() == 0) {
+            execlp("xdg-open", "xdg-open", "https://github.com/NotRexed/Hookshot/releases/latest", (char *)0);
+            _exit(127);
+        }
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl(builder, builder, "--update", dir, "--tag", tag, (char *)0);
+        _exit(127);
+    }
+    if (pid > 0) {
+        fprintf(stderr, "update: Hookshot Builder started to update to %s; the game closes\n", tag);
+        fflush(stderr);
+        _exit(0);
+    }
+}
 #else
 void hos_update_check(void) {}
 #endif

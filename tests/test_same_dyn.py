@@ -3,6 +3,7 @@
 python -I -B tests/test_same_dyn.py [--cxx g++]
 """
 import argparse
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -30,6 +31,13 @@ def main():
     for needle in ("s.viewport", "s.scissor", "s.chmask", "s.blend", "s.ds", "cur_program", "s.poly"):
         if needle not in pack:
             raise SystemExit(f"dynamic state is remembered without {needle}")
+    # (the program in the key is what its write masks are made from: a draw of another program with the same masks is the same state)
+    if "program_wm_sig(*cur_program)" not in pack or "RX_VK_DYN_PROG_KEY" not in pack:
+        raise SystemExit("dynamic state is remembered by program, not by what the program makes of the write masks")
+    reads = lambda text: set(re.findall(r"info\.(\w+)", text))
+    mask, sig = block(source, "uint32_t target_write_mask("), block(source, "uint64_t program_wm_sig(")
+    if reads(mask) != reads(sig):
+        raise SystemExit(f"target_write_mask reads {sorted(reads(mask))} but the program's write mask word is made from {sorted(reads(sig))}")
     body = block(source, "void dynamic_state(")
     if body.index("dyn_same(") > body.index("std::memset(&d, 0"):
         raise SystemExit("dynamic state is built before checking the draw before it")

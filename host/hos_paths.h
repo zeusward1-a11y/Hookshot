@@ -7,6 +7,12 @@
 #include <string.h>
 #include <wchar.h>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 
 static inline DWORD hos_game_path_a(char *buf, DWORD size) {
@@ -49,7 +55,27 @@ static inline DWORD hos_game_path_w(wchar_t *buf, DWORD size) {
     return (DWORD)wcslen(buf);
 }
 #else
+#include <unistd.h>
 #include <windows.h>   /* (linux: host/posix's, for DWORD and GetModuleFileNameA) */
-/* (Linux: the game and its files share one folder, as before) */
-static inline DWORD hos_game_path_a(char *buf, DWORD size) { return GetModuleFileNameA(NULL, buf, size); }
+/* (Linux) the same bin/ layout when the folder was built by the packaged builder: hookshot in the folder is the
+   launcher script, and the game is bin/hookshot. A development build has no bin/ and this is GetModuleFileName. */
+static inline DWORD hos_game_path_a(char *buf, DWORD size) {
+    DWORD n = GetModuleFileNameA(NULL, buf, size);
+    if (!n || n >= size) return n;
+    char *name = buf + n;
+    while (name > buf && name[-1] != '/') name--;
+    if (name - buf < 5) return n;
+    char *dir = name - 1;
+    char *bin = dir;
+    while (bin > buf && bin[-1] != '/') bin--;
+    if (dir - bin != 3 || memcmp(bin, "bin", 3) != 0) return n;
+    char probe[MAX_PATH + 16];
+    const size_t root = (size_t)(bin - buf);
+    if (root + 10 >= sizeof probe) return n;
+    memcpy(probe, buf, root);
+    memcpy(probe + root, "image.bin", 10);
+    if (access(probe, F_OK) != 0) return n;
+    memmove(buf + root, name, strlen(name) + 1);
+    return (DWORD)strlen(buf);
+}
 #endif
