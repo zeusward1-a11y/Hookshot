@@ -186,9 +186,12 @@ void queue_flush_for(int why) {
     flush_reason = why;
     queue_flush_locked();
 }
-// (RX_VK_BATCH_POLL_US=<us>: a progress poll sends held submits only once the oldest has waited that long; 0: always)
+// (RX_VK_BATCH_POLL_US=<us>: a progress poll sends held submits only once the oldest has waited that long; 0: always.
+// Default 2000: the game polls many times a frame, and each poll that flushed was a whole command submission, the cost
+// batching is there to avoid. RX 7800 XT, RADV, Kokiri: 525 -> 67 poll flushes per 120 presents, 38 -> 42.5 fps; issues
+// 413, 528)
 void queue_flush_poll() {
-    static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 0;
+    static const int64_t us = getenv("RX_VK_BATCH_POLL_US") ? atoll(getenv("RX_VK_BATCH_POLL_US")) : 2000;
     std::lock_guard lk(dev.present_mu);
     if (pend.cbs.empty()) return;
     if (us > 0 && std::chrono::steady_clock::now() - pend_since < std::chrono::microseconds(us)) return;
