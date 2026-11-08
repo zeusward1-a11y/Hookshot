@@ -14,8 +14,8 @@ body:
     id: version
     attributes:
       label: Hookshot version
-      description: The release you built (its name on the Releases page, such as `movie-sync`), or the first line of `hookshot_log.txt` if it starts with `hookshot`.
-      placeholder: movie-sync
+      description: The version you built (such as `v2.0.0`, shown by the launcher and on the Releases page), or the first line of `hookshot_log.txt` if it starts with `hookshot`.
+      placeholder: v2.0.0
     validations:
       required: true
   - type: dropdown
@@ -80,7 +80,7 @@ body:
       label: Other software hooked into the game
       description: ReShade, shader-cache tools (SCSKiller and the like), overlays or frame-generation injectors change what Hookshot does. Please test without them before reporting.
       options:
-        - None
+        - No, nothing hooked in
         - Yes (named under "Changes from the defaults")
     validations:
       required: true
@@ -88,7 +88,7 @@ body:
     id: log
     attributes:
       label: hookshot_log.txt
-      description: Drag the file here. It is beside hookshot.exe and holds the last run only, so attach it right after the problem. It has no game files in it.
+      description: Drag the file here. It is beside hookshot.exe and holds the last run; the four runs before are `hookshot_log.1.txt` (the one before) to `.4.txt`. If you started the game again after the problem, attach `hookshot_log.1.txt` too. It has no game files in it.
     validations:
       required: true
   - type: textarea

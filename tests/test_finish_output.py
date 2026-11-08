@@ -26,7 +26,7 @@ def finish_statements(source, filename):
     main = next(node for node in ast.parse(source).body
                 if isinstance(node, ast.FunctionDef) and node.name == "main")
     starts = [i for i, node in enumerate(main.body) if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "launcher" for target in node.targets)]
+              and any(isinstance(target, ast.Name) and target.id in ("staged", "launcher") for target in node.targets)]
     assert starts
     start = starts[0]
     end = next(i for i, node in enumerate(main.body[start + 1:], start + 1)

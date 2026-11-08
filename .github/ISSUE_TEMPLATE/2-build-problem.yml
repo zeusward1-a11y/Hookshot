@@ -10,8 +10,8 @@ body:
     id: version
     attributes:
       label: Builder version
-      description: The release you downloaded (its name on the Releases page).
-      placeholder: movie-sync
+      description: The version you downloaded (such as `v2.0.0`, on the Releases page and in the builder).
+      placeholder: v2.0.0
     validations:
       required: true
   - type: dropdown

@@ -1,244 +1,14 @@
+# Every game-free check, on every pull request to main or dev and every push to them: tests/run_all.py runs each
+# tests/test_*.py and nx2/test_*.py (all of them, even after a failure), the C++ unit tests under gpu/vk/tests and a
+# byte-compile of every tracked Python file, and writes a table of them to the run's summary. Its skip list says which
+# checks need a GPU, the game or MSVC, and why. No game data is involved.
 name: Game-free source regressions
 
 on:
   push:
-    branches: [main]
-    paths:
-      - nx2/nup.py
-      - nx2/make_game.py
-      - nx2/build.py
-      - nx2/unpack.py
-      - third_party/a64-kit/tools/toolchain.py
-      - host/msvc_oldnames.c
-      - tests/test_msvc_oldnames.py
-      - nx2/test_nup_paths.py
-      - tests/test_make_game_cache.py
-      - gpu/vk/vk_present_rect.h
-      - gpu/vk/tests/present_rect_test.cpp
-      - gpu/vk/vk_replay.cpp
-      - tests/test_child_unicode.py
-      - gpu/vk/vk_replay.cpp
-      - gpu/vk/vk_state.h
-      - tests/test_same_bind.py
-      - tests/test_cpm_discovery.py
-      - tests/test_finish_output.py
-      - tests/test_failure_reason.py
-      - tests/test_linux_builder_jobs.py
-      - builder/linux/hookshot_builder.py
-      - builder/HookshotBuilder/**
-      - tests/builder_workers/**
-      - tests/test_import_hold.py
-      - gpu/vk/vk_replay.cpp
-      - tests/import_hold_test.cpp
-      - gpu/vk/import_hold.h
-      - gpu/vk/vk_menu.cpp
-      - tests/test_fps_rate.py
-      - gpu/vk/vk_memory.cpp
-      - tests/test_vertex_bind.py
-      - tests/test_fps_overlay_order.py
-      - tests/test_dispatch_clock.py
-      - gpu/vk/vk_framegen.cpp
-      - tests/test_framegen_gate.py
-      - tests/test_upscale_independent.py
-      - tests/upscale_independent_test.cpp
-      - gpu/vk/vk_draw.cpp
-      - tests/test_table_track.py
-      - tests/test_desc_clock.py
-      - gpu/vk/vk_internal.h
-      - tests/test_prof_clock.py
-      - gpu/vk/vk_memory.cpp
-      - tests/test_pool_span.py
-      - tests/test_submitted_page.py
-      - gpu/vk/vk_replay.cpp
-      - gpu/vk/vk_draw.h
-      - tests/test_ub_memo.py
-      - tests/test_ub_gap.py
-      - tests/test_bind_memo.py
-      - tests/test_shader_census_cmd.py
-      - tests/test_shader_census.py
-      - tests/test_prepare_cache_save.py
-      - tests/test_slow_frame_limit.py
-      - tests/test_3d_view_create_flags.py
-      - tests/test_present_trace.py
-      - host/nn_vi.c
-      - gpu/vk/vk_main.cpp
-      - nx2/shader_census.py
-      - gpu/vk/vk_shader.cpp
-      - tests/test_same_draw.py
-      - tests/test_pass_hazard.py
-      - nx2/version.py
-      - nx2/test_version.py
-      - scripts/changelog.py
-      - tests/test_changelog.py
-      - host/nn_audio.c
-      - tests/test_audio_deadline.py
-      - tests/test_audio_output_errors.py
-      - tests/audio_output_errors_test.c
-      - host/nvn_native.c
-      - tests/test_nvn_null_pool.py
-      - tests/test_nvn_buffer_map.py
-      - tests/test_nvn_tex_builder_guard.py
-      - host/pad_sdl.c
-      - tests/test_rumble_refresh.py
-      - tests/test_same_dyn.py
-      - tests/test_upscale_label.py
-      - gpu/vk/movie_upscale_policy.h
-      - tests/test_movie_upscale_policy.cpp
-      - tests/test_movie_upscale_policy.py
-      - host/display.c
-      - host/posix/display_sdl.c
-      - host/nn_hid.c
-      - host/mkw_glue.c
-      - gpu/vk/vk_api.h
-      - tests/test_alt_enter.py
-      - tests/test_input_background.py
-      - tests/input_background_test.c
-      - nx2/test_import_windows.py
-      - tests/test_handle_lookup.py
-      - builder/linux/hookshot-launch
-      - builder/linux/AppRun
-      - builder/linux/hookshot-builder.desktop
-      - scripts/linux/appimage.sh
-      - tests/test_hookshot_launch.py
-      - tests/global_load_16_ir.cpp
-      - tests/global_load_16/**
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_instructions.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
-      - tests/test_mesh_stage_buffer_zero.py
-      - gpu/vk/eden/shader_recompiler/shader_info.h
-      - gpu/vk/eden/shader_recompiler/runtime_info.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-      - gpu/vk/eden/shader_recompiler/frontend/maxwell/translate_program.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
-      - tests/test_mesh_point_topology.py
-      - tests/test_lower_depbar.py
-      - tests/lower_depbar_test.cpp
-      - gpu/vk/eden/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-      - .github/workflows/source-regressions.yml
+    branches: [main, dev]
   pull_request:
-    branches: [main]
-    paths:
-      - nx2/nup.py
-      - nx2/make_game.py
-      - nx2/build.py
-      - nx2/unpack.py
-      - third_party/a64-kit/tools/toolchain.py
-      - host/msvc_oldnames.c
-      - tests/test_msvc_oldnames.py
-      - nx2/test_nup_paths.py
-      - tests/test_make_game_cache.py
-      - gpu/vk/vk_present_rect.h
-      - gpu/vk/tests/present_rect_test.cpp
-      - gpu/vk/vk_replay.cpp
-      - tests/test_child_unicode.py
-      - gpu/vk/vk_replay.cpp
-      - gpu/vk/vk_state.h
-      - tests/test_same_bind.py
-      - tests/test_cpm_discovery.py
-      - tests/test_finish_output.py
-      - tests/test_failure_reason.py
-      - tests/test_linux_builder_jobs.py
-      - builder/linux/hookshot_builder.py
-      - builder/HookshotBuilder/**
-      - tests/builder_workers/**
-      - tests/test_import_hold.py
-      - gpu/vk/vk_replay.cpp
-      - tests/import_hold_test.cpp
-      - gpu/vk/import_hold.h
-      - gpu/vk/vk_menu.cpp
-      - tests/test_fps_rate.py
-      - gpu/vk/vk_memory.cpp
-      - tests/test_vertex_bind.py
-      - tests/test_fps_overlay_order.py
-      - tests/test_dispatch_clock.py
-      - gpu/vk/vk_framegen.cpp
-      - tests/test_framegen_gate.py
-      - tests/test_upscale_independent.py
-      - tests/upscale_independent_test.cpp
-      - gpu/vk/vk_draw.cpp
-      - tests/test_table_track.py
-      - tests/test_desc_clock.py
-      - gpu/vk/vk_internal.h
-      - tests/test_prof_clock.py
-      - gpu/vk/vk_memory.cpp
-      - tests/test_pool_span.py
-      - tests/test_submitted_page.py
-      - gpu/vk/vk_replay.cpp
-      - gpu/vk/vk_draw.h
-      - tests/test_ub_memo.py
-      - tests/test_ub_gap.py
-      - tests/test_bind_memo.py
-      - tests/test_shader_census_cmd.py
-      - tests/test_shader_census.py
-      - tests/test_prepare_cache_save.py
-      - tests/test_slow_frame_limit.py
-      - tests/test_3d_view_create_flags.py
-      - tests/test_present_trace.py
-      - host/nn_vi.c
-      - gpu/vk/vk_main.cpp
-      - nx2/shader_census.py
-      - gpu/vk/vk_shader.cpp
-      - tests/test_same_draw.py
-      - tests/test_pass_hazard.py
-      - nx2/version.py
-      - nx2/test_version.py
-      - scripts/changelog.py
-      - tests/test_changelog.py
-      - host/nn_audio.c
-      - tests/test_audio_deadline.py
-      - tests/test_audio_output_errors.py
-      - tests/audio_output_errors_test.c
-      - host/nvn_native.c
-      - tests/test_nvn_null_pool.py
-      - tests/test_nvn_buffer_map.py
-      - tests/test_nvn_tex_builder_guard.py
-      - host/pad_sdl.c
-      - tests/test_rumble_refresh.py
-      - tests/test_same_dyn.py
-      - tests/test_upscale_label.py
-      - gpu/vk/movie_upscale_policy.h
-      - tests/test_movie_upscale_policy.cpp
-      - tests/test_movie_upscale_policy.py
-      - host/display.c
-      - host/posix/display_sdl.c
-      - host/nn_hid.c
-      - host/mkw_glue.c
-      - gpu/vk/vk_api.h
-      - tests/test_alt_enter.py
-      - tests/test_input_background.py
-      - tests/input_background_test.c
-      - nx2/test_import_windows.py
-      - tests/test_handle_lookup.py
-      - builder/linux/hookshot-launch
-      - builder/linux/AppRun
-      - builder/linux/hookshot-builder.desktop
-      - scripts/linux/appimage.sh
-      - tests/test_hookshot_launch.py
-      - tests/global_load_16_ir.cpp
-      - tests/global_load_16/**
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_memory.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_instructions.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
-      - tests/test_mesh_stage_buffer_zero.py
-      - gpu/vk/eden/shader_recompiler/shader_info.h
-      - gpu/vk/eden/shader_recompiler/runtime_info.h
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp
-      - gpu/vk/eden/shader_recompiler/frontend/maxwell/translate_program.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv.cpp
-      - gpu/vk/eden/shader_recompiler/backend/spirv/emit_spirv_mesh.cpp
-      - tests/test_mesh_point_topology.py
-      - tests/test_lower_depbar.py
-      - tests/lower_depbar_test.cpp
-      - gpu/vk/eden/shader_recompiler/frontend/ampere/lower_to_maxwell.h
-      - .github/workflows/source-regressions.yml
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -256,22 +26,41 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # (the versions scripts/linux/deps.sh builds the Vulkan back end with)
+      - name: Check out pinned SPIR-V headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: 04f10f650d514df88b76d25e83db360142c7b174 # vulkan-sdk-1.4.341.0
+          path: _deps/spirv-headers
+          persist-credentials: false
+      - name: Check out pinned Vulkan headers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: KhronosGroup/Vulkan-Headers
+          ref: 74d8a6cb930c68ef617b202c3ff3c59d919e086b # v1.4.345
+          path: _deps/vulkan-headers
+          persist-credentials: false
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - name: Check extraction boundaries
-        run: python -I -B nx2/test_nup_paths.py
-      - name: Check source-cache coherency
-        run: python -I -B tests/test_make_game_cache.py
-      - name: Check Vulkan presentation rectangle
-        if: runner.os == 'Windows'
+      # (the one package a test imports: nx2/test_nup_codec.py's zstandard. The runner itself needs none)
+      - name: Python packages for the tests
+        run: python -m pip install --disable-pip-version-check --no-deps zstandard==0.25.0
+      - name: Compilers and the SPIR-V validator
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++ clang spirv-tools
+
+      # (the steps below all run when one before them failed, so one run shows every failure)
+      - name: Check Windows native source regressions
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: cmd
         run: |
           @echo off
@@ -298,170 +87,41 @@ jobs:
           if errorlevel 1 exit /b 1
           "%TEMP%\present_rect_test.exe"
           if errorlevel 1 exit /b 1
-      - name: Check the Windows link's oldnames default
-        run: python -I -B tests/test_msvc_oldnames.py
-      - name: Check isolated child Unicode output
-        run: python -I -B tests/test_child_unicode.py
-      - name: Check packaged CPM discovery
-        run: python -I -B tests/test_cpm_discovery.py
-      - name: Check safe installation of built files
-        run: python -I -B tests/test_finish_output.py
-      - name: Check a failed step's error line
-        run: python -I -B tests/test_failure_reason.py
-      - name: Linux builder worker selection
-        run: python -I -B tests/test_linux_builder_jobs.py
+          python -I -B tests/test_invalidate_vcore.py --cxx cl
+          if errorlevel 1 exit /b 1
       - name: Set up .NET for Windows Builder checks
-        if: runner.os == 'Windows'
-        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.x'
       - name: Check Windows Builder worker delivery
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         shell: pwsh
         run: |
           dotnet restore tests/builder_workers/BuilderWorkersTests.csproj --configfile tests/builder_workers/NuGet.Config
           dotnet run --project tests/builder_workers/BuilderWorkersTests.csproj --configuration Release --no-restore -- (Get-Command python).Source
       - name: Compile Windows Builder
-        if: runner.os == 'Windows'
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
         run: dotnet build builder/HookshotBuilder/HookshotBuilder.csproj --configuration Debug -p:NuGetAudit=false
-      - name: C++ compiler for the import-hold check
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y g++
-      - name: Check failed-import backoff
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_import_hold.py
-      - name: Check the FPS counter's first sample
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_fps_rate.py
-      - name: Check a vertex stream is bound once
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_vertex_bind.py
-      - name: Check FPS overlay transfer ordering
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_fps_overlay_order.py
-      - name: Check dispatch timing stays off
-        run: python -I -B tests/test_dispatch_clock.py
-      - name: Check frame generation stays off until asked
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_framegen_gate.py
-      - name: Check upscaling works without frame generation
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_upscale_independent.py
-      - name: Check the table-entry tracker stops looking
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_table_track.py
-      - name: Check descriptor timing stays off
-        run: python -I -B tests/test_desc_clock.py
-      - name: Check a mesh program's stage buffer starts at zero
-        run: python -I -B tests/test_mesh_stage_buffer_zero.py
-      - name: Check a mesh program with control topology 1 draws points
-        run: python -I -B tests/test_mesh_point_topology.py
-      - name: Check the replay clock skips the performance counter
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_prof_clock.py
-      - name: Check a pool span is reused without the lock
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_pool_span.py
-      - name: Check a captured page is read once
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_submitted_page.py
-      - name: Check uniform words skip a known gap
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_ub_gap.py
-      - name: Check a repeated uniform word is not read again
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_ub_memo.py
-      - name: Check a pass hazard skips textures that are not targets
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_pass_hazard.py
-      - name: Check a repeated read bind is not looked up again
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_bind_memo.py
-      - name: Check the shader list's text encoding
-        run: python -I -B tests/test_shader_census_cmd.py
-      - name: Check the shader list has the game's compute programs
-        run: python -I -B tests/test_shader_census.py
-      - name: Check shader preparation saves the pipeline cache
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_prepare_cache_save.py
-      - name: Check multi-second frames remain in the requested slow log
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_slow_frame_limit.py
-      - name: Check sampled 2D views of 3D images have the creation flag
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_3d_view_create_flags.py
-      - name: Check the optional native present-return trace
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_present_trace.py
-      - name: Check the build's version stamp
-        run: python -I -B nx2/test_version.py
-      - name: Check the release changelog entry
-        run: python -I -B tests/test_changelog.py
-      - name: Check a repeated draw keeps its program and pipeline
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_same_draw.py
-      - name: Check the audio mixer's catch-up
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_audio_deadline.py
-      - name: Check audio output recovers from failed device calls
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_audio_output_errors.py
-      - name: Check a null NVN memory pool is answered, not dereferenced
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_nvn_null_pool.py
-      - name: Check pool-less NVN buffers have usable scratch maps
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_nvn_buffer_map.py --cc gcc
-      - name: Check a null NVN texture builder is a scratch one
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_nvn_tex_builder_guard.py
-      - name: Check controller rumble keeps going
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_rumble_refresh.py
-      - name: Check a repeated draw keeps its dynamic state
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_same_dyn.py
-      - name: Check upscale menu labels
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_upscale_label.py
-      - name: Check movie upscale fallback policy
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_movie_upscale_policy.py
-      - name: Check Alt+Enter is fullscreen, not Plus
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_alt_enter.py
-      - name: Check scripted input and physical focus routing
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_input_background.py --cc gcc
-      - name: Check import windows
-        if: runner.os == 'Linux'
-        run: python -I -B nx2/test_import_windows.py --cxx g++
-      - name: Check a texture handle is looked up once
-        run: python -I -B tests/test_handle_lookup.py
-      - name: Check a repeated bind keeps its descriptors
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_same_bind.py
-      - name: Check the game launcher
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_hookshot_launch.py
-      - name: Clang for the lowering check
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y clang
-      - name: Check every dependency barrier form lowers
-        if: runner.os == 'Linux'
-        run: python -I -B tests/test_lower_depbar.py --cxx clang++
+      # (--strict: a check whose compiler, headers or package is missing here fails instead of being skipped)
+      - name: Every test
+        if: ${{ !cancelled() }}
+        env:
+          HOOKSHOT_SPIRV_HEADERS: ${{ github.workspace }}/_deps/spirv-headers/include
+          HOOKSHOT_VULKAN_HEADERS: ${{ github.workspace }}/_deps/vulkan-headers/include
+        run: python -I -B tests/run_all.py --strict
 
   spirv-global16:
     name: SPIR-V global narrow load/store lowering
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Check out pinned SPIR-V headers
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: KhronosGroup/SPIRV-Headers
           ref: 496543121ce6419f23d6fa5d7194ba66c36212d2
@@ -478,9 +138,38 @@ jobs:
         run: cmake --build ${{ runner.temp }}/global-load-16 --parallel 2
       - name: Emit and inspect real IR modules
         run: ${{ runner.temp }}/global-load-16/global_load_16_ir ${{ runner.temp }}/global-load-16/modules
+      - name: Check real-IR compare-exchange loop contracts
+        env:
+          RX_VK_FOLLOW_STORES: '1'
+        run: ${{ runner.temp }}/global-load-16/global_load_16_ir --cas-loops ${{ runner.temp }}/global-load-16/modules
       - name: Validate every emitted module
         shell: bash
+        # (--uniform-buffer-standard-layout: the back end's device has uniformBufferStandardLayout, gpu/vk/vk_main.cpp
+        # creates it with every feature the GPU reports, so constant buffers are u32 arrays of stride 4)
         run: |
           for module in "${{ runner.temp }}"/global-load-16/modules/*.spv; do
-            spirv-val --target-env vulkan1.3 "$module"
+            spirv-val --target-env vulkan1.3 --uniform-buffer-standard-layout "$module"
           done
+
+  actionlint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # (the release's own binary, checked against its published SHA-256; shellcheck from the runner image checks the
+      # run: scripts)
+      - name: actionlint 1.7.12
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL --retry 5 --retry-delay 10 -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v$VERSION/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+      - name: Lint the workflows
+        run: '"$RUNNER_TEMP/actionlint" -color'
