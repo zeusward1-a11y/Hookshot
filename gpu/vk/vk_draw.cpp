@@ -1035,8 +1035,11 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     for (const Stage& st : p.stages) {
-        if (st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT))
-            continue;   // (hookshot: the fallback's dispatches are not graphics stages)
+        // (hookshot: the fallback's dispatches are not graphics stages. Only a fallback program's: with native mesh shaders
+        // the task and mesh stages are the pipeline's own, and a mesh program built without them was a fragment stage
+        // alone, which drew none of its geometry and then lost the device, issue 640)
+        if (p.fallback && (st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)))
+            continue;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
         si.module = st.module;
