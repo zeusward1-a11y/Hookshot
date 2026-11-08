@@ -610,7 +610,157 @@ static void check_original_stub_failure() {
     fail("original-stub negative control unexpectedly emitted a module");
 }
 
+static void check_cas_functions(const ModuleInfo& module) {
+    u32 bounded = 0, single = 0;
+    for (size_t first = 0; first < module.instructions.size(); ++first) {
+        if (module.instructions[first].op != spv::Op::OpFunction) continue;
+        size_t last = first + 1;
+        while (last < module.instructions.size() && module.instructions[last].op != spv::Op::OpFunctionEnd) ++last;
+        std::map<u32, const Instruction*> defs;
+        std::map<u32, size_t> labels;
+        bool entry = true, variables = true;
+        for (size_t i = first + 1; i < last; ++i) {
+            const auto& inst = module.instructions[i];
+            const auto& w = inst.words;
+            if (inst.op == spv::Op::OpLabel) {
+                labels[w[0]] = i;
+                if (!entry) variables = false;
+                entry = false;
+            } else if (inst.op == spv::Op::OpVariable) {
+                if (!variables) fail("CAS helper declares a Function variable after an instruction or entry block");
+                defs[w[1]] = &inst;
+            } else if (inst.op != spv::Op::OpFunctionParameter) {
+                variables = false;
+                if (inst.op == spv::Op::OpLoad || inst.op == spv::Op::OpIAdd ||
+                    inst.op == spv::Op::OpUGreaterThanEqual || inst.op == spv::Op::OpLogicalOr ||
+                    inst.op == spv::Op::OpIEqual) defs[w[1]] = &inst;
+            }
+        }
+        const auto def = [&](u32 id, spv::Op op) -> const std::vector<u32>& {
+            const auto it = defs.find(id);
+            if (it == defs.end() || it->second->op != op) fail("CAS exit lost its success-or-incremented-ceiling dependency");
+            return it->second->words;
+        };
+        std::map<size_t, bool> covered;
+        bool has_loop = false;
+        for (size_t i = first + 1; i < last; ++i) {
+            const auto& loop = module.instructions[i];
+            if (loop.op != spv::Op::OpLoopMerge) continue;
+            has_loop = true;
+            const u32 merge = loop.words[0];
+            const size_t end = labels.at(merge);
+            u32 header = 0;
+            for (const auto& [id, at] : labels) if (at < i && (!header || at > labels.at(header))) header = id;
+            size_t preheader = first;
+            for (const auto& [id, at] : labels) if (at < labels.at(header) && at > preheader) preheader = at;
+            for (size_t a = i + 1; a < end; ++a) {
+                const auto& atomic = module.instructions[a];
+                if (atomic.op != spv::Op::OpAtomicCompareExchange) continue;
+                bool exits = false;
+                for (size_t b = a + 1; b < end; ++b) {
+                    const auto& branch = module.instructions[b];
+                    if (branch.op != spv::Op::OpBranchConditional || branch.words[1] != merge) continue;
+                    const auto& either = def(branch.words[0], spv::Op::OpLogicalOr);
+                    const auto& success = def(either[2], spv::Op::OpIEqual);
+                    const auto& cap = def(either[3], spv::Op::OpUGreaterThanEqual);
+                    const auto& add = def(cap[2], spv::Op::OpIAdd);
+                    const auto& load = def(add[2], spv::Op::OpLoad);
+                    const auto& variable = def(load[2], spv::Op::OpVariable);
+                    if (variable[2] != static_cast<u32>(spv::StorageClassFunction) ||
+                        constant(module, add[3], "missing attempt increment") != 1 ||
+                        constant(module, cap[3], "missing attempt ceiling") != 1024 ||
+                        !((success[2] == atomic.words[1] && success[3] == atomic.words[7]) ||
+                          (success[3] == atomic.words[1] && success[2] == atomic.words[7])))
+                        fail("CAS exit does not compare its exchange result or count exactly one attempt");
+                    bool reset = false, incremented = false, feedback = false;
+                    const auto& expected = def(atomic.words[7], spv::Op::OpLoad);
+                    for (size_t s = first + 1; s < b; ++s) {
+                        const auto& store = module.instructions[s];
+                        if (store.op != spv::Op::OpStore) continue;
+                        if (s > preheader && s < labels.at(header) && store.words[0] == load[2]) {
+                            const auto value = module.constants.find(store.words[1]);
+                            if (value != module.constants.end() && value->second == 0) reset = true;
+                        }
+                        if (s > a && store.words[0] == load[2] && store.words[1] == add[1]) incremented = true;
+                        if (s > a && store.words[0] == expected[2] && store.words[1] == atomic.words[1]) feedback = true;
+                    }
+                    const u32 retry = branch.words[2];
+                    if (retry != header) {
+                        const auto& back = module.instructions[labels.at(retry) + 1];
+                        if (back.op != spv::Op::OpBranch || back.words[0] != header)
+                            fail("CAS failed-attempt path no longer returns to its loop header");
+                    }
+                    if (!reset || !incremented || !feedback) fail("CAS loop lost reset, increment or compare-exchange feedback");
+                    exits = true;
+                }
+                if (!exits) fail("CAS retry loop has no success-or-ceiling exit");
+                covered[a] = true;
+                ++bounded;
+            }
+        }
+        for (size_t i = first + 1; i < last; ++i) {
+            const auto& inst = module.instructions[i];
+            if (inst.op != spv::Op::OpAtomicCompareExchange || covered.contains(i)) continue;
+            bool returned = false;
+            for (size_t r = i + 1; r < last; ++r)
+                if (module.instructions[r].op == spv::Op::OpReturnValue &&
+                    module.instructions[r].words[0] == inst.words[1]) returned = true;
+            if (has_loop || !returned) fail("unclassified compare-exchange bypasses the retry-loop checks");
+            ++single;
+        }
+        first = last;
+    }
+    if (bounded != 7 || single != 2) fail("fixture did not emit all shared/storage/global loops and both one-shot CAS routes");
+    std::printf("PASS: %u retry loops reset/count/exit on success or 1024; %u one-shot exchanges return directly\n", bounded, single);
+}
+
+static void check_cas_program() {
+    if (!std::getenv("RX_VK_FOLLOW_STORES")) fail("CAS fixture needs RX_VK_FOLLOW_STORES=1 to exercise the page-table route");
+    ObjectPool<IR::Inst> inst_pool;
+    IR::Block block{inst_pool};
+    IR::Program program;
+    program.stage = Stage::Compute;
+    program.workgroup_size = {1, 1, 1};
+    program.shared_memory_size = 16;
+    program.blocks.push_back(&block);
+    program.post_order_blocks.push_back(&block);
+    IR::AbstractSyntaxNode node{};
+    node.type = IR::AbstractSyntaxNode::Type::Block;
+    node.data.block = &block;
+    program.syntax_list.push_back(node);
+    IR::AbstractSyntaxNode ret{};
+    ret.type = IR::AbstractSyntaxNode::Type::Return;
+    program.syntax_list.push_back(ret);
+    IR::IREmitter ir{block};
+    ir.WriteShared(8, ir.Imm32(0u), ir.Imm32(0xa5u));
+    // Storage IR is the actual lowered form; its descriptor is authored fixture metadata.
+    block.AppendNewInst(IR::Opcode::WriteStorageU8, {ir.Imm32(0u), ir.Imm32(0u), ir.Imm32(0xa5u)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicAddF32, {ir.Imm32(0u), ir.Imm32(0u), ir.Imm32(1.0f)});
+    // Recreate the emitter after appending the lowered instructions, preserving their order.
+    IR::IREmitter tail{block};
+    (void)tail.GlobalAtomicF32Add(tail.Imm64(u64{0x1000}), tail.Imm32(1.0f));
+    (void)tail.GlobalAtomicCompareExchange(tail.Imm64(u64{0x1000}), tail.Imm32(1u), tail.Imm32(2u));
+    tail.Epilogue();
+    TestEnvironment env;
+    Optimization::CollectShaderInfoPass(env, program);
+    program.info.constant_buffer_descriptors.push_back({0, 1});
+    program.info.storage_buffers_descriptors.push_back({0, 0, 1, true});
+    program.info.used_constant_buffer_types |= IR::Type::U32 | IR::Type::U32x2;
+    Profile profile{};
+    profile.supported_spirv = 0x00010600;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.min_ssbo_alignment = 16;
+    const auto module = inspect(save_module("cas-helper-contracts", EmitSPIRV(profile, program)));
+    check_cas_functions(module);
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--cas-loops") {
+        output_dir = argv[2];
+        check_cas_program();
+        return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--expect-original-stub") {
         check_original_stub_failure();
         return 0;
