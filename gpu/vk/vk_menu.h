@@ -31,6 +31,9 @@ struct Options {
     int preset = 0;       // quality preset: 0 Custom, 1 Minimum (4GB), 2 Low (6GB), 3 Balanced (8GB), 4 High (12GB), 5 Ultra (16GB+)
     int vram_mb = 0;      // dynamic texture cache budget limit in MB
     int mirror_mb = 0;    // staging mirror limit in MB
+    int dlss = 0;         // the game's gameplay upscale through NVIDIA DLSS (vk_dlss.cpp); read once, at the start (RX_DLSS=0/1 over it)
+    int dlss_mode = 3;    // the render size with DLSS on: 0 Ultra Performance .. 3 Quality, 4 DLAA (dlss_render_size)
+    int dlss_preset = 3;  // DLSS's model: 0 J, 1 K, 2 L, 3 M; applies at once (RX_DLSS_PRESET=J..M over it)
 };
 extern Options opts;
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
@@ -42,8 +45,9 @@ void menu_init();             // (the options from the file, once)
 void menu_set_gpu_count(int count);
 void menu_tick();             // (each frame shown: the keys, while the game's window has the focus)
 bool menu_is_open();
-bool resolution_auto();       // (the game's dynamic resolution: Resolution Auto)
-int resolution_scale();       // (the fixed path's scale in 1/10000: the Resolution row's, as a twelfth of the output)
+bool resolution_auto();       // (the game's dynamic resolution: Resolution Auto, and DLSS not setting the size)
+void menu_note_output(uint32_t w, uint32_t h);   // (each present: the game's output, its window crop)
+int resolution_scale();       // (the fixed path's scale in 1/10000: the Resolution row's, or the DLSS mode's, as a twelfth of the output)
 void menu_option_set(int id, int value);   // (from the game's side: 7 the mouse's sensitivity, the - and = keys)
 int menu_heart_protection();
 int menu_player_flight();

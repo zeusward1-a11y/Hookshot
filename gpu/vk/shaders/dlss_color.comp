@@ -1,0 +1,19 @@
+#version 450
+// (hookshot) ported from Lichii (Eden lineage; Duck912's Eglantine work), GPL-3.0-or-later: vk_dlss.cpp
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D guest_color;
+layout(binding = 1, rgba16f) uniform writeonly image2D dlss_color;
+layout(push_constant) uniform P { int encode; } pc;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(dlss_color)))) {
+        return;
+    }
+    // The guest has already tonemapped this square-root-encoded color for LDR (the network's input, RGB9E5). (hookshot) encode = 1:
+    // the tonemapped scene, the network's first passes left out (vk_draw.cpp), square-root encoded here the same way.
+    // dlss_output.comp squares it back
+    const vec3 c = max(texelFetch(guest_color, pixel, 0).rgb, vec3(0.0));
+    imageStore(dlss_color, pixel, vec4(pc.encode != 0 ? sqrt(c) : c, 1.0));
+}

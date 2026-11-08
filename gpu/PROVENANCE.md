@@ -28,3 +28,9 @@ mkw-recomp's changes, for the Switch 2:
 `mkw_gpu.cpp` / `mkw_gpu.h` / `build-gpu.bat` are the earlier Vulkan stand-in (a window and a swapchain; no longer
 loaded). `shadertool.cpp` runs dumped NVN2 programs through Eglantine's recompiler offline (SPIR-V; it prints what
 each program reads from the constant banks).
+
+Hookshot's NVIDIA DLSS (`vk/vk_dlss.cpp`, the DLSS part of `vk/vk_draw.cpp`, `vk/shaders/dlss_*.comp`) is ported from Lichii
+(zortos293/Lichii: `vulkan_common/streamline.cpp`, `renderer_vulkan/vk_streamline_dlss.cpp`, `vk_ocarina_camera_motion.cpp`,
+`host_shaders/ocarina_*.comp`; Eden Emulator Project, GPL-3.0-or-later; Lichii credits Duck912's Eglantine work).
+`third_party/streamline/` is NVIDIA Streamline v2.14.16's headers (MIT, `license.txt`); its DLLs and NVIDIA's DLSS are
+loaded from the user's PC at run time and are not vendored.

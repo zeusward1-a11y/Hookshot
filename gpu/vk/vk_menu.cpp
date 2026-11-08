@@ -21,6 +21,7 @@
 #include "vk_menu.h"
 #include "vk_menu_hit.h"
 #include "oot_cheat_items.h"
+#include "vk_dlss.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -69,6 +70,8 @@ const char* tx_percent(int v) {
     snprintf(b, sizeof b, "%d%%", v);
     return b;
 }
+// The game's output: the crop of its window texture that the present scales (menu_note_output): the scale sent to the game is for it
+std::atomic<uint32_t> out_w{2048}, out_h{1152};
 // The output the menu's sizes are shown for: the Output resolution row's (applied at the next start), so the rows below follow a change
 // at once; the handheld profile runs the game's own (1536x864)
 struct Out {
@@ -79,6 +82,7 @@ Out shown_output() {
     return opts.handheld ? Out{1536, 864} : t[std::min(std::max(opts.output_res, 0), 2)];
 }
 constexpr int kResPercent[] = {0, 100, 75, 67, 50};
+bool dlss_sets_size() { return opts.dlss && dlss_available(); }
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
 // outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
 // 3840x2160, not the 2560x1440 of 8/12.
@@ -88,12 +92,30 @@ void game_size(float scale, uint32_t& w, uint32_t& h) {
     const int k = twelfths(scale);
     w = (o.w * k + 11) / 12, h = o.h * k / 12;
 }
+// The DLSS mode's scale: NVIDIA's optimal render width for the mode over the output's
+float dlss_scale(int mode, Out o) {
+    uint32_t w, h;
+    dlss_render_size(mode, o.w, o.h, w, h);
+    return (float)w / o.w;
+}
 const char* tx_resolution(int v) {
     static char b[48];
+    if (dlss_sets_size()) return "Set by DLSS mode";
     if (v <= 0 || v > 4) return "Auto (dynamic)";
     uint32_t w, h;
     game_size(kResPercent[v] / 100.0f, w, h);
     snprintf(b, sizeof b, "%d%% (%ux%u)", kResPercent[v], w, h);
+    return b;
+}
+const char* tx_dlss_mode(int v) {
+    static const char* names[] = {"Ultra Performance", "Performance", "Balanced", "Quality", "DLAA"};
+    static char b[64];
+    if ((unsigned)v > 4) v = 3;
+    if (!dlss_sets_size()) return snprintf(b, sizeof b, "%s (DLSS off)", names[v]), b;
+    uint32_t w, h;
+    const float s = dlss_scale(v, shown_output());
+    game_size(s, w, h);
+    snprintf(b, sizeof b, "%s (%d%%, %ux%u)", names[v], (int)(w * 100.0 / shown_output().w + 0.5), w, h);
     return b;
 }
 const char* tx_output_res(int v) {
@@ -107,6 +129,15 @@ const char* tx_text_speed(int v) {
     return t[v];
 }
 const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
+const char* tx_dlss(int v) {
+    if (v && !dlss_available()) return strcmp(dlss_reason(), "not started") ? "On (no NVIDIA DLSS found)" : "On (restart)";
+    return v ? "On" : "Off";
+}
+const char* tx_dlss_preset(int v) {
+    static char b[16];
+    snprintf(b, sizeof b, opts.dlss && dlss_available() ? "%c" : "%c (DLSS off)", 'J' + v);
+    return b;
+}
 const char* tx_ultrawide(int v) { return v ? "Monitor's shape (restart)" : "16:9 (restart)"; }
 int gpu_device_at_start = 0;   // (the row's value the game started with: menu_set_gpu_count)
 const char* tx_gpu(int v) {
@@ -182,10 +213,18 @@ Row rows[] = {
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
     {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
-     "faster."},
+     "faster. With DLSS on, the DLSS mode sets it."},
     {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, 2, 1, tx_output_res,
      "The size the game draws its whole frame at, HUD included, before it is scaled to your window. The 3D is drawn at the "
-     "Resolution percentage of it. Docked only. Applies after a restart."},
+     "Resolution percentage of it, and DLSS scales up to it. Docked only. Applies after a restart."},
+    {TAB_GRAPHICS, "DLSS", &opts.dlss, 0, 1, 1, tx_dlss,
+     "NVIDIA DLSS in place of the game's own upscale. Needs an RTX GPU and NVIDIA's DLLs in the "
+     "streamline folder beside the game. Applies after a restart."},
+    {TAB_GRAPHICS, "DLSS mode", &opts.dlss_mode, 0, 4, 1, tx_dlss_mode, nullptr},   // (help_of: the output's size in it)
+    {TAB_GRAPHICS, "DLSS preset", &opts.dlss_preset, 0, 3, 1, tx_dlss_preset,
+     "NVIDIA's DLSS model, changed at once. M: NVIDIA's pick for Performance, close to L's picture but nearer K's speed. L: its "
+     "pick for Ultra Performance, sharper and steadier, less ghosting, slower. K: its pick for Quality, Balanced and DLAA. J: "
+     "like K, slightly less ghosting, more flicker."},
     {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
@@ -317,6 +356,15 @@ std::atomic<int> item_counts[kItems];   // (-1 until the game side reports: OOT_
 int item_choice = 0, item_scroll = 0;
 constexpr int kCheatRows = 11;
 constexpr int kRows = sizeof rows / sizeof rows[0];
+const char* help_of(const Row& r) {
+    if (r.help) return r.help;
+    static char b[400];
+    const Out o = shown_output();
+    snprintf(b, sizeof b, "The size DLSS draws the 3D at before upscaling it to the game's output (%ux%u), in place of Resolution, changed "
+             "at once. Quality is NVIDIA's default; Balanced, Performance and Ultra Performance are lighter on slower GPUs; DLAA draws at "
+             "full size.", o.w, o.h);
+    return b;
+}
 constexpr int kMenuWidth = menu_hit::kWidth;   // (at a scale of 1: 720 lines)
 
 int cur_tab = TAB_GRAPHICS;
@@ -946,7 +994,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT help = font(14 * s, FW_NORMAL);
     SelectObject(dc, help);
     SetTextColor(dc, RGB(176, 186, 180));
-    wrap_help(dc, rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])].help, (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
+    wrap_help(dc, help_of(rows[tab_row_to_global(cur_tab, tab_selected[cur_tab])]), (int)w - 32 * s, 16 * s, help_top + 4 * s, true);
     SelectObject(dc, body);
     SetTextColor(dc, RGB(140, 150, 144));
     const char* hint = "Arrows change   Q/E or LB/RB: tabs   Home or F1 closes";   // (fits 448 px at 16 px)
@@ -997,7 +1045,7 @@ int measure_help(int s) {
     HFONT f = font(14 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, f);
     int most = 0;
-    for (const Row& r : rows) most = std::max(most, wrap_help(dc, r.help, (kMenuWidth - 32) * s, 0, 0, false));
+    for (const Row& r : rows) most = std::max(most, wrap_help(dc, help_of(r), (kMenuWidth - 32) * s, 0, 0, false));
     SelectObject(dc, old);
     DeleteObject(f);
     DeleteDC(dc);
@@ -1110,12 +1158,18 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
+    if (const char* e = getenv("RX_DLSS")) opts.dlss = atoi(e) != 0;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
+    if (const char* e = getenv("RX_DLSS_PRESET"); e && e[0] >= 'J' && e[0] <= 'M') opts.dlss_preset = e[0] - 'J';
 }
 
-bool resolution_auto() { return opts.resolution == 0; }
-int resolution_scale() {
-    const float s = opts.resolution > 0 && opts.resolution <= 4 ? kResPercent[opts.resolution] / 100.0f : 0;
+void menu_note_output(uint32_t w, uint32_t h) {
+    if (w && h) out_w = w, out_h = h;
+}
+bool resolution_auto() { return opts.resolution == 0 && !dlss_sets_size(); }
+int resolution_scale() {   // (for the output the game runs at: the crop)
+    const Out o{out_w, out_h};
+    float s = dlss_sets_size() ? dlss_scale(opts.dlss_mode, o) : opts.resolution > 0 && opts.resolution <= 4 ? kResPercent[opts.resolution] / 100.0f : 0;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 

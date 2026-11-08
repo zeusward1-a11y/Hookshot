@@ -193,8 +193,11 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
 | | Frame generation | Off, 2x to 8x | Off |
 | | Frame pacing | Off, On | Off |
-| | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size) | Auto |
+| | Resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size); set by the DLSS mode while DLSS is on | Auto |
 | | Output resolution | 2048x1152, 2560x1440, 3840x2160 (after a restart) | 2048x1152 |
+| | DLSS | Off, On (after a restart) | Off |
+| | DLSS mode | Ultra Performance, Performance, Balanced, Quality, DLAA | Quality |
+| | DLSS preset | J, K, L, M | M |
 | | Upscaling | Off, Catmull-Rom, Lanczos | Off |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Handheld profile | Off, On (after a restart) | Off |
@@ -222,8 +225,7 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
 - **Frame generation** makes extra frames between the game's own. It adds a little input delay, and fast motion can
   show artifacts. **Frame pacing** shows frames at an even interval: less stutter, up to one frame of delay.
 - **Output resolution** is the size of the game's whole frame, HUD included, before it is scaled to your window.
-  Resolution is a share of it, and its row shows the size for the output you chose. Docked only. At 3840x2160 the game's
-  render targets get a bigger GPU pool, so a full-size 3D fits. `HOS_OUTPUT_RES=0/1/2` sets it for one run.
+  Resolution and the DLSS mode are a share of it, and their rows show the size for the output you chose. Docked only.
 - **Upscaling** and **Sharpness** also work when Frame generation is Off.
 - **Handheld profile** runs the game as if the console were undocked: lower resolution, lighter on the GPU.
 - **Robust buffers:** a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; Off
@@ -237,6 +239,17 @@ and the right one closes the menu. Your choices are saved in `hookshot_options.i
   place of the right stick. The <kbd>-</kbd> and <kbd>=</kbd> keys change the sensitivity in game too.
 - **Layout preset:** Nintendo has A on the right face button, Xbox / PC and Swap Face put A on the bottom one. Changing
   a button yourself sets it to Custom.
+
+### NVIDIA DLSS
+
+DLSS is optional and needs an RTX card. It replaces the game's own upscale: the 3D is drawn at the DLSS mode's size and
+DLSS scales it up to the output. Hookshot does not include NVIDIA's files. Put a `streamline` folder beside the game's
+exe (`bin\hookshot.exe` with the launcher) holding `sl.interposer.dll`, `sl.common.dll` and `sl.dlss.dll` from
+NVIDIA's [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline) (2.14 or newer) and `nvngx_dlss.dll`. Without
+`nvngx_dlss.dll`, the copy the NVIDIA app keeps is used if it is signed by NVIDIA. Without any of them the DLSS row says
+so and the game runs as before. **DLSS preset** picks NVIDIA's model and changes at once.
+
+For one run: `RX_DLSS=0/1`, `RX_DLSS_PRESET=J..M`, `RX_DLSS_DIR=<folder>`, `HOS_OUTPUT_RES=0/1/2`.
 
 ### Controls
 
@@ -441,7 +454,7 @@ Hookshot exists thanks to the work of many people:
 - **[EvilBoyce / evilmfkr](https://github.com/evilmfkr/Hookshot)** (EvilOOT): the GPU culling that brings back Kokiri's foliage
   (trees, ferns, grass, falling leaves, fireflies), the ambient light probes, the pond's water, the game's own fog, the freeze
   after Load (Horizon's mutex handoff) and the exposure flicker fix.
-- **[zortos293/Lichii](https://github.com/zortos293/Lichii)**: reference for Ampere shader lowering, and its compare-exchange retry fix.
+- **[zortos293/Lichii](https://github.com/zortos293/Lichii)**: reference for Ampere shader lowering, and its compare-exchange retry fix; the NVIDIA DLSS replacement of the game's upscale (Streamline loader, camera motion and its shaders), ported in `gpu/vk/vk_dlss.cpp` and `gpu/vk/vk_draw.cpp`, which Lichii credits to Duck912's work in Eglantine. NVIDIA Streamline's headers (MIT) are in `third_party/streamline`; NVIDIA's DLLs are not part of Hookshot.
 - **[mstorsjo/llvm-mingw](https://github.com/mstorsjo/llvm-mingw)**: the bundled Windows compiler (no Visual Studio needed).
 - **[kinnay/zbic](https://github.com/kinnay/zbic)**, **Opus** and **SDL**: decompression, audio and controllers.
 - **[sostenesfreitas/ocarina-recomp](https://github.com/sostenesfreitas/ocarina-recomp)**: this README's layout, and its notes

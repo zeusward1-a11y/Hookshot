@@ -2488,6 +2488,7 @@ void log_frame_stats() {
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 void do_present(const nvn_tex* t, const int crop[4]) {
+    if (crop) menu_note_output((uint32_t)std::max(crop[2], 0), (uint32_t)std::max(crop[3], 0));   // (the menu's sizes)
     {   // (hookshot, RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
         static std::atomic<int64_t> seen{0};
         static const int64_t at = getenv("RX_VK_PASS_TRACE_AT") ? atoll(getenv("RX_VK_PASS_TRACE_AT")) : 0;

@@ -35,7 +35,7 @@ FLAGS_NEW = FLAGS_OLD + "    hos_res_module = c->x[20];\n    if (hos_fixed_resol
 
 
 def fixed_scale(t):
-    """The fixed path's scale reaching the 3D (the Resolution row). (t, 1) when applied here"""
+    """The fixed path's scale reaching the 3D (the Resolution row, or the DLSS mode with DLSS on). (t, 1) when applied here"""
     if APPLY_OLD not in t or FLAGS_OLD not in t:
         return t, 0
     t = t.replace(APPLY_OLD, APPLY_NEW, 1).replace(FLAGS_OLD, FLAGS_NEW, 1)
