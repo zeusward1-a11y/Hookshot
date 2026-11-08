@@ -7,6 +7,8 @@
 //
 // Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
 #include <atomic>
 #include <chrono>
@@ -40,6 +42,12 @@
 #include "shaders/clear_vert_spv.h"
 #include "shaders/taau_upscale_comp_spv.h"
 #include "shaders/movie_upscale_comp_spv.h"
+#include "shaders/dlss_motion_comp_spv.h"
+#include "shaders/dlss_color_comp_spv.h"
+#include "shaders/dlss_output_comp_spv.h"
+#include "shaders/dlss_debug_comp_spv.h"
+#include "vk_dlss.h"
+#include "vk_menu.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -4453,6 +4461,8 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
     vkCmdBindIndexBuffer(cmd, buffer, offset, type);
     last_ib = {b, (uint64_t)offset, (uint32_t)type, true};
 }
+void dlss_note_camera(const NvnState& s, const Targets& at);   // (below, with the DLSS frame code)
+bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p);
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF(PROF_DRAW);
@@ -4467,6 +4477,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     const Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
+    dlss_note_camera(s, at);   // (hookshot: the scene camera, for DLSS's motion)
     uint8_t types[8];
     for (int i = 0; i < 8; i++) {
         const VkFormat f = i < at.n ? at.color_format[i] : VK_FORMAT_UNDEFINED;
@@ -5410,6 +5421,362 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     return typed_upscale(cmd, dw.imgs[0].imageView, dw.imgs[ntex].imageView, out, level, p.key, keys, true);
 }
 
+// ---- (hookshot) NVIDIA DLSS in place of OoT's gameplay upscale (vk_dlss.cpp has Streamline; this, the frame's part) ----
+// Ported from Lichii (Eden lineage; Duck912's Eglantine work), GPL-3.0-or-later: vk_ocarina_camera_motion.cpp, TryOcarinaDlss.
+// The game's chain after its tonemap draw (B10G11R11 at the render size: twelfths of 2048x1152, the Resolution row's or, with DLSS
+// on, the DLSS mode's; 1536x864 at 75%), seen in
+// frame dumps: 26fe0c70ab9fc547 (a quarter-size pass over the tonemapped scene) -> 685adb41edc19de7 -> 6637ac1d052d22d4 (the
+// network's input: the scene square-root encoded, RGB9E5, over the scene's colour target) -> fd029a317a9a4b94 (the network:
+// a 4/3 upscale with its sharpening, B10G11R11 at 2048x1152, under the HUD; then the HUD, and a plain copy into the window
+// texture, whose 2048x1152 crop the present scales: no FSR, no other upscale or sharpening). What the first three write feeds only
+// the next (their images alias depth targets the next frame draws first). On a DLSS frame none of the four runs: at the first, the
+// tonemapped scene becomes DLSS's colour; at the last, DLSS (with depth and the camera's motion) writes the network's target.
+// The fallback, with its reason logged: the game's whole chain (the decision is made at its first pass), or, when DLSS fails after
+// that, a linear upscale for the frame.
+namespace {
+constexpr uint64_t kChainFirst = 0x26fe0c70ab9fc547ull, kChainMid1 = 0x685adb41edc19de7ull, kChainMid2 = 0x6637ac1d052d22d4ull,
+                   kChainNet = 0xfd029a317a9a4b94ull;
+// (the network has one variant per input size, all to the same 2048x1152 target; the game draws at twelfths of it: 2048x1152
+// 9dc98871eb7fc101, 1536x864 fd029a317a9a4b94, 1366x768 6676619641320ba7, 1195x672 f10782f9e58b6a7c, 1024x576
+// 72ba090c70fe2614, 683x384 0775215f8da720e6 (frame dumps at each scale). Any other dispatch right after the three prepasses
+// that writes a B10G11R11 target of at least the render size is taken as the network too: the sizes not seen)
+bool chain_net(uint64_t k) {
+    return k == kChainNet || k == 0x0775215f8da720e6ull || k == 0xf10782f9e58b6a7cull || k == 0x9dc98871eb7fc101ull ||
+           k == 0x72ba090c70fe2614ull || k == 0x6676619641320ba7ull;
+}
+using Mat = std::array<float, 16>;
+struct DlssCamera {
+    uint64_t frame = ~0ull;
+    Texture* depth = nullptr;
+    VkImageView depth_view = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+    Mat cur{}, prev{};
+};
+struct DlssImg {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation mem = nullptr;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0;
+};
+struct DlssState {
+    DlssCamera cam, used;      // (the frame's camera, and the one the armed frame took)
+    bool armed = false;        // (the chain's first pass was left out: its last must be replaced)
+    uint64_t last_frame = ~0ull;
+    Mat last_vp{};
+    uint32_t evals = 0;
+    DlssImg color, motion, out, prev;   // (prev: last frame's colour, RX_DLSS_DEBUG 3/4 only)
+    VkPipeline motion_pipe = VK_NULL_HANDLE, color_pipe = VK_NULL_HANDLE, output_pipe = VK_NULL_HANDLE, debug_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE, debug_layout = VK_NULL_HANDLE;
+    uint32_t resets = 0, cuts = 0;   // (in the last 600 evaluations: history dropped, and of those the camera cuts)
+    VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
+    const char* reason = nullptr;   // (the last fallback's)
+    uint64_t repeats = 0;
+    bool ready = false, made = false;
+};
+DlssState ds;   // ponytail: one set of images, no lock: the replay records one frame at a time (RX_VK_PARALLEL would need ParLock here)
+
+bool dlss_on() { return opts.dlss && dlss_available(); }
+// RX_DLSS_DEBUG=1..4 (dlss_debug.comp): motion, depth, or the reprojection error with and without the motion, drawn in place of
+// DLSS's output (DLSS still runs)
+int dlss_debug() { static const int v = getenv("RX_DLSS_DEBUG") ? atoi(getenv("RX_DLSS_DEBUG")) : 0; return v; }   // (the menu's Off takes effect at once; On needs the start's Streamline)
+
+/// Logged when the reason changes and every 600th repeat: the game's chain draws this frame
+void dlss_fallback(const char* why) {
+    if (why != ds.reason || ++ds.repeats % 600 == 0)
+        logf("vk: dlss: the game's upscale draws frame %llu (%s)", (unsigned long long)texture_frame_no(), why);
+    if (why != ds.reason) ds.reason = why, ds.repeats = 0;
+}
+
+/// (Lichii's ClipToPreviousClip) depth reprojected from the current clip space into the previous camera's
+bool clip_to_previous(const Mat& current, const Mat& previous, Mat& out) {
+    double rows[4][8]{};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) rows[i][j] = current[i * 4 + j];
+        rows[i][i + 4] = 1.0;
+    }
+    for (int col = 0; col < 4; col++) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; r++)
+            if (std::abs(rows[r][col]) > std::abs(rows[pivot][col])) pivot = r;
+        std::swap(rows[col], rows[pivot]);
+        const double d = rows[col][col];
+        if (!std::isfinite(d) || std::abs(d) < 1e-10) return false;
+        for (double& v : rows[col]) v /= d;
+        for (int r = 0; r < 4; r++)
+            if (r != col) {
+                const double k = rows[r][col];
+                for (int i = 0; i < 8; i++) rows[r][i] -= k * rows[col][i];
+            }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            double v = 0;
+            for (int i = 0; i < 4; i++) v += previous[r * 4 + i] * rows[i][c + 4];
+            out[r * 4 + c] = (float)v;
+            if (!std::isfinite(out[r * 4 + c])) return false;
+        }
+    return true;
+}
+
+bool dlss_image(DlssImg& im, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkCommandBuffer cmd) {
+    if (im.image && im.w == w && im.h == h) return true;
+    im = {};   // (the one before is kept: work in flight may still use it, and the sizes seldom change)
+    VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ic.imageType = VK_IMAGE_TYPE_2D, ic.format = format, ic.extent = {w, h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1;
+    ic.samples = VK_SAMPLE_COUNT_1_BIT, ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = usage;
+    if (!create_image(ic, im.image, im.mem)) return im = {}, false;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = im.image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format, vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev.device, &vc, nullptr, &im.view) != VK_SUCCESS) return im = {}, false;
+    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+    ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    ib.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = im.image, ib.subresourceRange = vc.subresourceRange;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+    vkCmdPipelineBarrier2(cmd, &di);
+    im.w = w, im.h = h;
+    return true;
+}
+
+/// The three passes' pipelines (binding 0 a sampled image, 1 a storage image, 64 bytes pushed), once
+bool dlss_pipelines() {
+    if (ds.made) return ds.ready;
+    ds.made = true;
+    if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
+    VkDescriptorSetLayoutBinding b[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, li.bindingCount = 2, li.pBindings = b;
+    VkDescriptorSetLayout set{};
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &ds.layout) != VK_SUCCESS) return false;
+    const auto make = [](const uint32_t* code, size_t bytes) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = bytes, mi.pCode = code;
+        VkShaderModule m{};
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return VkPipeline(VK_NULL_HANDLE);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+        ci.layout = ds.layout;
+        VkPipeline pl = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
+        vkDestroyShaderModule(dev.device, m, nullptr);
+        return pl;
+    };
+    ds.motion_pipe = make(DLSS_MOTION_COMP_SPV, sizeof DLSS_MOTION_COMP_SPV);
+    ds.color_pipe = make(DLSS_COLOR_COMP_SPV, sizeof DLSS_COLOR_COMP_SPV);
+    ds.output_pipe = make(DLSS_OUTPUT_COMP_SPV, sizeof DLSS_OUTPUT_COMP_SPV);
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCreateSampler(dev.device, &si, nullptr, &ds.nearest);
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    vkCreateSampler(dev.device, &si, nullptr, &ds.linear);
+    ds.ready = ds.motion_pipe && ds.color_pipe && ds.output_pipe && ds.nearest && ds.linear;
+    if (ds.ready && dlss_debug()) {   // (four sampled images and the target)
+        VkDescriptorSetLayoutBinding db[5];
+        for (uint32_t i = 0; i < 5; i++)
+            db[i] = {i, i < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        li.bindingCount = 5, li.pBindings = db;
+        VkDescriptorSetLayout dset{};
+        pi.pSetLayouts = &dset;
+        if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &dset) == VK_SUCCESS &&
+            vkCreatePipelineLayout(dev.device, &pi, nullptr, &ds.debug_layout) == VK_SUCCESS) {
+            std::swap(ds.layout, ds.debug_layout);
+            ds.debug_pipe = make(DLSS_DEBUG_COMP_SPV, sizeof DLSS_DEBUG_COMP_SPV);
+            std::swap(ds.layout, ds.debug_layout);
+        }
+        logf("vk: dlss: RX_DLSS_DEBUG=%d: %s", dlss_debug(), ds.debug_pipe ? "its view replaces DLSS's output" : "its pipeline was not made");
+    }
+    if (!ds.ready) logf("vk: dlss: its passes' pipelines were not made");
+    return ds.ready;
+}
+
+void dlss_pass(VkCommandBuffer cmd, VkPipeline pipe, VkSampler sampler, VkImageView in, VkImageView out, uint32_t w, uint32_t h,
+               const void* push) {
+    const VkDescriptorImageInfo ii{sampler, in, VK_IMAGE_LAYOUT_GENERAL}, oi{VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    wr[0].dstBinding = 0, wr[0].descriptorCount = 1, wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, wr[0].pImageInfo = &ii;
+    wr[1].dstBinding = 1, wr[1].descriptorCount = 1, wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, wr[1].pImageInfo = &oi;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.layout, 0, 2, wr);
+    if (push) vkCmdPushConstants(cmd, ds.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, push);
+    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+}
+/// RX_DLSS_DEBUG: its view into the network's target (out), then this frame's colour kept as the next one's previous
+bool dlss_debug_pass(VkCommandBuffer cmd, VkImageView out, uint32_t w, uint32_t h, const DlssCamera& cam) {
+    if (!ds.debug_pipe || !dlss_image(ds.prev, ds.color.w, ds.color.h, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd))
+        return false;
+    VkDescriptorImageInfo ii[5] = {{ds.nearest, ds.color.view, VK_IMAGE_LAYOUT_GENERAL}, {ds.nearest, ds.motion.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {ds.nearest, cam.depth_view, VK_IMAGE_LAYOUT_GENERAL}, {ds.linear, ds.prev.view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[5];
+    for (uint32_t i = 0; i < 5; i++) {
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstBinding = i, wr[i].descriptorCount = 1, wr[i].pImageInfo = &ii[i];
+        wr[i].descriptorType = i < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    const int32_t push[16] = {dlss_debug()};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.debug_pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.debug_layout, 0, 5, wr);
+    vkCmdPushConstants(cmd, ds.debug_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, push);
+    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+    std::swap(ds.color, ds.prev);   // (the next frame's colour goes into the other image)
+    return true;
+}
+} // namespace
+
+/// From draw(): the scene camera (Lichii's TrackOcarinaCamera): vertex constant buffer 3 of a draw into a B10G11R11 target of at
+/// least 640x360 with D32 depth, whose +0x120/+0x124 are the target's size and +0xa8/+0xac -1 and 0; current view-projection at
+/// +0x30, the previous frame's at +0x180. The largest such target of the frame
+void dlss_note_camera(const NvnState& s, const Targets& at) {
+    if (!dlss_on() || at.n < 1 || !at.color[0] || at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || at.width < 640 ||
+        at.height < 360 || !at.depth || at.depth_format != VK_FORMAT_D32_SFLOAT || at.samples != VK_SAMPLE_COUNT_1_BIT ||
+        at.depth_level || at.depth_layer || !at.depth_view)
+        return;
+    const uint64_t now = texture_frame_no();
+    if (ds.cam.frame == now && (uint64_t)at.width * at.height <= (uint64_t)ds.cam.w * ds.cam.h) return;
+    const nvn_p_bind_buf& u = s.ubo[0][0];   // (Maxwell's cbuf 3 of the vertex stage)
+    float c[0x230 / 4];
+    if (!u.addr || (u.size && u.size < sizeof c) || !ub_read(u.addr, c, sizeof c)) return;
+    if (c[0x120 / 4] != (float)at.width || c[0x124 / 4] != (float)at.height || c[0xa8 / 4] != -1.0f || c[0xac / 4] != 0.0f) return;
+    // (a sampled view: at.depth_view is the attachment's, made with only the depth-attachment usage, and read through it the
+    // depth came back 0 everywhere: every pixel at the near plane, so any camera move gave huge motion, the ghosting)
+    const VkImageView depth = texture_view(at.depth, s.rt.depth, s.rt.has_dview ? &s.rt.dview : nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
+    if (!depth) return;
+    ds.cam.frame = now, ds.cam.depth = at.depth, ds.cam.depth_view = depth, ds.cam.w = at.width, ds.cam.h = at.height;
+    std::copy_n(c + 0x30 / 4, 16, ds.cam.cur.begin());
+    std::copy_n(c + 0x180 / 4, 16, ds.cam.prev.begin());
+}
+
+/// DLSS's colour for this frame into ds.color (encode: square-root encode it, the tonemapped scene; else the network's own input,
+/// encoded already), with the checks that decide the frame; ds.used the camera it goes with. False: the game's passes run
+bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
+    if (ds.cam.frame != texture_frame_no()) return dlss_fallback("no scene camera this frame"), false;
+    const Texture* src = draw_sampled.empty() ? nullptr : draw_sampled[0];
+    if (p.stages.empty() || p.stages[0].info.texture_descriptors.empty() || dw.imgs.empty() || !dw.imgs[0].imageView || !src ||
+        src->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || src->samples != VK_SAMPLE_COUNT_1_BIT)
+        return dlss_fallback("unexpected bindings"), false;
+    if (src->width != ds.cam.w || src->height != ds.cam.h) return dlss_fallback("the scene colour is not the camera's size"), false;
+    if (!ds.cam.depth || !ds.cam.depth->image || ds.cam.depth->width != ds.cam.w || ds.cam.depth->height != ds.cam.h)
+        return dlss_fallback("no scene depth at the camera's size"), false;
+    if (!dlss_pipelines()) return dlss_fallback("no pipelines"), false;
+    if (!dlss_image(ds.color, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd) ||
+        !dlss_image(ds.motion, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd))
+        return dlss_fallback("images not made"), false;
+    int32_t push[16] = {encode ? 1 : 0};
+    gprof_begin(cmd);
+    full_barrier(cmd);
+    dlss_pass(cmd, ds.color_pipe, ds.nearest, dw.imgs[0].imageView, ds.color.view, ds.cam.w, ds.cam.h, push);
+    full_barrier(cmd);
+    gprof_end(cmd, "dlss: colour");
+    descriptors_disturbed();
+    ds.used = ds.cam;
+    return true;
+}
+
+/// From dispatch(), the program's descriptors built: true when the dispatch is replaced (the network on a DLSS frame; with
+/// unless RX_DLSS_KEEP_PREPASSES=1, the chain's first three passes too)
+bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
+    const bool pre = p.key == kChainFirst || p.key == kChainMid1 || p.key == kChainMid2;
+    const bool known = chain_net(p.key);
+    if ((!pre && !known && !ds.armed) || !dlss_on()) return false;
+    // (the first three prepare the network's input and feed nothing else: left out, DLSS takes the tonemapped scene, square-root
+    // encoded here as they do. The same picture as with them (means within 1% in the A/B, docs in the DLSS report).
+    // RX_DLSS_KEEP_PREPASSES=1: they run and DLSS takes the network's input, as Lichii does)
+    static const bool skip_pre = !(getenv("RX_DLSS_KEEP_PREPASSES") && atoi(getenv("RX_DLSS_KEEP_PREPASSES")) != 0);
+    if (pre) {
+        if (!skip_pre) return false;
+        if (p.key == kChainFirst) ds.armed = dlss_take_colour(cmd, p, true);
+        return ds.armed;
+    }
+    if (!known && !skip_pre) return false;   // (unknown networks by their place only: with the prepasses left out)
+    const bool armed = ds.armed;   // (the network's input was never made: whatever happens, the network cannot run)
+    if (skip_pre ? !armed : !dlss_take_colour(cmd, p, false)) return false;
+    const uint64_t now = texture_frame_no();
+    // the network's target, as taau_stand_in finds it
+    const Stage& st = p.stages[0];
+    size_t ntex = 0;
+    for (const auto& d : st.info.texture_descriptors) ntex += d.count;
+    Texture* out = nullptr;
+    uint32_t level = 0;
+    const uint32_t handle = st.info.image_descriptors.empty() ? 0 : handle_of(s, st, st.info.image_descriptors[0], 0);
+    if (handle) texture_view_of(handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(st.info.image_descriptors[0].format), &out, &level);
+    if (!out || level || dw.imgs.size() <= ntex || !dw.imgs[ntex].imageView || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+        out->width < ds.used.w || out->height < ds.used.h) {
+        if (!known) return false;   // (not the network after all: it runs, the chain stays armed)
+        ds.armed = false;
+        if (!armed) return dlss_fallback("the network's target is not the expected B10G11R11 image"), false;
+        logf("vk: dlss: frame %llu: the network's target is not the expected B10G11R11 image: left as it was", (unsigned long long)now);
+        return true;
+    }
+    ds.armed = false;
+    if (!known) {
+        static uint64_t logged;
+        if (logged != p.key) logged = p.key, logf("vk: dlss: network %016llx (not a known one) taken by its place in the chain", (unsigned long long)p.key);
+    }
+    const uint32_t ow = out->width, oh = out->height, rw = ds.used.w, rh = ds.used.h;
+    gprof_begin(cmd);
+    full_barrier(cmd);
+    bool ok = dlss_image(ds.out, ow, oh, VK_FORMAT_R16G16B16A16_SFLOAT,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, cmd);
+    Mat clip{};
+    const bool have_motion = clip_to_previous(ds.used.cur, ds.used.prev, clip);
+    if (ok && have_motion) {
+        dlss_pass(cmd, ds.motion_pipe, ds.nearest, ds.used.depth_view, ds.motion.view, rw, rh, clip.data());
+        full_barrier(cmd);
+        bool same_camera = true;   // (a camera cut: the previous matrix is not last frame's current one)
+        for (int i = 0; i < 16; i++) same_camera = same_camera && std::abs(ds.used.prev[i] - ds.last_vp[i]) < 0.001f;
+        const bool reset = ds.last_frame == ~0ull || now != ds.last_frame + 1 || !same_camera;
+        ds.resets += reset, ds.cuts += reset && !same_camera;
+        if (dlss_debug() && ds.evals >= 1500 && ds.evals < 1512) {   // (the camera of 12 frames: a jitter would move [0][3]/[1][3] by ~1/w)
+            const Mat& m = ds.used.cur;
+            logf("vk: dlss: debug: frame %llu camera %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g | %.6g %.6g %.6g %.6g",
+                 (unsigned long long)now, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+        }
+        if (ds.evals % 600 == 599) {   // (a cut every frame would mean +0x180 is not last frame's camera: no history, no ghosting)
+            logf("vk: dlss: the last 600 frames: %u history resets, %u of them camera cuts", ds.resets, ds.cuts);
+            ds.resets = ds.cuts = 0;
+        }
+        const DlssImage color{ds.color.image, ds.color.view, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT};
+        const DlssImage depth{ds.used.depth->image, ds.used.depth_view, VK_FORMAT_D32_SFLOAT, rw, rh, VK_IMAGE_ASPECT_DEPTH_BIT};
+        const DlssImage motion{ds.motion.image, ds.motion.view, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT};
+        const DlssImage output{ds.out.image, ds.out.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT};
+        ok = dlss_evaluate(cmd, color, depth, motion, output, reset, ds.evals++);
+        if (ok) {
+            if (ds.reason || ds.last_frame == ~0ull)
+                logf("vk: dlss: DLSS draws the upscale from frame %llu (%ux%u -> %ux%u)", (unsigned long long)now, rw, rh, ow, oh);
+            ds.reason = nullptr;
+            ds.last_frame = now, ds.last_vp = ds.used.cur;
+        }
+    }
+    full_barrier(cmd);
+    if (!ok && !armed) {   // (the network's input is there: the game's network draws this frame)
+        dlss_fallback(have_motion ? "DLSS declined the frame" : "the camera matrix is not invertible");
+        gprof_end(cmd, "dlss: declined");
+        descriptors_disturbed();
+        return false;
+    }
+    if (ok && dlss_debug() && dlss_debug_pass(cmd, dw.imgs[ntex].imageView, ow, oh, ds.used)) {
+    } else if (ok) {
+        dlss_pass(cmd, ds.output_pipe, ds.nearest, ds.out.view, dw.imgs[ntex].imageView, ow, oh, nullptr);   // (squared back)
+    } else {   // (DLSS failed with the first passes left out: a linear upscale of the square-rooted scene this frame)
+        dlss_fallback(have_motion ? "DLSS declined the frame: a linear upscale" : "the camera matrix is not invertible: a linear upscale");
+        dlss_pass(cmd, ds.output_pipe, ds.linear, ds.color.view, dw.imgs[ntex].imageView, ow, oh, nullptr);
+    }
+    full_barrier(cmd);
+    gprof_end(cmd, ok ? "dlss: motion, DLSS, output" : "dlss: fallback upscale");
+    texture_written(out);
+    descriptors_disturbed();
+    return true;
+}
+
 bool precompile_wanted() {
 #if defined(HOOKSHOT_RELEASE)
     bool on = true;
@@ -5933,17 +6300,25 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     work_since_barrier = true;
     if (!p.stages.empty() && p.stages[0].info.uses_cooperative_matrix) {   // (the game's networks, once each: what they read and write)
         static std::mutex mu;
-        static std::unordered_map<uint64_t, int> seen;
+        static std::unordered_map<uint64_t, uint64_t> seen;   // (key -> the sizes last logged: again when they change)
+        static int lines = 0;
         std::lock_guard lk(mu);
-        if (seen[p.key]++ == 0) {
+        uint64_t sig = 0;
+        for (const Texture* t : draw_sampled)
+            if (t) sig = sig * 1000003u + ((uint64_t)t->width << 32 | t->height);
+        auto it = seen.find(p.key);
+        if ((it == seen.end() || it->second != sig) && lines++ < 200) {
+            seen[p.key] = sig;
             char line[900];
-            int n = snprintf(line, sizeof line, "vk: network %016llx: dispatch %ux%ux%u, %zu textures %zu images:", (unsigned long long)p.key, x, y, z,
-                             p.stages[0].info.texture_descriptors.size(), p.stages[0].info.image_descriptors.size());
+            int n = snprintf(line, sizeof line, "vk: network %016llx: dispatch %ux%ux%u, %zu textures %zu images (frame %llu):", (unsigned long long)p.key, x, y, z,
+                             p.stages[0].info.texture_descriptors.size(), p.stages[0].info.image_descriptors.size(),
+                             (unsigned long long)texture_frame_no());
             for (const Texture* t : draw_sampled)
                 if (t && n < 860) n += snprintf(line + n, sizeof line - n, " %ux%ux%u/%u", t->width, t->height, t->depth, (unsigned)t->format);
             logf("%s", line);
         }
     }
+    if (dlss_dispatch(cmd, s, p)) return void(st_dispatches++);   // (hookshot: NVIDIA DLSS in place of the game's upscale chain)
     if (taau_stand_in(cmd, s, p)) return void(st_dispatches++);
     if (!p.compute_pipeline) SKIP_HERE();
     dump_ssbos(cmd, p, "before");

@@ -4,6 +4,7 @@
 #include "vk_paths.h"
 #include "vk_loader.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include "vk_api.h"
 #include "vk_draw.h"
 #include "vk_internal.h"
+#include "vk_dlss.h"
 #include "gpu_choice.h"
 #include "vk_menu.h"
 
@@ -87,8 +89,16 @@ bool create_instance() {
         return false;
     }
 #ifdef _WIN32
-    const char* exts[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
-    const uint32_t n_exts = 2;
+    std::vector<const char*> exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
+    {   // (hookshot) what NVIDIA Streamline asks for (vk_dlss.cpp), those the loader has
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> all(n);
+        vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
+        for (const char* e : dlss_instance_exts())
+            if (has_extension(all, e) && std::none_of(exts.begin(), exts.end(), [&](const char* x) { return !std::strcmp(x, e); })) exts.push_back(e);
+    }
+    const uint32_t n_exts = (uint32_t)exts.size();
 #else
     // (linux: every window system's surface the loader has, for whichever one SDL's window is on: X11 or Wayland)
     const char* exts[4] = {VK_KHR_SURFACE_EXTENSION_NAME};
@@ -108,7 +118,7 @@ bool create_instance() {
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     ci.enabledExtensionCount = n_exts;
-    ci.ppEnabledExtensionNames = exts;
+    ci.ppEnabledExtensionNames = &exts[0];
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
     const char* layer = "VK_LAYER_KHRONOS_validation";
     if (getenv("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
@@ -228,6 +238,8 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    for (const char* e : dlss_device_exts())   // (hookshot: NVIDIA Streamline's, vk_dlss.cpp)
+        if (has_extension(exts, e) && std::none_of(want.begin(), want.end(), [&](const char* x) { return !std::strcmp(x, e); })) want.push_back(e);
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -370,6 +382,7 @@ bool create_device() {
 
     load_device(dev.device);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    dlss_attach(dev.instance, dev.physical, dev.device, dev.queue_family);   // (before the first swapchain: Streamline's proxies make them)
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     if (dev.push_descriptor) {
@@ -670,6 +683,8 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
     }
+    menu_init();   // (hookshot: the DLSS row decides the instance and device extensions)
+    if (opts.dlss) dlss_start();
     if (!create_instance() || !pick_device() || !create_device()) return nullptr;
     logf("vk: %s, Vulkan %u.%u, driver %#x; mesh shaders %s, host memory import %s, pipeline libraries %s",
          dev.props.deviceName, VK_VERSION_MAJOR(dev.props.apiVersion), VK_VERSION_MINOR(dev.props.apiVersion),
