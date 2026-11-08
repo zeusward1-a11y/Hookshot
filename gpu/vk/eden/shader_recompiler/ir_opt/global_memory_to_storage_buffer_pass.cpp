@@ -81,11 +81,12 @@ bool GmLegacy() {
 /// (hookshot) The tracking a stage gets. EDEN_NX2_GM_LEGACY=0/1: the port / the tracking as before, for every stage. Unset: the port
 /// for the geometry and compute stages, the tracking as before for the fragment stage. The port placed the trees and terrain right
 /// (v2.0.3: no floating trees, issue #729) and the dark characters were lighting, which the fragment stage reads (light probes).
-/// EDEN_NX2_GM_SPLIT=0: the tracking as before everywhere (v2.0.4's default)
+/// EDEN_NX2_GM_SPLIT=1: that split; unset or 0: the tracking as before everywhere (v2.0.4/v2.0.5's default). Off by default again
+/// (2026-11-08 test): with it the cold precompile of the 10340 compute programs took 650 s instead of ~130 s.
 bool GmLegacyFor(Stage stage) {
     static const char* const forced{std::getenv("EDEN_NX2_GM_LEGACY")};
     if (forced && *forced) return GmLegacy();
-    static const bool split{EnvSwitch("EDEN_NX2_GM_SPLIT", true)};
+    static const bool split{EnvSwitch("EDEN_NX2_GM_SPLIT", false)};
     return !split || stage == Stage::Fragment;
 }
 bool GmNative() {
