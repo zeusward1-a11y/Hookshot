@@ -543,8 +543,9 @@ static int game_main(int argc, char **argv) {
         const double game = 16.0 / 9.0;
         if (want > game * 1.01) {
             double r = want > 32.0 / 9.0 ? 32.0 / 9.0 : want;
-            const unsigned oh = 1440, ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
-            const unsigned sh = 1080, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
+            uint32_t hos_output_size(int height);   /* (host/nn_applet.c: the Output resolution's height, 1440 as shipped) */
+            const unsigned oh = hos_output_size(1), ow = (unsigned)(oh * r / 8 + 0.5) * 8;   /* (whole multiples of 8 pixels) */
+            const unsigned sh = oh * 3 / 4, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;
             hos_wide_ratio = (float)ow / (float)oh;
