@@ -166,6 +166,9 @@ To build from the command line you also need:
   it the build uses the clang from [emsdk](https://github.com/emscripten-core/emsdk) at `C:\emsdk` with Visual Studio's C++ tools
   and the Windows SDK (`HOOKSHOT_MSVC=1` forces that route).
 - Visual Studio 2022 with .NET 8, only if you want to change the builder itself.
+- From Linux, the Windows game builds too: unpack llvm-mingw's Linux build (`ucrt-ubuntu-22.04-x86_64`), then run
+  `make_game.py` with `RX_TARGET=windows` and `HOOKSHOT_MINGW` set to its folder. The objects go to
+  `~/.cache/hookshot-builder-windows`, apart from the Linux game's. The game folder runs under Proton or on Windows.
 - The prebuilt tools that go in `third_party/`: `a64emit`, `lld-link`, `zbic` and SDL2.
 - What the HookshotBuilder zip carries in its `tools` folder and a clone does not. The builder sets the variables
   below itself; from the command line, set them before you run `make_game.py`:

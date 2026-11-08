@@ -51,10 +51,23 @@ static class Updater
                     using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
                     return doc.RootElement.GetProperty("tag_name").GetString();
                 }
-                if ((int)response.StatusCode < 500) return null;
+                if ((int)response.StatusCode < 500) break;   // (the API's limit, 60 an hour a PC: the list below instead)
             }
             catch (Exception) { }
             await Task.Delay(TimeSpan.FromSeconds(2 << attempt));
+        }
+        // (v2.0.0: when the API did not answer, the builder said a game was up to date. The release's setup list names its tag in
+        // its first line, from GitHub's download service, not the API)
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                var list = await http.GetStringAsync("https://github.com/NotRexed/Hookshot/releases/latest/download/" + SetupList);
+                foreach (var line in list.Split('\n'))
+                    if (line.StartsWith("tag ")) return line[4..].Trim();
+            }
+            catch (Exception) { }
+            await Task.Delay(TimeSpan.FromSeconds(2));
         }
         return null;
     }

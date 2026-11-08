@@ -205,6 +205,21 @@ void wait_value(uint64_t v) {
     wi.pValues = &v;
     vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
 }
+} // namespace
+uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
+void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
+    if (!timeline || completed() >= v) return;
+    queue_flush_for(FR_VALUE);
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &timeline;
+    wi.pValues = &v;
+    if (vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT) {
+        static std::atomic<int> logged{0};
+        if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
+    }
+}
+namespace {
 
 int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU behind)
 
@@ -2535,15 +2550,8 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         }
         if (interpolated) framegen_queue(value);
         else menu_note_frame(true);   // (the FPS counter's, as frame generation's thread counts what it shows)
-        {   // The replay waits for each frame's GPU work at its present (RX_VK_WAIT_GPU=0, the default): the game's CPU
-            // otherwise runs a frame ahead and writes data a pass of this frame has yet to read, and the scene and the
-            // exposure meter's samples of it came out too bright for one frame (one-frame exposure flashes).
-            // RX_VK_WAIT_GPU=<frames>: that many frames ahead instead; -1: no wait, as before
-            // (hookshot, 2026-11-08: on Windows too. At the owner's settings (3440x1440, 100% resolution, Lanczos) on an RTX 4060 Ti
-            // the flicker he saw went away with it and came back without it, and came back with 1 frame ahead; 32.7 fps against 34.2.
-            // About ten players reported the flashing on Windows (issue 574: NVIDIA and AMD). Its author measured 70 -> 0 on Linux)
+        {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that)
             static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU")) : 0;
-            if (ahead == 0) wait_value(value);
             static uint64_t values[8];
             if (ahead > 0) {
                 const uint64_t old = values[presents % ahead];

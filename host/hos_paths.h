@@ -49,6 +49,7 @@ static inline DWORD hos_game_path_w(wchar_t *buf, DWORD size) {
     return (DWORD)wcslen(buf);
 }
 #else
+#include <windows.h>   /* (linux: host/posix's, for DWORD and GetModuleFileNameA) */
 /* (Linux: the game and its files share one folder, as before) */
 static inline DWORD hos_game_path_a(char *buf, DWORD size) { return GetModuleFileNameA(NULL, buf, size); }
 #endif

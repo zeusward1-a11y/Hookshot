@@ -172,6 +172,9 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 bool memory_rb_refresh(VkCommandBuffer up);
+/// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
+uint64_t vk_timeline_completed();
+void vk_timeline_wait(uint64_t v);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);

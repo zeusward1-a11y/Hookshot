@@ -68,6 +68,15 @@ public partial class MainWindow : Window
 
     async void Start()
     {
+        // (development) HOOKSHOT_TEST_SHORTCUTS=<game folder>: both shortcuts made for it, the result in the log beside the app, and out
+        if (Environment.GetEnvironmentVariable("HOOKSHOT_TEST_SHORTCUTS") is { Length: > 0 } testFolder)
+        {
+            Finder.Shortcuts(testFolder, true, true);
+            File.WriteAllText(System.IO.Path.Combine(AppContext.BaseDirectory, "shortcut-test.txt"),
+                              $"desktop {File.Exists(Finder.DesktopLink)} start {File.Exists(Finder.StartLink)} error {Finder.ShortcutError}");
+            Application.Current.Shutdown();
+            return;
+        }
         Animate();
         var started = Stopwatch.StartNew();
         if (Environment.GetCommandLineArgs().Contains("--update"))
@@ -97,7 +106,7 @@ public partial class MainWindow : Window
         ShowMain();
         if (Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") is { Length: > 0 } preview) { Preview(preview); return; }
         CheckAll();
-        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? fake : await Updater.LatestTag();
+        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag();
         RefreshMode();
     }
 
@@ -106,7 +115,7 @@ public partial class MainWindow : Window
 
     enum Mode { Build, UpdateGame, UpToDate, UpdateBuilder }
     Mode mode = Mode.Build;
-    string? latestTag;
+    string? latestTag, updateTarget;
     bool sourcePicked;   // (the player chose game files here: a build from them, even over a game that is up to date)
 
     /// The release a game folder was built with (its hookshot_version.txt), when it keeps its game files for updates
@@ -128,21 +137,25 @@ public partial class MainWindow : Window
         if (BuildButton == null || updating || runner != null) return;
         var game = OutPath.Text.Length > 2 ? GameVersion(OutPath.Text) : null;
         var builder = Tools.Find()?.Version;
-        if (game != null && latestTag != null && game != latestTag && !sourcePicked) mode = Mode.UpdateGame;
-        else if (game != null && (latestTag == null || game == latestTag) && !sourcePicked) mode = Mode.UpToDate;
+        // (the newest release known: GitHub's, else this builder's own. v2.0.0 took a GitHub that did not answer for "up to date")
+        updateTarget = latestTag ?? builder;
+        if (game != null && updateTarget != null && game != updateTarget && !sourcePicked) mode = Mode.UpdateGame;
+        else if (game != null && !sourcePicked) mode = Mode.UpToDate;
         else if (latestTag != null && builder != null && builder != latestTag) mode = Mode.UpdateBuilder;
         else mode = Mode.Build;
         switch (mode)
         {
             case Mode.UpdateGame:
                 FilesTitle.Text = "Update available";
-                FilesSub.Text = $"Hookshot {latestTag} is available. Your game is {game}: Update builds it again from the game files kept in " +
+                FilesSub.Text = $"Hookshot {updateTarget} is available. Your game is {game}: Update builds it again from the game files kept in " +
                                 "its folder, compiling only what changed.";
                 BuildButton.Content = "Update";
                 break;
             case Mode.UpToDate:
                 FilesTitle.Text = "Your game is up to date";
-                FilesSub.Text = $"{game} is the latest version. Pick game files below only to build it again from scratch.";
+                FilesSub.Text = latestTag == null
+                    ? $"Your game is {game}, as this builder. GitHub did not answer, so newer versions could not be checked."
+                    : $"{game} is the latest version. Pick game files below only to build it again from scratch.";
                 BuildButton.Content = "Play";
                 break;
             case Mode.UpdateBuilder:
@@ -179,18 +192,19 @@ public partial class MainWindow : Window
         LaunchVersion.Text = (game != null ? $"Hookshot {game}" : "Hookshot") + " · " + folder;
         LaunchPlay.IsEnabled = File.Exists(GameExe(folder));
         ShowPage(LaunchPage);
-        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? fake : await Updater.LatestTag();
-        if (latestTag == null) LaunchStatus.Text = "Could not check for updates (GitHub did not answer)";
-        else if (game != null && game != latestTag && GameVersion(folder) != null)
+        latestTag = Environment.GetEnvironmentVariable("HOOKSHOT_LATEST_TAG") is { Length: > 0 } fake ? (fake == "none" ? null : fake) : await Updater.LatestTag();
+        updateTarget = latestTag ?? Tools.Find()?.Version;   // (GitHub's newest, else this builder's own)
+        if (updateTarget == null) LaunchStatus.Text = "Could not check for updates (GitHub did not answer)";
+        else if (game != null && game != updateTarget && GameVersion(folder) != null)
         {
-            LaunchStatus.Text = $"Update available: {latestTag}";
+            LaunchStatus.Text = $"Update available: {updateTarget}";
             LaunchStatus.Foreground = new SolidColorBrush(Color.FromRgb(0xB9, 0xC8, 0xFF));
             LaunchStatus.FontWeight = FontWeights.SemiBold;
             LaunchUpdate.Visibility = Visibility.Visible;
         }
-        else if (game != null && game != latestTag)
-            LaunchStatus.Text = $"{latestTag} is out: build this folder again with the Hookshot Builder to get it";
-        else LaunchStatus.Text = "Up to date";
+        else if (game != null && game != updateTarget)
+            LaunchStatus.Text = $"{updateTarget} is out: build this folder again with the Hookshot Builder to get it";
+        else LaunchStatus.Text = latestTag == null ? "Up to date with this builder (GitHub did not answer)" : "Up to date";
     }
 
     /// (a folder built before it kept its game files has a version too: only shown)
@@ -220,7 +234,7 @@ public partial class MainWindow : Window
         Process.Start(si);
     }
 
-    void LaunchUpdateClick(object sender, RoutedEventArgs e) => Updater.UpdateFolder(this, launchFolder, latestTag, fetched: false);
+    void LaunchUpdateClick(object sender, RoutedEventArgs e) => Updater.UpdateFolder(this, launchFolder, updateTarget, fetched: false);
 
     void LaunchPlayClick(object sender, RoutedEventArgs e)
     {
@@ -588,7 +602,7 @@ public partial class MainWindow : Window
         {
             case Mode.UpdateGame:   // (the kept game files; the newer builder first when this one is older)
                 SaveSettings();
-                Updater.UpdateFolder(this, OutPath.Text, latestTag, fetched: false);
+                Updater.UpdateFolder(this, OutPath.Text, updateTarget, fetched: false);
                 return;
             case Mode.UpToDate:
                 finished = OutPath.Text;
@@ -806,7 +820,12 @@ public partial class MainWindow : Window
         if (!updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
             Finder.Shortcuts(finished, DesktopTick.IsChecked == true, StartTick.IsChecked == true);
         else if (updating && Environment.GetEnvironmentVariable("HOOKSHOT_UI_PREVIEW") == null)
-            Finder.RefreshShortcuts(finished);   // (the ones the player has, onto the folder's launcher; none made)
+        {   // (the ones the player has, onto the folder's launcher; the boxes say which there are, and ticking one makes it)
+            DesktopTick.IsChecked = File.Exists(Finder.DesktopLink);
+            StartTick.IsChecked = File.Exists(Finder.StartLink);
+            Finder.RefreshShortcuts(finished);
+        }
+        if (Finder.ShortcutError != null) AddLog("shortcut not made: " + Finder.ShortcutError);
         ShowPage(ReadyPage);
     }
 

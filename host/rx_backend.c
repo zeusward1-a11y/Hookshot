@@ -147,14 +147,24 @@ static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and
 
 /* The game registers its first textures and samplers before the window's thread starts the renderer (NVN is up
    first): those calls are kept here and given to the renderer rx_start chose, in order. Without that the Vulkan back
-   end never knew the first ~0x60 texture slots, and lit geometry sampled them as its black dummy. */
+   end never knew the first ~0x60 texture slots, and lit geometry sampled them as its black dummy.
+   The texels the game writes then (WriteTexels) are kept too, with a copy of their data: without a renderer they went
+   nowhere (Linux has no WebGPU renderer to take them), and a texture filled so at boot kept zeros in its storage. OoT's
+   4x4 white placeholder is one: bound in place of the ground fog's depth, it read 0 and hid the ground fog at some camera
+   angles. That happened when the window's thread started the renderer after the game had begun (windowed, not headless). */
 typedef struct {
-    int kind;   /* 0 texture registration, 1 sampler registration, 2 texture pool size, 3 texture finalized */
+    int kind;   /* 0 texture registration, 1 sampler registration, 2 texture pool size, 3 texture finalized, 4 texture
+                   made, 5 texels written */
     int id;
     nvn_tex t;
     nvn_view v;
     int has_view;
     nvn_samp_par p;
+    /* (5: WriteTexels) */
+    unsigned level, layer0;
+    NVNcopyRegion r;
+    uint64_t row, img;
+    uint8_t *data;
 } early_call;
 static early_call *early;
 static size_t n_early, cap_early;
@@ -181,8 +191,14 @@ static int keep_early(const early_call *c) {
 /* rx_start: the kept calls given to the renderer chosen, then the gate opened */
 static void flush_early(void) {
     AcquireSRWLockExclusive(&early_lock);
-    for (size_t i = 0; i < n_early; i++) forward(&early[i]);
-    if (n_early) hos_log("rx: %zu texture and sampler calls made before the renderer started, given to it", n_early);
+    size_t texels = 0;
+    for (size_t i = 0; i < n_early; i++) {
+        forward(&early[i]);
+        if (early[i].kind == 5) texels++, free(early[i].data);
+    }
+    if (n_early)
+        hos_log("rx: %zu texture and sampler calls made before the renderer started (%zu texel writes), given to it", n_early,
+                texels);
     free(early);
     early = NULL, n_early = cap_early = 0;
     InterlockedExchange(&started, 1);
@@ -267,6 +283,10 @@ static void forward(const early_call *c) {
     case 2: vk ? vk->nvn_set_texture_pool_size(c->id) : wgr_nvn_set_texture_pool_size(c->id); break;
     case 3: vk ? vk->nvn_texture_released(&c->t) : wgr_nvn_texture_released(&c->t); break;
     case 4: if (vk && vk->nvn_texture_created) vk->nvn_texture_created(&c->t); break;
+    case 5:
+        vk ? vk->nvn_write_texels(&c->t, c->level, c->layer0, &c->r, c->data, c->row, c->img)
+           : wgr_nvn_write_texels(&c->t, c->level, c->layer0, &c->r, c->data, c->row, c->img);
+        break;
     }
 }
 void rx_nvn_register_texture(int id, const nvn_tex *t, const nvn_view *v) {
@@ -316,6 +336,24 @@ void rx_nvn_read_texels(const nvn_tex *t, unsigned level, unsigned layer0, const
 }
 void rx_nvn_write_texels(const nvn_tex *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src,
                          size_t row, size_t img) {
+    if (!started && t && r && src) {   /* (kept with a copy of the data: the caller's buffer is its own again on return) */
+        int bw = 1, bh = 1;
+        const int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+        if (bpb > 0 && bw > 0 && bh > 0 && r->width > 0 && r->height > 0) {
+            const uint64_t wb = (uint64_t)((r->width + bw - 1) / bw) * (uint64_t)bpb, hb = (uint64_t)((r->height + bh - 1) / bh);
+            const uint64_t depth = r->depth > 0 ? (uint64_t)r->depth : 1;
+            /* (the bytes the copy reads: the last row of the last slice ends the data, whatever the strides) */
+            const uint64_t n = (depth - 1) * img + (hb - 1) * row + wb;
+            early_call c = {5, 0};
+            c.t = *t, c.level = level, c.layer0 = layer0, c.r = *r, c.row = row, c.img = img;
+            c.data = (uint8_t *)malloc(n);
+            if (c.data) {
+                memcpy(c.data, src, n);
+                if (keep_early(&c)) return;
+                free(c.data);
+            }
+        }
+    }
     vk ? vk->nvn_write_texels(t, level, layer0, r, src, row, img)
        : wgr_nvn_write_texels(t, level, layer0, r, src, row, img);
 }

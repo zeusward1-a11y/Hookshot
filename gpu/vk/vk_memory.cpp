@@ -1105,6 +1105,26 @@ std::unique_ptr<Capture> capture_make() {
     const int64_t n = mirrored.empty() || !host->collect_written_in ? 0
                     : host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(mirrored.data()), (int)mirrored.size(), &pages);
     const auto t_scan = std::chrono::steady_clock::now();
+    // (hookshot) A page the CPU wrote that a submission still on the GPU writes back: the copy waits for that write-back.
+    // OoT's exposure meter page is written by both: the GPU adds the frame's light into it and the CPU sets the sums back to
+    // 0 and fills in the rest. The CPU runs a frame ahead, and a copy taken before the write-back had landed had the GPU's
+    // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
+    // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
+    // last submission writing them back: not every frame's present. RX_VK_CAPTURE_WAIT=0: off
+    if (n > 0) {
+        static const bool cap_wait = !getenv("RX_VK_CAPTURE_WAIT") || atoi(getenv("RX_VK_CAPTURE_WAIT")) != 0;
+        uint64_t v = 0;
+        if (cap_wait) {
+            const uint64_t done = vk_timeline_completed();
+            std::lock_guard lk(wb_pages_mu);
+            if (!wb_pages.empty())
+                for (int64_t i = 0; i < n; i++) {
+                    auto it = wb_pages.find(pages[i]);
+                    if (it != wb_pages.end() && it->second > done) v = std::max(v, it->second);
+                }
+        }
+        if (v) vk_timeline_wait(v);
+    }
     if (n > 0) {
         c->pages.assign(pages, pages + n);
         if ((uint64_t)n * 4096 <= (256ull << 20) &&   // (a load writes more: those are read later, as before)

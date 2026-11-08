@@ -142,7 +142,7 @@ id (`hos_game_is_mkw`); OoT gets its own once its pacer is found, never by addre
 - **Whole functions** (`nx2/test_leaf.py`, `--calls` for call trees): random functions of every module on the real
   relocated image, natively and in Unicorn, on the 64-bit window with polls firing; registers, V registers and
   every changed page compared.
-- **The production build** (`nx2/test_dll.py`, when an `hookshot_game.dll` is built).
+- **The production build** (`nx2/test_dll.py`, when a `hookshot_game.dll` is built).
 - **In the game**: `scripts/run-vk.ps1` screenshots, the flash detector, frame dumps (`RX_VK_DUMP*`), the sampled
   profiler (`HOS_SAMPLE` + `scripts/prof.py`), and Eglantine as the A/B reference for what a frame should look like.
 

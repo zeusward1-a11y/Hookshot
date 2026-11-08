@@ -29,8 +29,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 PY = [sys.executable, "-I", "-u", "-X", "utf8"]   # (utf8: every step's output in UTF-8 whatever the console's code page: lift.py crashed on a letter, #180)   # (-u: the steps' output as it comes, not in 8 KB blocks minutes apart)
 BUILD_ID = "e0f3ccfa"   # (the version the patches, the hot list and the profile were made from)
-LINUX = os.name != "nt"
-BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "SDL3.dll", "wgpu_native.dll"]
+sys.path[:0] = [HERE, os.path.join(ROOT, "third_party", "a64-kit", "tools")]   # (python -I leaves the script folder off)
+import toolchain as _toolchain
+# (hookshot) RX_TARGET=windows on Linux: the Windows game, with llvm-mingw's Linux release (HOOKSHOT_MINGW, or llvm-mingw
+# beside the builder), to run under Proton or copy to a Windows PC
+LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt"
+BESIDE = ["hookshot", "hookshot_vk.so", "libSDL2-2.0.so.0"] if LINUX else ["hookshot.exe", "hookshot_vk.dll", "SDL2.dll", "wgpu_native.dll"]
 LANGUAGES = [("en-US", "English (US)"), ("en-GB", "English (UK)"), ("fr", "French (France)"), ("fr-CA", "French (Canada)"), ("de", "German"),
              ("it", "Italian"), ("es", "Spanish (Spain)"), ("es-419", "Spanish (Latin America)"), ("pt-BR", "Portuguese (Brazil)"), ("nl", "Dutch"),
              ("pl", "Polish"), ("ru", "Russian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh-Hans", "Chinese (Simplified)"),
@@ -340,7 +344,7 @@ def bundled_mingw():
         return os.environ.get("HOOKSHOT_MINGW", "")
     if not os.environ.get("HOOKSHOT_MINGW"):
         here = os.path.join(ROOT, "llvm-mingw")
-        if os.path.isfile(os.path.join(here, "bin", "clang.exe")):
+        if os.path.isfile(os.path.join(here, "bin", "clang" + (".exe" if os.name == "nt" else ""))):
             os.environ["HOOKSHOT_MINGW"] = here
         elif os.path.isdir(here):
             # (the folder is there and its compiler is not: an antivirus took it (false positives on unsigned tools), or the
@@ -378,6 +382,9 @@ def check_windows_sdk():
         return check_linux_compiler()
     if bundled_mingw():
         return check_mingw()
+    if CROSS:
+        fail("Building for Windows on Linux needs llvm-mingw: unpack its Linux release (github.com/mstorsjo/llvm-mingw) and set "
+             "HOOKSHOT_MINGW to its folder.")
     sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
     import toolchain
     # (an INCLUDE set for the whole machine, by an old Visual Studio or another tool, is all clang reads: without the Windows SDK's C
@@ -615,8 +622,9 @@ def main():
     p.add_argument("--romfs")
     p.add_argument("--exefs")
     p.add_argument("--out")
-    p.add_argument("--work", default=os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "hookshot-builder")
-                   if LINUX else os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
+    p.add_argument("--work", default=os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                                                  "hookshot-builder-windows" if CROSS else "hookshot-builder")   # (the objects apart)
+                   if os.name != "nt" else os.path.join(os.environ.get("LOCALAPPDATA", ROOT), "HookshotBuilder"))
     # (HOOKSHOT_JOBS: fewer compilers on a PC short of memory; the AppImage's builds pass no --jobs)
     p.add_argument("--jobs", type=int, default=int(os.environ.get("HOOKSHOT_JOBS") or 0) or default_jobs())
     p.add_argument("--language", default="en-US", help="the game's language: a code from LANGUAGES, written to language.txt")
@@ -764,11 +772,16 @@ def main():
     # launcher for this folder (Play, and Update left of it when a newer release is out: builder/setup/setup.c launch mode), or starts
     # the game when no builder is installed. The game and its DLLs are in bin\; its files (image.bin, romfs, saves, settings, caches)
     # stay in the folder (host/hos_paths.h). Without the setup (a development build) the game stays hookshot.exe in the folder
+    staged = []
     launcher = os.path.join(os.path.dirname(os.path.abspath(ROOT)), "HookshotBuilder-Setup.exe")
     launcher = launcher if not LINUX and os.path.isfile(launcher) else None
     game_dir = os.path.join(out, "bin") if launcher else out
     os.makedirs(game_dir, exist_ok=True)
-    staged = [(os.path.join(built, n), os.path.join(game_dir, n)) for n in BESIDE if os.path.exists(os.path.join(built, n))]
+    ffmpeg_dlls = [] if LINUX else sorted(f for f in os.listdir(built) if f.endswith(".dll") and f.startswith(("av", "sw")))
+    for n in BESIDE + ffmpeg_dlls:
+        src = os.path.join(built, n)
+        if os.path.exists(src):
+            staged.append((src, os.path.join(game_dir, n)))
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
     if launcher:
         staged.append((launcher, os.path.join(out, "hookshot.exe")))
@@ -788,7 +801,8 @@ def main():
             fail("Could not replace %s. Close any running copy of Hookshot and check that the file and folder are writable, then retry. "
                  "Staged replacements remain beside the installed files; the compiled source remains at %s." % (dst, src))
     if launcher:   # (a folder built before the launcher: its game's DLLs and map left the folder for bin\; hookshot.exe is the launcher now)
-        for n in BESIDE[1:] + ["hookshot.map", "hookshot-game.exe"]:
+        stale = sorted(f for f in os.listdir(out) if f.endswith(".dll") and f.startswith(("av", "sw")))
+        for n in BESIDE[1:] + stale + ["hookshot.map", "hookshot-game.exe"]:
             try:
                 if os.path.isfile(os.path.join(out, n)):
                     os.remove(os.path.join(out, n))
