@@ -823,6 +823,9 @@ uint64_t disk_stamp() {
     add(&translator, sizeof translator);
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
+    // (and a GPU's mesh shaders: a file of native task and mesh programs is no use to the compute fallback, nor its to one)
+    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u);
+    add(&mesh, sizeof mesh);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
     const uint32_t abi[] = {(uint32_t)sizeof(Shader::Info), (uint32_t)sizeof(Program), (uint32_t)sizeof(std::vector<uint32_t>),
@@ -1001,10 +1004,16 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0)));
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0) |
+                      (p.fallback_task ? 8 : 0)));
     put_list(o, p.answers);
     put(o, p.workgroup);
     put(o, p.shared_memory);
+    put(o, (uint32_t)p.fallback_topology);
+    put(o, p.fallback_vertices_per_workgroup);
+    put(o, p.fallback_record_words);
+    put(o, p.fallback_payload_words);
+    put(o, p.fallback_task_threads);
     put(o, (uint64_t)p.stages.size());
     for (size_t k = 0; k < p.stages.size(); k++) {
         const Stage& st = p.stages[k];
@@ -1022,7 +1031,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     fwrite(o.data(), 1, o.size(), disk_out);
     fflush(disk_out);
     // (the precompile's: nothing holds them but the file, and the game starts on them at once)
-    if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0))});
+    if (disk_listing) disk_records[p.key].push_back({at + 16, o.size(), (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0))});
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
@@ -1048,11 +1057,17 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         auto p = std::make_unique<Program>();
         p->key = key;
         const uint32_t kind = r.get<uint32_t>();
-        p->compute = (kind & 1) != 0, p->mesh = (kind & 2) != 0;
+        p->compute = (kind & 1) != 0, p->mesh = (kind & 2) != 0, p->fallback = (kind & 4) != 0,
+        p->fallback_task = (kind & 8) != 0;
         r.list(p->answers);
         p->variant = answers_hash(*p);
         p->workgroup = r.get<std::array<uint32_t, 3>>();
         p->shared_memory = r.get<uint32_t>();
+        p->fallback_topology = (VkPrimitiveTopology)r.get<uint32_t>();
+        p->fallback_vertices_per_workgroup = r.get<uint32_t>();
+        p->fallback_record_words = r.get<uint32_t>();
+        p->fallback_payload_words = r.get<uint32_t>();
+        p->fallback_task_threads = r.get<uint32_t>();
         const uint64_t n = r.count(1);
         bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
         for (uint64_t k = 0; ok && k < n; k++) {
@@ -1303,6 +1318,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         Shader::Backend::Bindings bindings{};
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache: mesh programs were never kept,
                                                    // so each was translated and its pipeline built in the middle of play, every run)
+        const bool fallback{dev.mesh_fallback};   // (no mesh shaders: compute stages and a generated vertex stage)
         std::unique_ptr<Translation> task_t;
         const std::array<u32, 3> mesh_regs = mesh_registers_of(task, mesh);
         if (task) {
@@ -1312,13 +1328,15 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             dump_ir(p, "task", task_t->program, task->key);
             Shader::RuntimeInfo rt{};
             rt.previous_stage_stores.mask.set();
+            rt.mesh_fallback = fallback;
+            rt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
             const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), rt, task_t->program, bindings);
             kept.push_back(spirv);
             Stage st;
             st.nvn_stage = bank_stage(*task);
             st.info = task_t->program.info;
             st.module = make_module(spirv);
-            st.vk_stage = VK_SHADER_STAGE_TASK_BIT_EXT;
+            st.vk_stage = fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_TASK_BIT_EXT;
             st.c1 = task->c1;
             p.stages.push_back(std::move(st));
         }
@@ -1344,15 +1362,60 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         if (task_t) mrt.previous_stage_stores = task_t->program.info.stores;
         else mrt.previous_stage_stores.mask.set();
         mrt.convert_depth_mode = host->depth_minus_w() != 0;
+        mrt.mesh_fallback = fallback;
+        mrt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+        mrt.mesh_fallback_task = task_t != nullptr;
         const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), mrt, mesh_t->program, bindings);
         kept.push_back(mspirv);
         Stage ms;
         ms.nvn_stage = bank_stage(mesh);
         ms.info = mesh_t->program.info;
         ms.module = make_module(mspirv);
-        ms.vk_stage = VK_SHADER_STAGE_MESH_BIT_EXT;
+        ms.vk_stage = fallback ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
         ms.c1 = mesh.c1;
         p.stages.push_back(std::move(ms));
+        if (fallback) {   // (the ordinary vertex stage that reads the mesh epilogue's records)
+            const Shader::MeshInfo& mi = mesh_t->program.mesh;
+            Shader::RuntimeInfo vrt{};
+            vrt.mesh_fallback = true;
+            vrt.mesh_fallback_vertex = true;
+            vrt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+            vrt.convert_depth_mode = host->depth_minus_w() != 0;
+            const Shader::Stage saved_stage{mesh_t->program.stage};
+            // (the generated vertex stage has no descriptors of its own: its inputs are the records. Only the stores
+            // (the outputs) are kept from the mesh program's info.)
+            Shader::Info saved_info{std::move(mesh_t->program.info)};
+            mesh_t->program.info = Shader::Info{};
+            mesh_t->program.info.stores = saved_info.stores;
+            mesh_t->program.stage = Shader::Stage::VertexB;
+            for (const u32 line : mi.primitive_lines) {
+                const auto attribute = static_cast<Shader::IR::Attribute>(line);
+                if (Shader::IR::IsGeneric(attribute))
+                    vrt.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            }
+            const std::vector<uint32_t> vspirv =
+                Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, mesh_t->program, bindings);
+            mesh_t->program.info = std::move(saved_info);
+            mesh_t->program.stage = saved_stage;
+            kept.push_back(vspirv);
+            Stage v;
+            v.nvn_stage = 0;
+            v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
+            v.module = make_module(vspirv);
+            v.c1 = mesh.c1;
+            p.stages.push_back(std::move(v));
+            const u32 topo{mesh.topology == 3 ? 4u : mesh.topology == 1 ? 0u : mesh.topology};
+            p.fallback = true;
+            p.fallback_task = task_t != nullptr;
+            p.fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 1;
+            p.fallback_topology = topo == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                                 : topo == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                                             : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            p.fallback_vertices_per_workgroup = mi.max_primitives * mi.Corners();
+            p.fallback_record_words = 1 + static_cast<u32>(mi.vertex_lines.size()) +
+                                      static_cast<u32>(mi.primitive_lines.size());
+            p.fallback_payload_words = mi.payload_words;
+        }
         if (fsc) {
             Env fenv{s, *fsc, Shader::Stage::Fragment};
             auto fs = translate(fenv, true);
@@ -1362,8 +1425,12 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             frt.previous_stage_stores = mesh_t->program.info.stores;
             for (const u32 line : mesh_t->program.mesh.primitive_lines) {
                 const auto attribute = static_cast<Shader::IR::Attribute>(line);
-                if (Shader::IR::IsGeneric(attribute))
-                    frt.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+                if (!Shader::IR::IsGeneric(attribute)) continue;
+                const u32 index = Shader::IR::GenericAttributeIndex(attribute);
+                if (fallback)   // (a vertex pipeline has no PerPrimitiveEXT: Flat the same values, as the generated stage writes them)
+                    fs->program.info.interpolation[index] = Shader::Interpolation::Flat;
+                else
+                    frt.per_primitive_generics.set(index);
             }
             // (points: a generic the fragment program reads and the mesh program never writes is the point sprite's coordinate,
             // as the hardware replaces it. OoT's grass shadow reads its alpha mask at generic 5's (s, t): left at (0, 0, 0, 1),
@@ -1411,7 +1478,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
 /// An NVN2 mesh program: the stages that write the internal stage buffer are its task (attribute writes only, when
 /// there are two) and mesh programs; a header-only stage, its per-primitive outputs (shader_lock held)
 const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[8]) {
-    if (!dev.mesh_shader) return nullptr;
+    if (!dev.mesh_shader && !dev.mesh_fallback) return nullptr;
     const std::vector<Code>& cs = codes_of(s);
     const Code *fsc = nullptr, *prim = nullptr, *task = nullptr, *mesh = nullptr;
     for (const Code& c : cs) {
@@ -1427,6 +1494,7 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     auto& variants = programs[key];
     program_cache_load(key, variants);
     for (auto& p : variants) {
+        if (p->mesh != dev.mesh_shader || p->fallback != dev.mesh_fallback) continue;   // (another GPU's: native or fallback)
         if (!p->ready.load(std::memory_order_acquire)) return p.get();
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
@@ -1434,7 +1502,8 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     miss_note(key, "mesh", mesh->key, fsc ? fsc->key : 0, s, color_types, variants.size());
     auto p = std::make_unique<Program>();
     p->key = key;
-    p->mesh = true;
+    p->mesh = dev.mesh_shader;   // (not a native mesh program: a fallback one is an ordinary graphics pipeline)
+    p->fallback = !dev.mesh_shader;   // (the GPU has no mesh shaders: its stages are compute and vertex)
     Program* raw = p.get();
     variants.push_back(std::move(p));
     struct Job {

@@ -520,6 +520,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     u32& texture_binding{is_unified ? bindings.unified : bindings.texture};
     u32& image_binding{is_unified ? bindings.unified : bindings.image};
     AddCapability(spv::Capability::Shader);
+    if (runtime_info.mesh_fallback || runtime_info.mesh_fallback_vertex) {
+        wants_mesh_fallback = true;   // (before any DefineRescalingInputPushConstant, which is made once)
+    }
     DefineCommonTypes(program.info);
     DefineCommonConstants();
     DefineInterfaces(program);
@@ -542,6 +545,32 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
         MemberDecorate(block, 0, spv::Decoration::Offset, 0U);
         mesh_first_block_pointer = TypePointer(spv::StorageClass::PhysicalStorageBuffer, block);
         mesh_first_member_pointer = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1]);
+        DefineRescalingInputPushConstant();
+    }
+    if (runtime_info.mesh_fallback && (stage == Stage::Task || stage == Stage::Mesh)) {
+        mesh_fallback = true;
+        wants_mesh_fallback = true;
+        // (the push block is made below, before DefineGlobalMemoryFunctions can ask for the page table: a fallback stage
+        // that follows pointers needs its member now, or the block would be made without it)
+        wants_guest_pages = program.info.uses_global_memory && profile.support_int64;
+        if (!Sirit::ValidId(U64)) {
+            AddCapability(spv::Capability::Int64);
+            U64 = Name(TypeInt(64, false), "u64");
+        }
+        AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+        AddExtension("SPV_KHR_physical_storage_buffer");
+        SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+        DefineRescalingInputPushConstant();
+    }
+    if (runtime_info.mesh_fallback_vertex) {   // (the generated vertex stage: pushes the records' address)
+        AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+        AddExtension("SPV_KHR_physical_storage_buffer");
+        SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+        if (!Sirit::ValidId(U64)) {
+            AddCapability(spv::Capability::Int64);
+            U64 = Name(TypeInt(64, false), "u64");
+        }
+        mesh_info = program.mesh;
         DefineRescalingInputPushConstant();
     }
     DefineMesh(program);
@@ -1521,7 +1550,10 @@ void EmitContext::DefineRescalingInput(const Info& info) {
 }
 
 void EmitContext::DefineRescalingInputPushConstant() {
-    boost::container::static_vector<Id, 5> members{};
+    if (Sirit::ValidId(rescaling_push_constants)) {
+        return;   // (the page table's call and the fallback's: one block)
+    }
+    boost::container::static_vector<Id, 12> members{};
     u32 member_index{0};
 
     rescaling_textures_type = TypeArray(U32[1], Const(4u));
@@ -1545,6 +1577,12 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (wants_mesh_first) {
         members.push_back(U64);
         mesh_first_member_index = member_index++;
+    }
+    if (wants_mesh_fallback) {
+        members.push_back(U64);
+        mesh_fallback_payload_member_index = member_index++;
+        members.push_back(U64);
+        mesh_fallback_records_member_index = member_index++;
     }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
@@ -1572,6 +1610,17 @@ void EmitContext::DefineRescalingInputPushConstant() {
         MemberDecorate(push_constant_struct, mesh_first_member_index, spv::Decoration::Offset, MESH_FIRST_PUSH_OFFSET);
         MemberName(push_constant_struct, mesh_first_member_index, "mesh_first");
     }
+    if (wants_mesh_fallback) {
+        const std::array<std::pair<u32, u32>, 2> fallback_members{{
+            {mesh_fallback_payload_member_index, MESH_FALLBACK_PAYLOAD_PUSH_OFFSET},
+            {mesh_fallback_records_member_index, MESH_FALLBACK_RECORDS_PUSH_OFFSET},
+        }};
+        for (const auto& [member, offset] : fallback_members) {
+            MemberDecorate(push_constant_struct, member, spv::Decoration::Offset, offset);
+        }
+        MemberName(push_constant_struct, mesh_fallback_payload_member_index, "mesh_fallback_payload");
+        MemberName(push_constant_struct, mesh_fallback_records_member_index, "mesh_fallback_records");
+    }
     const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
     rescaling_push_constants = AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
     Name(rescaling_push_constants, "rescaling_push_constants");
@@ -1579,6 +1628,17 @@ void EmitContext::DefineRescalingInputPushConstant() {
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(rescaling_push_constants);
     }
+}
+
+Id EmitContext::MeshFallbackWord(Id address) {
+    if (!Sirit::ValidId(mesh_fallback_word_ptr)) {
+        const Id block{TypeStruct(U32[1])};
+        Decorate(block, spv::Decoration::Block);
+        MemberDecorate(block, 0, spv::Decoration::Offset, 0U);
+        mesh_fallback_word_ptr = TypePointer(spv::StorageClass::PhysicalStorageBuffer, block);
+    }
+    const Id pointer_type{TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[1])};
+    return OpAccessChain(pointer_type, OpConvertUToPtr(mesh_fallback_word_ptr, address), Const(0U));
 }
 
 void EmitContext::DefineRescalingInputUniformConstant() {
@@ -2117,6 +2177,9 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             }
         }
     }
+    if (runtime_info.mesh_fallback_vertex) {
+        vertex_index = DefineInput(*this, U32[1], true, spv::BuiltIn::VertexIndex);
+    }
     if (stage == Stage::TessellationEval) {
         for (size_t index = 0; index < info.uses_patches.size(); ++index) {
             if (!info.uses_patches[index]) {
@@ -2134,18 +2197,36 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     if (stage != Stage::Task && stage != Stage::Mesh) {
         return;
     }
-    AddExtension("SPV_EXT_mesh_shader");
-    AddCapability(spv::Capability::MeshShadingEXT);
+    mesh_fallback = runtime_info.mesh_fallback;
+    if (!mesh_fallback) {
+        AddExtension("SPV_EXT_mesh_shader");
+        AddCapability(spv::Capability::MeshShadingEXT);
+    }
     mesh_info = program.mesh;
     mesh_threads = program.workgroup_size[0];
     // The task's output region, which its mesh workgroups read as their input region.
     const Id payload_type{TypeArray(U32[1], Const(mesh_info.payload_words))};
-    mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
-                                  spv::StorageClass::TaskPayloadWorkgroupEXT);
-    Name(mesh_payload, "task_payload");
-    mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
-    if (stage == Stage::Task) {
-        return;
+    if (mesh_fallback) {
+        // Workgroup memory still holds the stage buffer while the program runs; the epilogue copies it out. The map
+        // and record buffers live in the pushed fallback buffers, one slot a workgroup. A mesh program with no task
+        // reads the workgroup index from its own payload, as NVN's hardware provides it.
+        const Id wg_pointer{TypePointer(spv::StorageClass::Workgroup, U32[1])};
+        if (stage == Stage::Task || !runtime_info.mesh_fallback_task) {
+            mesh_payload = DefineVariable(*this, payload_type, std::nullopt, spv::StorageClass::Workgroup);
+            Name(mesh_payload, "isbe_payload");
+            mesh_payload_u32 = wg_pointer;
+        }
+        if (stage == Stage::Task) {
+            return;
+        }
+    } else {
+        mesh_payload = DefineVariable(*this, payload_type, std::nullopt,
+                                      spv::StorageClass::TaskPayloadWorkgroupEXT);
+        Name(mesh_payload, "task_payload");
+        mesh_payload_u32 = TypePointer(spv::StorageClass::TaskPayloadWorkgroupEXT, U32[1]);
+        if (stage == Stage::Task) {
+            return;
+        }
     }
     // Output attribute region: groups of 32 vertices, then groups of 32 primitives, one 32-word
     // line per attribute. The map region keeps one map byte per word.
@@ -2166,6 +2247,10 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_primitive_count =
         DefineVariable(*this, U32[1], std::nullopt, spv::StorageClass::Workgroup);
     Name(mesh_primitive_count, "isbe_primitive_count");
+
+    if (mesh_fallback) {
+        return;   // (no mesh outputs here: the epilogue writes records)
+    }
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
