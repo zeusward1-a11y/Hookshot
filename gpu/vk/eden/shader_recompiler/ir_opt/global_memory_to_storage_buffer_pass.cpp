@@ -78,6 +78,16 @@ bool GmLegacy() {
     static const bool on{EnvSwitch("EDEN_NX2_GM_LEGACY", true)};
     return on;
 }
+/// (hookshot) The tracking a stage gets. EDEN_NX2_GM_LEGACY=0/1: the port / the tracking as before, for every stage. Unset: the port
+/// for the geometry and compute stages, the tracking as before for the fragment stage. The port placed the trees and terrain right
+/// (v2.0.3: no floating trees, issue #729) and the dark characters were lighting, which the fragment stage reads (light probes).
+/// EDEN_NX2_GM_SPLIT=0: the tracking as before everywhere (v2.0.4's default)
+bool GmLegacyFor(Stage stage) {
+    static const char* const forced{std::getenv("EDEN_NX2_GM_LEGACY")};
+    if (forced && *forced) return GmLegacy();
+    static const bool split{EnvSwitch("EDEN_NX2_GM_SPLIT", true)};
+    return !split || stage == Stage::Fragment;
+}
 bool GmNative() {
     static const bool on{EnvSwitch("EDEN_NX2_GM_NATIVE", true)};
     return on;
@@ -1641,7 +1651,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // (geometry stages only: with the fragment stage too, the sky drew black rectangles and the lighting went too bright at the castle)
     g_graphics_stage = program.stage != Stage::Compute && program.stage != Stage::Fragment;
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
-    const bool pairing{!GmLegacy()};
+    const bool pairing{!GmLegacyFor(program.stage)};
     std::optional<TrackingConditions> conditions;
     StorageInfo info;
     info.pairing = pairing;
