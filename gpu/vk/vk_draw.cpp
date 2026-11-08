@@ -818,9 +818,13 @@ Targets note_targets(const PipeNote& n) {
     for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
     return at;
 }
-void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]);
+uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo);
+void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo,
+                   const uint8_t* color_types = nullptr) {
     static const bool off = getenv("RX_VK_NO_PROGRAM_CACHE") != nullptr;
     if (off) return;
+    if (color_types) state_record(p, s, at, topo, color_types);
     auto rec = std::make_unique<PipeNote>();
     rec->key = key, rec->prog = p.key, rec->variant = p.variant, rec->topo = (uint32_t)topo, rec->n = (uint32_t)at.n;
     rec->samples = (uint32_t)at.samples, rec->depth_format = (uint32_t)at.depth_format, rec->has_depth = at.depth != nullptr;
@@ -854,6 +858,222 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
         }
     }
     if (note_file && noted.insert(key).second) fwrite(rec.get(), sizeof(PipeNote), 1, note_file), fflush(note_file);
+}
+
+// ---- (hookshot) The pipeline state list: each pipeline the game asks for, by what it is made of and nothing of the game's code
+// (its stages' code keys, the vertex input and colour output types its program was translated for, the draw state baked into it), in
+// hookshot_pipeline_states.bin beside the executable. Unlike hookshot_pipelines.bin it is good for any build of the back end: when
+// the shaders are prepared for a new one (prepare_run), every pipeline in it is noted for the precompile, its program translated
+// first when the seed's are not that one, so that a new release, or a new install with a list from someone else's play
+// (hookshot_pipeline_states_shipped.bin, nx2/make_game.py: work/pipeline_states.bin), builds them before the game and not in
+// play. Only hashes, formats and state: the stages themselves come from the player's own game (hookshot_shaders.bin) ----
+constexpr char kStateMagic[8] = {'H', 'K', 'S', 'T', 'A', 'T', 'E', '1'};
+struct StateRec {
+    uint64_t code[4];        // the stages' code keys: vertex (mesh), fragment, task, the header-only stage (0: none)
+    uint64_t variant;        // the program's (its answers about the textures)
+    uint32_t mesh, topo, n, samples, depth_format, has_depth;
+    uint32_t color_format[8];
+    uint8_t color_types[8];  // (Shader::AttributeType of each target: what the fragment outputs are translated for)
+    uint64_t blend[8];       // (nvn_blend_st)
+    uint32_t vattr[16], nvattr;   // (nvn_va_st: the vertex attributes' formats)
+    uint32_t stride[16], divisor[16];
+    uint32_t blend_en, chmask, poly_mode, depth_clamp, a2c, pad;
+    // the program variant's texture answers: by descriptor (Program::answers: stage << 28 | descriptor << 12 | image << 8 | type), and
+    // as the translation asked them (Program::questions); a variant with more is noted without them, and made in play
+    uint32_t nanswers, nquestions;
+    uint32_t answers[24];
+    uint8_t questions[32];
+};
+static_assert(sizeof(StateRec) == 528 && std::is_trivially_copyable_v<StateRec>, "the state list's record is a file format");
+std::string state_list_path(const char* name) {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
+}
+uint64_t state_hash(const StateRec& r) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    const uint8_t* b = (const uint8_t*)&r;
+    for (size_t i = 0; i < sizeof r; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+/// The records of a state list (none when it is not one)
+std::vector<StateRec> state_list_read(const std::string& path) {
+    std::vector<StateRec> out;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return out;
+    char magic[8];
+    uint32_t size = 0;
+    if (fread(magic, 8, 1, f) == 1 && !memcmp(magic, kStateMagic, 8) && fread(&size, 4, 1, f) == 1 && size == sizeof(StateRec)) {
+        StateRec r;
+        while (fread(&r, sizeof r, 1, f) == 1) out.push_back(r);
+    }
+    fclose(f);
+    return out;
+}
+std::mutex state_mu;
+FILE* state_file = nullptr;
+std::unordered_set<uint64_t> state_seen;
+void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
+    static const bool off = getenv("RX_VK_NO_STATE_LIST") != nullptr;
+    if (off) return;
+    StateRec r{};
+    std::memcpy(r.code, p.codes, sizeof r.code);   // (kept with the program: the stages' lock is not taken on the draw's path)
+    if (!r.code[0] || p.compute) return;
+    r.variant = p.variant;
+    r.mesh = p.mesh ? 1 : 0, r.topo = (uint32_t)topo, r.n = (uint32_t)at.n, r.samples = (uint32_t)at.samples;
+    r.depth_format = (uint32_t)at.depth_format, r.has_depth = at.depth != nullptr;
+    for (int i = 0; i < 8; i++) r.color_format[i] = (uint32_t)at.color_format[i], r.color_types[i] = color_types[i];
+    for (int i = 0; i < 16; i++) r.vattr[i] = s.vattr[i], r.stride[i] = s.vstream[i].stride, r.divisor[i] = s.vstream[i].divisor;
+    r.nvattr = (uint32_t)s.nvattr;
+    for (int i = 0; i < 8; i++) std::memcpy(&r.blend[i], &s.blend[i], 8);
+    r.blend_en = (uint32_t)s.color.blend_en, r.chmask = s.chmask.mask, r.poly_mode = (uint32_t)s.poly.mode;
+    r.depth_clamp = s.depth_clamp ? 1 : 0, r.a2c = s.ms.a2c ? 1 : 0;
+    if (p.answers.size() <= 24 && p.questions.size() <= 32) {
+        r.nanswers = (uint32_t)p.answers.size(), r.nquestions = (uint32_t)p.questions.size();
+        for (size_t i = 0; i < p.answers.size(); i++) {
+            const Program::Answer& a = p.answers[i];
+            r.answers[i] = (uint32_t)(a.stage & 0xF) << 28 | (uint32_t)(a.desc & 0xFFFF) << 12 | (a.image ? 1u : 0u) << 8 | a.type;
+        }
+        std::memcpy(r.questions, p.questions.data(), p.questions.size());
+    }
+    const uint64_t h = state_hash(r);
+    std::lock_guard lk(state_mu);
+    if (!state_file) {
+        const std::string path = state_list_path("hookshot_pipeline_states.bin");
+        const std::vector<StateRec> had = state_list_read(path);
+        for (const StateRec& o : had) state_seen.insert(state_hash(o));
+        FILE* probe = fopen(path.c_str(), "rb");
+        const bool keep = probe && !had.empty();
+        if (probe) fclose(probe);
+        state_file = fopen(path.c_str(), keep ? "ab" : "wb");
+        if (state_file && !keep) {
+            const uint32_t size = sizeof(StateRec);
+            fwrite(kStateMagic, 8, 1, state_file), fwrite(&size, 4, 1, state_file);
+        }
+    }
+    if (state_file && state_seen.insert(h).second) fwrite(&r, sizeof r, 1, state_file), fflush(state_file);
+}
+/// (prepare_run, the seed open) every pipeline of the state lists (the player's own and the shipped one): its program translated
+/// when the program cache lacks it, then noted in hookshot_pipelines.bin for precompile_run to build. RX_VK_NO_STATE_LIST=1: off
+void state_list_prepare(void (*progress)(size_t done, size_t total)) {
+    if (getenv("RX_VK_NO_STATE_LIST")) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<StateRec> recs = state_list_read(state_list_path("hookshot_pipeline_states_shipped.bin"));
+    const size_t shipped = recs.size();
+    for (const StateRec& r : state_list_read(state_list_path("hookshot_pipeline_states.bin"))) recs.push_back(r);
+    if (recs.empty()) return;
+    // the programs: each once (by its stages and the types it was translated for)
+    struct Want { const StateRec* r; uint64_t key = 0; };
+    std::vector<Want> want;
+    std::unordered_map<uint64_t, size_t> by_program;
+    std::vector<size_t> rec_program(recs.size());
+    for (size_t i = 0; i < recs.size(); i++) {
+        const StateRec& r = recs[i];
+        uint64_t h = 0xCBF29CE484222325ull;
+        const auto add = [&h](const void* d, size_t n) {
+            for (size_t k = 0; k < n; k++) h = (h ^ ((const uint8_t*)d)[k]) * 1099511628211ull;
+        };
+        add(r.code, sizeof r.code), add(&r.mesh, 4), add(r.color_types, 8);
+        for (int k = 0; k < 16; k++) {   // (the input types, not the formats: what the program key holds)
+            const uint8_t t = (uint8_t)attribute_type_of(r.vattr[k]);
+            add(&t, 1);
+        }
+        const auto [it, fresh] = by_program.emplace(h, want.size());
+        if (fresh) want.push_back({&r});
+        rec_program[i] = it->second;
+    }
+    std::atomic<size_t> next{0}, made{0}, missing{0};
+    const auto worker = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+            const size_t i = next++;
+            if (i >= want.size()) return;
+            const StateRec& r = *want[i].r;
+            std::unique_ptr<Program> p;
+            // (a mesh program on a GPU without mesh shaders is not made; one with a header-only stage is made in play)
+            if (!r.code[3] && (!r.mesh || dev.mesh_shader)) p = seed_program_of(r.code, r.mesh != 0, r.vattr, r.color_types, &want[i].key);
+            if (!want[i].key) missing++;
+            if (p) {
+                if (!p->failed) made++;
+                for (Stage& st : p->stages)
+                    if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+            }
+            if (progress) progress(i, want.size());
+        }
+    };
+    std::vector<std::thread> threads;
+    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    for (std::thread& t : threads) t.join();
+    // then each pipeline, noted as a draw would note it
+    std::unordered_set<uint64_t> keys;
+    for (const Want& w : want)
+        if (w.key) keys.insert(w.key);
+    // (these keys only: the kept compute programs stay on disk for precompile_run, which builds their pipelines)
+    program_cache_load_some(keys, [](Program& p) { ensure_layout(p); }, false);
+    // the variants made by other textures (the seed's are for nothing bound): translated with the answers the game's gave
+    std::vector<size_t> variant_of;   // (a record of each variant the cache lacks)
+    {
+        std::unordered_set<uint64_t> seen;
+        for (size_t i = 0; i < recs.size(); i++) {
+            const StateRec& r = recs[i];
+            const uint64_t key = want[rec_program[i]].key;
+            if (key && (r.nanswers || r.nquestions) && !program_find(key, r.variant) && seen.insert(mix(key, r.variant)).second)
+                variant_of.push_back(i);
+        }
+    }
+    std::atomic<size_t> variants_made{0};
+    next = 0;
+    const auto variant_worker = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+            const size_t i = next++;
+            if (i >= variant_of.size()) return;
+            const StateRec& r = recs[variant_of[i]];
+            std::vector<uint8_t> questions(r.questions, r.questions + r.nquestions);
+            std::vector<Program::Answer> answers(r.nanswers);
+            for (uint32_t k = 0; k < r.nanswers; k++)
+                answers[k] = {(uint16_t)(r.answers[k] >> 28), (uint16_t)(r.answers[k] >> 12 & 0xFFFF), (uint8_t)(r.answers[k] & 0xFF),
+                              (r.answers[k] >> 8 & 1) != 0};
+            if (const Program* p = seed_variant_of(r.code, r.mesh != 0, r.vattr, r.color_types, questions, answers)) {
+                if (p->variant == r.variant) variants_made++;
+                ensure_layout(const_cast<Program&>(*p));
+            }
+        }
+    };
+    threads.clear();
+    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(variant_worker);
+    for (std::thread& t : threads) t.join();
+    size_t noted_n = 0, no_variant = 0;
+    auto s = std::make_unique<NvnState>();
+    for (size_t i = 0; i < recs.size(); i++) {
+        const StateRec& r = recs[i];
+        const uint64_t key = want[rec_program[i]].key;
+        if (!key) continue;
+        const Program* p = program_find(key, r.variant);
+        if (!p) {
+            no_variant++;
+            continue;
+        }
+        *s = NvnState{};
+        for (int k = 0; k < 16; k++) s->vattr[k] = r.vattr[k], s->vstream[k].stride = r.stride[k], s->vstream[k].divisor = r.divisor[k];
+        s->nvattr = (int)r.nvattr;
+        for (int k = 0; k < 8; k++) std::memcpy(&s->blend[k], &r.blend[k], 8);
+        s->color.blend_en = r.blend_en, s->chmask.mask = r.chmask, s->poly.mode = r.poly_mode;
+        s->depth_clamp = r.depth_clamp != 0, s->ms.a2c = (uint8_t)r.a2c;
+        Targets at{};
+        at.n = (int)r.n, at.samples = (VkSampleCountFlagBits)r.samples, at.depth_format = (VkFormat)r.depth_format;
+        at.depth = r.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
+        for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)r.color_format[k];
+        if (!p->layout) ensure_layout(const_cast<Program&>(*p));
+        pipeline_note(pipeline_key(*p, *s, at, (VkPrimitiveTopology)r.topo), *p, *s, at, (VkPrimitiveTopology)r.topo);
+        noted_n++;
+    }
+    logf("vk: state list: %zu pipelines (%zu shipped), %zu programs (%zu translated now, %zu with stages not in the seed), %zu variants "
+         "by their textures (%zu made), %zu noted, %zu whose program variant was not made, in %.1f s", recs.size(), shipped,
+         want.size(), made.load(), missing.load(), variant_of.size(), variants_made.load(), noted_n, no_variant,
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 // ---- (hookshot) Stage libraries, as TotK Recomp's runtime/vk_pipeline.c: the part of a pipeline that costs is its shaders, and with
@@ -940,7 +1160,36 @@ struct PipeFast {
 };
 thread_local PipeFast pipe_fast[2];
 
-PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+/// A graphics pipeline's key: what is baked into it (the rest is dynamic state)
+uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
+    uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topology_class(topo) << 8 | (uint64_t)at.samples);
+    const Shader::Info& vs = p.stages[0].info;
+    if (!p.mesh) {
+        for (int i = 0; i < 16; i++)
+            if (vs.loads.Generic(i)) key = mix(key, (uint64_t)s.vattr[i] << 8 | (i < s.nvattr));
+        for (int i = 0; i < 16; i++) key = mix(key, (uint64_t)s.vstream[i].divisor);
+    }
+    for (int i = 0; i < at.n; i++) {
+        key = mix(key, (uint64_t)at.color_format[i]);
+        if (!dev.eds3_blend) {
+            uint64_t b;
+            std::memcpy(&b, &s.blend[i], 8);
+            key = mix(key, (s.color.blend_en >> i & 1) ? b : 0);
+        }
+    }
+    key = mix(key, (uint64_t)at.depth_format);
+    if (!dev.eds3_blend) {
+        uint64_t wm = 0;
+        for (int i = 0; i < at.n; i++) wm |= (uint64_t)target_write_mask(p, s, i) << (4 * i);
+        key = mix(key, wm << 8 | s.color.blend_en);
+    }
+    if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
+    if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
+    if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
+    return key;
+}
+
+PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
     // one ran another's shaders under its own descriptors)
@@ -975,30 +1224,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         std::memcpy(f.blend, blend, sizeof blend);
         return e;
     };
-    uint64_t key = mix(mix(p.key, p.variant), (uint64_t)topo_c << 8 | (uint64_t)at.samples);
-    const Shader::Info& vs = p.stages[0].info;
-    if (!p.mesh) {
-        for (int i = 0; i < 16; i++)
-            if (vs.loads.Generic(i)) key = mix(key, (uint64_t)s.vattr[i] << 8 | (i < s.nvattr));
-        for (int i = 0; i < 16; i++) key = mix(key, (uint64_t)s.vstream[i].divisor);
-    }
-    for (int i = 0; i < at.n; i++) {
-        key = mix(key, (uint64_t)at.color_format[i]);
-        if (!dev.eds3_blend) {
-            uint64_t b;
-            std::memcpy(&b, &s.blend[i], 8);
-            key = mix(key, (s.color.blend_en >> i & 1) ? b : 0);
-        }
-    }
-    key = mix(key, (uint64_t)at.depth_format);
-    if (!dev.eds3_blend) {
-        uint64_t wm = 0;
-        for (int i = 0; i < at.n; i++) wm |= (uint64_t)target_write_mask(p, s, i) << (4 * i);
-        key = mix(key, wm << 8 | s.color.blend_en);
-    }
-    if (!dev.eds3_polygon) key = mix(key, (uint64_t)s.poly.mode);
-    if (!dev.eds3_clamp) key = mix(key, (uint64_t)s.depth_clamp);
-    if (!dev.eds3_a2c) key = mix(key, (uint64_t)s.ms.a2c);
+    const uint64_t key = pipeline_key(p, s, at, topo);
     static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(key); m != mine.end()) return FINE_X(FC_PIPE_MAP, 1), remember(m->second);
     ParLock lk;
@@ -1006,7 +1232,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (it != pipelines.end()) return remember(mine[key] = it->second.get());
     pcache_init();
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
-    pipeline_note(key, p, s, at, topo);
+    pipeline_note(key, p, s, at, topo, color_types);
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
         e->pipeline = build_graphics(p, s, at, topo);
@@ -4561,7 +4787,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             ParLock lk;
             ensure_layout(p);
         }
-        pe = graphics_pipeline(p, s, at, topo);
+        pe = graphics_pipeline(p, s, at, topo, types);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
         if (may_skip) return void(st_pending_skips++);
@@ -5523,6 +5749,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
         if (next.load() >= total + threads.size()) break;
     }
     for (std::thread& t : threads) t.join();
+    state_list_prepare(nullptr);
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     int64_t translated = 0, failed = 0;
     shader_stats(&translated, &failed);
