@@ -134,13 +134,14 @@ static uint64_t host_guest_alloc(uint64_t size) {
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size);   /* nvn_native.c */
 static void host_watch_guest_writes(uint64_t guest, uint64_t size) { hos_watch_guest_writes(hos_guest_base() + guest, size); }
 static float host_aspect_ratio(void) { return hos_aspect_ratio; }
+int hos_mouse_pointer(MkwVkPointer *out);   /* display.c, posix/display_sdl.c */
 
 static const MkwVkHost vk_host = {
     MKWVK_API_VERSION, host_log, hos_guest_base, hos_guest_size, hos_gpu_ptr, nvn_gpu_guest, nvn_gpu_read,
     nvn_gpu_write, host_collect, host_free_pages, host_mark_written, hos_ticks, hos_now_ns, nvn_tex_layout,
     nvn_tex_level_offset, nvn_fmt_bpb, nvn_tex_level_tiles, nvn_tex_linear_stride, nvn_depth_minus_w, hos_gpu_pools,
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
-    host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio,
+    host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, hos_mouse_pointer,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
