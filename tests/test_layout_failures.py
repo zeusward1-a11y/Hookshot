@@ -91,6 +91,8 @@ class LayoutFailureTests(unittest.TestCase):
                    '-I' + str(ROOT / 'gpu/vk/eden'), '-I' + str(ROOT / 'gpu/vk'),
                    '-I' + str(ROOT / 'gpu/third_party/suyu'),
                    str(ROOT / 'tests/layout_failures_test.cpp'), '-o', str(cls.executable)]
+        if os.name == 'nt':
+            command += ['-D_CRT_SECURE_NO_WARNINGS']  # Match production's Windows CRT contract for getenv.
         if BASELINE:
             command += ['-DHAVE_ORIGINAL_HELPER']
         options = {'creationflags': subprocess.BELOW_NORMAL_PRIORITY_CLASS} if os.name == 'nt' else {}

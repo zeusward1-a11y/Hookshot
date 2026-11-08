@@ -59,7 +59,7 @@ VkResult vkCreateDescriptorSetLayout(VkDevice device, const VkDescriptorSetLayou
     for (uint32_t i=0; i<ci->bindingCount; ++i) {
         const auto& b=ci->pBindings[i];
         CHECK(!b.pImmutableSamplers);
-        arguments.insert(arguments.end(), {b.binding, b.descriptorType, b.descriptorCount, b.stageFlags});
+        arguments.insert(arguments.end(), {b.binding, static_cast<uint64_t>(b.descriptorType), b.descriptorCount, b.stageFlags});
     }
     if (failure == 1) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *out=handle<VkDescriptorSetLayout>(++next_handle); sets.insert(id(*out));
