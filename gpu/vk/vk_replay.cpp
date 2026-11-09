@@ -1307,7 +1307,7 @@ void submit_segment_recording(Recording& r) {
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     r.submitted = res == VK_SUCCESS;
     if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
-    if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+    if (res == VK_ERROR_DEVICE_LOST) device_lost();
 }
 
 struct Segment {

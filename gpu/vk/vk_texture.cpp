@@ -766,7 +766,9 @@ VkImageView astc_level_view(Texture* tex, uint32_t level, uint32_t layer) {
 // arrays, made again when Link came back from Castle Town (evicted there), were a decode, a resize and an encode of ~570 M
 // texels in one submission: on an RX 7700S (8 GB, Adrenalin 26.10.1) it ran past Windows' 2 seconds three times out of three,
 // the driver was reset and the device lost. Until its last layers are in, a texture shows what its image held for those (a
-// frame or two of a scene change). RX_VK_BC_PART_MTEXELS=<M texels a recording> (16 by default; 0: all at once, as before)
+// frame or two of a scene change). Only AMD by default: on an RTX 3070 the parts made the Hyrule Castle load hitch ~1.2 s
+// longer (2.1 s against 0.9 s) with no reset to avoid. RX_VK_BC_PART_MTEXELS=<M texels a recording> (AMD: 16 by default;
+// other GPUs: 0, all at once, as before)
 struct BcPending {
     Texture* tex;
     uint64_t total;
@@ -775,7 +777,8 @@ struct BcPending {
 std::vector<BcPending> bc_pending;
 thread_local uint64_t bc_part_texels = 0;   // (what this recording's upload holds already)
 uint64_t bc_part_budget() {
-    static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_PART_MTEXELS") ? std::max(0, atoi(getenv("RX_VK_BC_PART_MTEXELS"))) : 16) << 20;
+    static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_PART_MTEXELS") ? std::max(0, atoi(getenv("RX_VK_BC_PART_MTEXELS")))
+                                     : dev.props.vendorID == 0x1002 ? 16 : 0) << 20;
     return v;
 }
 uint64_t astc_layer_size(const Texture& tex, uint64_t total) {

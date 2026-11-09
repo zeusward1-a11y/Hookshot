@@ -14,6 +14,9 @@ def check_source():
                    "void texture_bc_continue()", "bc_part_texels = 0;"):
         if needle not in tex:
             raise SystemExit("vk_texture.cpp no longer has: " + needle)
+    # (the parts are AMD's by default: on NVIDIA they made the Hyrule Castle load hitch longer with no reset to avoid, PR 1130)
+    if ": dev.props.vendorID == 0x1002 ? 16 : 0) << 20;" not in tex:
+        raise SystemExit("vk_texture.cpp: bc_part_budget's default is no longer 16 M texels on AMD and 0 elsewhere")
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
     for needle in ("texture_bc_continue();", "texture_bc_pending()"):
         if needle not in replay:
