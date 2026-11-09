@@ -28,7 +28,9 @@
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 #define PROF(x) ((void)0)
+#define PROF_HOT(x) ((void)0)   // (#989's sampled phase timer)
 namespace mkwvk {
+inline void ub_thread_off() {}   // (#968: background threads leave the replay's uniform update list)
 struct Texture;
 #include "layout_types.inc"
 template<class T> T handle(uintptr_t n) {
