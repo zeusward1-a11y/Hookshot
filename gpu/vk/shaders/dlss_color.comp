@@ -4,7 +4,19 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D guest_color;
 layout(binding = 1, rgba16f) uniform writeonly image2D dlss_color;
-layout(push_constant) uniform P { int encode; } pc;
+layout(push_constant) uniform P { int encode; float sat; float contrast; float density; } pc;
+
+// (hookshot) The grade of the encoded colour (dlss_grade.h has this same arithmetic and says what it is): subtractive saturation,
+// the dye's density (a saturated colour is darker), then contrast about the pivot
+vec3 grade(vec3 c) {
+    c = min(c, vec3(65504.0));
+    const float top = max(c.r, max(c.g, c.b));
+    c = max(top - (top - c) * (1.0 + pc.sat), vec3(0.0));
+    const float low = min(c.r, min(c.g, c.b));
+    const float dark = 1.0 - pc.density * (top > 0.0 ? (top - low) / top : 0.0);
+    c = (c * dark - 0.435) * (1.0 + pc.contrast) + 0.435;
+    return max(c, vec3(0.0));
+}
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -15,5 +27,6 @@ void main() {
     // the tonemapped scene, the network's first passes left out (vk_draw.cpp), square-root encoded here the same way.
     // dlss_output.comp squares it back
     const vec3 c = max(texelFetch(guest_color, pixel, 0).rgb, vec3(0.0));
-    imageStore(dlss_color, pixel, vec4(pc.encode != 0 ? sqrt(c) : c, 1.0));
+    const vec3 e = pc.encode != 0 ? sqrt(c) : c;
+    imageStore(dlss_color, pixel, vec4(pc.sat != 0.0 || pc.contrast != 0.0 || pc.density != 0.0 ? grade(e) : e, 1.0));
 }

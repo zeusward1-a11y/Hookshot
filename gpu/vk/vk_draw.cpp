@@ -56,6 +56,7 @@
 #include "vk_dlss.h"
 #include "dlss_objmv.h"
 #include "dlss_jitter.h"
+#include "dlss_grade.h"
 #include "dlss_actor.h"
 #include "dlss_actor_plan.h"
 #include "spirv_xfb.h"
@@ -7145,6 +7146,15 @@ bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
         !dlss_image(ds.mask, ds.cam.w, ds.cam.h, VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd))
         return dlss_fallback("images not made"), false;
     int32_t push[16] = {encode ? 1 : 0};
+    {   // (dlss_grade.h: RX_DLSS_GRADE_SAT, _DENSITY and _CONTRAST, percents; unset, the colour goes as it came)
+        static const float sat = grade::factor_of(getenv("RX_DLSS_GRADE_SAT")), contrast = grade::factor_of(getenv("RX_DLSS_GRADE_CONTRAST"));
+        static const float density = grade::given(getenv("RX_DLSS_GRADE_DENSITY")) ? grade::factor_of(getenv("RX_DLSS_GRADE_DENSITY")) : sat;
+        static bool said;
+        if (!said && (sat != 0.0f || contrast != 0.0f || density != 0.0f))
+            said = true, logf("vk: dlss: grade on the scene before DLSS: subtractive saturation %+.1f%%, density %+.1f%%, contrast %+.1f%%",
+                              sat * 100.0, density * 100.0, contrast * 100.0);
+        std::memcpy(&push[1], &sat, 4), std::memcpy(&push[2], &contrast, 4), std::memcpy(&push[3], &density, 4);
+    }
     gprof_begin(cmd);
     full_barrier(cmd);
     dlss_pass(cmd, ds.color_pipe, ds.nearest, dw().imgs[0].imageView, ds.color.view, ds.cam.w, ds.cam.h, push);
