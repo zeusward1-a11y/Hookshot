@@ -34,12 +34,20 @@ def code(text):
 
 def check_stop_said_at_once(replay):
     body = code(block(replay, "bool run_submit("))
-    stop = body.index("q.waiting = true;")
+    # (the stop's own block, if (stop) { ... }, and the line at its top level: not in its else (a submission that went on),
+    # not under an inner if such as the first 12 stops' log)
+    stopped = block(body, "if (stop) {")
+    inner = stopped[stopped.index("{") + 1:]
     said = re.search(r"if \(sync_waits_on\(\) && !blocked_n\.load\(\)\) blocked_since = std::chrono::steady_clock::now\(\), "
-                     r"blocked_n = 1;", body[stop:])
+                     r"blocked_n = 1;", inner)
     if not said:
         raise SystemExit("run_submit: a queue's stop is not said in blocked_n before run_submit lets replay_mu go")
-    if "return" in body[stop:stop + said.start()]:
+    before = inner[:said.start()]
+    if before.count("{") != before.count("}"):
+        raise SystemExit("run_submit: blocked_n is set under an inner condition, not at every stop")
+    if "q.waiting = true;" not in before:
+        raise SystemExit("run_submit: blocked_n is set before the queue is marked stopped")
+    if "return" in before:
         raise SystemExit("run_submit: a return comes between the stop and blocked_n")
 
 
