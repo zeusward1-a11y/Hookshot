@@ -1926,23 +1926,30 @@ std::vector<WriteBack> writebacks;
 std::mutex cpu_words_mu;
 // (a sorted vector and the words noted since it was last sorted: a std::set took a node a word, the same report words
 // every frame, and freed 65536 of them at once when it filled: ~4% of the replay thread in a Kokiri profile, 11-08)
-std::vector<uint64_t> cpu_words, cpu_words_new;
+// (two sorted sets with no word in both: the words go into the recent one, which goes into the big one only once it is an
+// eighth of its size. Merging every write-back's new words into one vector moved the whole of it each time, ~2.4% of
+// the replay thread on a 3900X in Kokiri, 11-08: report words come at new addresses all the time)
+std::vector<uint64_t> cpu_words, cpu_words_recent, cpu_words_new;
+void sorted_merge(std::vector<uint64_t>& into, const uint64_t* b, const uint64_t* e) {
+    const size_t mid = into.size();
+    into.insert(into.end(), b, e);
+    std::inplace_merge(into.begin(), into.begin() + (ptrdiff_t)mid, into.end());
+}
 void cpu_words_merge() {   // (holding cpu_words_mu)
     if (cpu_words_new.empty()) return;
     std::sort(cpu_words_new.begin(), cpu_words_new.end());
     cpu_words_new.erase(std::unique(cpu_words_new.begin(), cpu_words_new.end()), cpu_words_new.end());
-    // (the words already kept left out first: they are the same report words every frame, and merging them in again was a
-    // whole pass over the sorted vector and its temporary buffer on every write-back, ~5% of the replay thread in a heavy
-    // Kokiri view, 11-08)
-    if (!cpu_words.empty())
-        cpu_words_new.erase(std::remove_if(cpu_words_new.begin(), cpu_words_new.end(),
-                                           [](uint64_t w) { return std::binary_search(cpu_words.begin(), cpu_words.end(), w); }),
-                            cpu_words_new.end());
-    if (cpu_words_new.empty()) return;
-    const size_t mid = cpu_words.size();
-    cpu_words.insert(cpu_words.end(), cpu_words_new.begin(), cpu_words_new.end());
-    std::inplace_merge(cpu_words.begin(), cpu_words.begin() + (ptrdiff_t)mid, cpu_words.end());
-    cpu_words.erase(std::unique(cpu_words.begin(), cpu_words.end()), cpu_words.end());
+    // (only the words not kept already: the same report words come every frame)
+    size_t fresh = 0;
+    for (const uint64_t w : cpu_words_new)
+        if (!std::binary_search(cpu_words.begin(), cpu_words.end(), w) &&
+            !std::binary_search(cpu_words_recent.begin(), cpu_words_recent.end(), w))
+            cpu_words_new[fresh++] = w;
+    if (fresh) sorted_merge(cpu_words_recent, cpu_words_new.data(), cpu_words_new.data() + fresh);
+    if (cpu_words_recent.size() > std::max<size_t>(4096, cpu_words.size() / 8)) {
+        sorted_merge(cpu_words, cpu_words_recent.data(), cpu_words_recent.data() + cpu_words_recent.size());
+        cpu_words_recent.clear();
+    }
     cpu_words_new.clear();
 }
 } // namespace
@@ -1950,9 +1957,9 @@ void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
     if (off || !guest) return;
     std::lock_guard lk(cpu_words_mu);
-    if (cpu_words.size() + cpu_words_new.size() > 65536) {   // (as before: forgotten when it gets this big)
+    if (cpu_words.size() + cpu_words_recent.size() + cpu_words_new.size() > 65536) {   // (as before: forgotten when it gets this big)
         cpu_words_merge();
-        if (cpu_words.size() > 65536) cpu_words.clear();
+        if (cpu_words.size() + cpu_words_recent.size() > 65536) cpu_words.clear(), cpu_words_recent.clear();
         if (cpu_words_new.size() > 65536) cpu_words_new.clear();
     }
     for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words_new.push_back(a);
@@ -1967,14 +1974,19 @@ namespace {
 void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
     std::lock_guard lk(cpu_words_mu);
     cpu_words_merge();
-    if (cpu_words.empty()) return;
+    if (cpu_words.empty() && cpu_words_recent.empty()) return;
     std::vector<VkBufferCopy> out;
     for (const VkBufferCopy& r : runs) {
         uint64_t at = r.srcOffset;
         const uint64_t end = r.srcOffset + r.size;
         // A run can start inside an owned word: include that word when cutting the overlap.
-        for (auto it = std::lower_bound(cpu_words.begin(), cpu_words.end(), (p.lo + at) & ~7ull); it != cpu_words.end() && *it < p.lo + end; ++it) {
-            const uint64_t w = *it - p.lo;
+        const uint64_t first = (p.lo + at) & ~7ull, last = p.lo + end;
+        auto a = std::lower_bound(cpu_words.begin(), cpu_words.end(), first);
+        auto b = std::lower_bound(cpu_words_recent.begin(), cpu_words_recent.end(), first);
+        for (;;) {   // (both sets' words in the run, in order)
+            const bool in_a = a != cpu_words.end() && *a < last, in_b = b != cpu_words_recent.end() && *b < last;
+            if (!in_a && !in_b) break;
+            const uint64_t w = (in_a && (!in_b || *a < *b) ? *a++ : *b++) - p.lo;
             if (w > at) out.push_back({at, at, w - at});
             at = std::max(at, w + 8);
         }
