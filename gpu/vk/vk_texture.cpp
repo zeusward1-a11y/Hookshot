@@ -454,7 +454,11 @@ std::chrono::steady_clock::time_point bc_used_at;
 uint64_t bc_last_value = 0;   // (the recording that last used them: they go once it is done)
 std::atomic<bool> bc_have{false};
 uint32_t bc_idle_s() {
-    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S")) : 20;
+    // (hookshot) 0 by default again, kept once made: given back after 20 s, the garbled/rainbow textures of 4-8 GB cards followed
+    // (issue 993): every such log has the "given back" line, an RTX 3050 4 GB player's went away with RX_VK_BC_IDLE_S=0 and not with
+    // RX_VK_NO_EVICT=1, and they began with v2.0.3, which brought this give-back. Its cost: 160-288 MB of VRAM held after the first
+    // decode. RX_VK_BC_IDLE_S=<seconds>: given back as before
+    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S")) : 0;
     return v;
 }
 bool bc_scratch_make() {   // (bc_mu held)
