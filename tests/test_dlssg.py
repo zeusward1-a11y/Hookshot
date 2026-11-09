@@ -132,8 +132,10 @@ def check_sources():
          "no log line for RX_VK_FIFO set aside")
     reflex = code(block(dlss, "void apply_reflex("))
     # (the session's rules are tested by behaviour, tests/dlssg_test.cpp session(): here only that vk_dlss.cpp goes through it)
-    need("o.frameLimitUs = limit;" in reflex and "fr.session.limit(st.limit_basis, dlssg_engaged(), st.refresh_hz)" in reflex,
-         "Reflex's frame limit does not come from the session")
+    need("o.frameLimitUs = limit;" in reflex and
+         "fr.session.limit(st.limit_basis, dlssg_engaged(), st.refresh_hz, st.player_fps)" in reflex,
+         "Reflex's frame limit does not come from the session (with the player's RX_DLSSG_FPS)")
+    need('st.player_fps = dlssg::parse_game_fps(getenv("RX_DLSSG_FPS"));' in code(dlss), "RX_DLSSG_FPS is not read")
     need("fr.session.swapchain(capped," in code(block(dlss, "void dlssg_present_mode(")), "the frame limit's cap does not follow each swapchain")
     bcode = code(begin)
     need(bcode.rfind("apply_reflex(false);") > bcode.index("fr.generating = fr.session.generating();") and

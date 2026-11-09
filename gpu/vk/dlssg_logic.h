@@ -308,6 +308,24 @@ struct FreeLater {
     }
 };
 
+/// RX_DLSSG_FPS=N: the player's own cap on the game's frames while DLSS-G can run (10 to 120; absent or out of range: none), so the
+/// generated frames come at an even rate. Without it the game swung 28-44 fps between Castle Town and Kokiri, 56-88 on screen at 2x,
+/// and the pacing felt uneven (the TotK recomp's fps_limit = 52 with 3x did the same for it). 0 when not set
+inline int parse_game_fps(const char* s) {
+    if (!s || !*s) return 0;
+    char* end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    return end && *end == 0 && v >= 10 && v <= 120 ? (int)v : 0;
+}
+/// That cap as Reflex's frameLimitUs, in the basis's units: game frames, or every present (fps times what is shown per game frame)
+inline uint32_t player_limit_us(int basis, bool usable, int fps, int shown) {
+    if (!usable || fps <= 0 || basis == LIMIT_NONE) return 0;
+    const int per = basis == LIMIT_PRESENT ? (shown < 1 ? 1 : shown) : 1;
+    return (uint32_t)std::ceil(1e6 / ((double)fps * (double)per));
+}
+/// Two limits in microseconds (0: none): the stricter one, the longer interval
+inline uint32_t stricter_limit(uint32_t a, uint32_t b) { return a > b ? a : b; }
+
 /// What vk_dlss.cpp keeps of DLSS-G between presents, as one piece so that its rules are tested together (tests/dlssg_test.cpp): the
 /// options last sent (DLSS-G's eWarnOutOfVRAM is a sent option too: a warning, as dlss_result.h has it for DLSS), the frame limit's cap
 /// swapchain by swapchain, slFreeResources after the player's Off, and the limit for a present
@@ -328,8 +346,10 @@ struct Session {
     bool generating() const { return sent && applied.on; }
     bool needs_free_off() const { return frees(sent, applied); }   // (the built-in interpolation took over: an eOff that frees)
     int swapchain(bool capped, bool usable) { return cap.update(capped, usable); }
-    uint32_t limit(int basis, bool usable, uint32_t refresh_hz) const {
-        return reflex_limit_us(basis, cap.on, usable, generating(), applied.frames, refresh_hz);
+    uint32_t limit(int basis, bool usable, uint32_t refresh_hz, int player_fps = 0) const {
+        const int shown = generating() ? (int)applied.frames + 1 : 1;
+        return stricter_limit(reflex_limit_us(basis, cap.on, usable, generating(), applied.frames, refresh_hz),
+                              player_limit_us(basis, usable, player_fps, shown));
     }
     bool after_present() { return free_later.presented(generating()); }   // (true: slFreeResources now)
 };

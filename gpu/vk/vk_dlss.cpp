@@ -110,6 +110,7 @@ struct State {
     int reflex_asked = 1, reflex_applied = -1;
     uint32_t limit_applied = ~0u;   // (Reflex's frameLimitUs last sent)
     int limit_basis = dlssg::LIMIT_GAME;   // (RX_DLSSG_LIMIT=game|present|0: what the limit counts, dlssg_logic.h)
+    int player_fps = 0;             // (RX_DLSSG_FPS=N: the player's cap on the game's frames while DLSS-G can run, dlssg_logic.h)
     bool mailbox_asked = false;     // (RX_DLSSG_MAILBOX=1: mailbox before immediate while DLSS-G runs)
     uint32_t refresh_hz = 0;        // (the window's monitor, at the last swapchain)
 };
@@ -454,16 +455,16 @@ void apply_reflex(bool force) {
     // (RX_VK_FIFO not taken: what is shown at most 97% of the refresh, where G-SYNC holds the picture, from what DLSS-G does now:
     // the options last sent, so a menu or a frame DLSS did not draw does not hold the game at the row's multiplier)
     const int shown = fr.session.generating() ? (int)fr.session.applied.frames + 1 : 1;
-    const uint32_t limit = fr.session.limit(st.limit_basis, dlssg_engaged(), st.refresh_hz);
+    const uint32_t limit = fr.session.limit(st.limit_basis, dlssg_engaged(), st.refresh_hz, st.player_fps);
     if (!force && mode == st.reflex_applied && limit == st.limit_applied) return;
     sl::ReflexOptions o{};
     o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode == 1 ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
     o.frameLimitUs = limit;
     const sl::Result r = st.reflex_options(o);
     static int limits_logged;   // (generation on and off changes it: the first ones)
-    if (limit != st.limit_applied && (fr.session.cap.on || st.limit_applied != ~0u) && limits_logged++ < 20)
-        logf("vk: dlssg: monitor %u Hz: Reflex frame limit %u us (basis %s, %dx shown; result %d)", st.refresh_hz, limit,
-             dlssg::limit_name(st.limit_basis), shown, (int)r);
+    if (limit != st.limit_applied && (fr.session.cap.on || st.player_fps || st.limit_applied != ~0u) && limits_logged++ < 20)
+        logf("vk: dlssg: monitor %u Hz: Reflex frame limit %u us (basis %s, %dx shown, RX_DLSSG_FPS %d; result %d)", st.refresh_hz,
+             limit, dlssg::limit_name(st.limit_basis), shown, st.player_fps, (int)r);
     st.limit_applied = limit;
     static int logged;
     if (mode != st.reflex_applied || logged < 4) {
@@ -694,6 +695,7 @@ bool dlss_start() {
     for (const std::string& s : st.dev_names) st.devx.push_back(s.c_str());
     st.reflex_asked = dlssg::parse_reflex(getenv("RX_REFLEX"), 1);
     st.limit_basis = dlssg::parse_limit(getenv("RX_DLSSG_LIMIT"));
+    st.player_fps = dlssg::parse_game_fps(getenv("RX_DLSSG_FPS"));
     st.mailbox_asked = env_int("RX_DLSSG_MAILBOX", 0) != 0;
     sl::FeatureVersion version{};
     st.get_feature_version(sl::kFeatureDLSS, version);

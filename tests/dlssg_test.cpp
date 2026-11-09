@@ -577,7 +577,33 @@ static void session() {
     CHECK(g.changed(ON, mode_for(ON, 3, 3), Session::kOk));
 }
 
+// ---- RX_DLSSG_FPS: the player's cap on the game's frames (an even rate for the generated ones) ----
+static void player_fps() {
+    CHECK(parse_game_fps(nullptr) == 0);
+    CHECK(parse_game_fps("") == 0);
+    CHECK(parse_game_fps("40") == 40);
+    CHECK(parse_game_fps("10") == 10 && parse_game_fps("120") == 120);
+    CHECK(parse_game_fps("9") == 0 && parse_game_fps("121") == 0 && parse_game_fps("40x") == 0 && parse_game_fps("abc") == 0);
+    CHECK(player_limit_us(LIMIT_GAME, true, 40, 2) == 25000);      // (40 game frames: 25 ms, whatever is shown)
+    CHECK(player_limit_us(LIMIT_GAME, true, 30, 3) == 33334);      // (rounded up: never faster than asked)
+    CHECK(player_limit_us(LIMIT_PRESENT, true, 40, 2) == 12500);   // (every present counted: 80 a second at 2x)
+    CHECK(player_limit_us(LIMIT_GAME, false, 40, 2) == 0);         // (DLSS-G cannot run: no cap of ours)
+    CHECK(player_limit_us(LIMIT_GAME, true, 0, 2) == 0);           // (not set)
+    CHECK(player_limit_us(LIMIT_NONE, true, 40, 2) == 0);          // (RX_DLSSG_LIMIT=0: no limit at all)
+    CHECK(stricter_limit(0, 25000) == 25000 && stricter_limit(12573, 25000) == 25000 && stricter_limit(25000, 0) == 25000);
+    // in the session: the player's cap holds with no FIFO cap (RX_VK_IMMEDIATE, the user's set-up), and the stricter one wins
+    Session s;
+    CHECK(s.limit(LIMIT_GAME, true, 165, 0) == 0);                 // (no FIFO cap, no player cap: none, as before)
+    CHECK(s.limit(LIMIT_GAME, true, 165, 40) == 25000);
+    CHECK(s.limit(LIMIT_GAME, false, 165, 40) == 0);
+    s.swapchain(true, true);                                        // (FIFO set aside: the refresh cap is on, 1x shown)
+    CHECK(s.limit(LIMIT_GAME, true, 165, 40) == 25000);            // (40 is stricter than 0.97 x 165)
+    CHECK(s.limit(LIMIT_GAME, true, 165, 120) == 8334);            // (120 is stricter than the 160 of 0.97 x 165 at 1x too)
+    CHECK(s.limit(LIMIT_GAME, true, 60, 120) == frame_limit_us(60, 1, 0.97));    // (on a 60 Hz monitor the refresh cap wins)
+}
+
 int main() {
+    player_fps();
     session();
     second_review();
     follow_up();
