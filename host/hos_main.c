@@ -1156,6 +1156,7 @@ volatile uint64_t hos_wide_out, hos_wide_scene;
 /* (nx2/oot_native_resolution.py) mode 1's scene base scale 1.0 instead of 0.8: Resolution 100% (host/nn_vi.c keeps it current),
    HOS_SCENE_NATIVE=0/1 over it */
 volatile int hos_native_scene;
+volatile int hos_fix_res;   /* (nx2/oot_native_resolution.py's cached-scale refresh: HOS_FIX_RES=1; #849's fixed-scale patch does it by default) */
 volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
 /* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
 volatile int hos_occlusion_off;
@@ -1322,6 +1323,7 @@ static int game_main(int argc, char **argv) {
             if (on && sh > 0) want = (float)sw / (float)sh;
         }
         if (getenv("HOS_SCENE_NATIVE")) hos_native_scene = atoi(getenv("HOS_SCENE_NATIVE")) != 0;
+        if (getenv("HOS_FIX_RES")) hos_fix_res = atoi(getenv("HOS_FIX_RES")) != 0;
         if (hos_native_scene) hos_log("boot: HOS_SCENE_NATIVE=1: the scene's base scale 1.0 (the game's 0.8 otherwise)");
         extern volatile uint64_t hos_wide_out, hos_wide_scene;
         extern volatile float hos_wide_ratio, hos_wide_squeeze, hos_wide_margin;
