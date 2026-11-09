@@ -11,6 +11,7 @@
 #include "hos.h"
 #include "hos_paths.h"
 #include "../gpu/vk/vk_api.h"
+#include "../gpu/vk/oot_cheat_items.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -378,6 +379,7 @@ static void load_hookshot_env(void) {
 }
 
 int hos_oot_protect_hearts;
+volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat <action>": host/nn_hid.c */
 
 int hos_oot_hearts_enabled(void) {
     int rx_option(int id, int otherwise);
@@ -395,27 +397,23 @@ int hos_oot_is_player(Ctx *c, uint64_t actor) {
 }
 
 #ifdef _WIN32
-static void oot_edit_pouch(Ctx *c, int action) {
-    static const char *const items[] = {
-        "Item_DekuSeed", "Item_DekuNut", "Item_DekuStick", "Item_Bomb", "Item_Arrow_Normal"
-    };
-    const unsigned item = (unsigned)(action - 200) / 32;
-    const int delta = (action - 200) % 32 - 10;
-    if (item >= sizeof items / sizeof items[0] || !delta || delta < -10 || delta > 10) return;
-
+/* OneShotAddOrRemovePouchContent (f_828d4a70) for one pouch content by actor name: delta > 0 adds, < 0 removes.
+   Returns the event status (top bits of the result word), or -1 when the pouch is not ready. */
+static int oot_pouch_change(Ctx *c, const char *name, int delta) {
     const uint64_t pouch_singleton = recomp_load64(c, 0x84c9e0d0ULL);
     const uint64_t state_singleton = recomp_load64(c, 0x84c9e2a8ULL);
     const uint64_t actor_db = recomp_load64(c, 0x84eb6888ULL);
     const uint64_t actor_info = recomp_load64(c, 0x84e8c060ULL);
     A64Fn edit = a64_lookup(0x828d4a70ULL);
     if (!edit || !pouch_singleton || !recomp_load64(c, pouch_singleton) ||
-        !state_singleton || !recomp_load64(c, state_singleton) || !actor_db || !actor_info) return;
+        !state_singleton || !recomp_load64(c, state_singleton) || !actor_db || !actor_info || !delta ||
+        strlen(name) >= 0x60) return -1;
 
     // OneShotAddOrRemovePouchContent reads the event parameters through pointers.
     const Ctx saved = *c;
-    const uint64_t event = c->x[31] - 0xa0;
-    memset(A64_PTR(event), 0, 0xa0);
-    memcpy(A64_PTR(event + 0x80), items[item], strlen(items[item]) + 1);
+    const uint64_t event = (c->x[31] - 0xe0) & ~0xfULL;
+    memset(A64_PTR(event), 0, 0xe0);
+    memcpy(A64_PTR(event + 0x80), name, strlen(name) + 1);
     recomp_store64_sp(c, event + 0x20, event + 0x60);
     recomp_store64_sp(c, event + 0x30, event + 0x70);
     recomp_store64_sp(c, event + 0x38, event + 0x68);
@@ -427,9 +425,119 @@ static void oot_edit_pouch(Ctx *c, int action) {
     c->x[31] = event;
     c->x[0] = event;
     edit(c);
-    const uint32_t result = recomp_load32(c, event + 0x18) >> 30;
+    const int result = (int)(recomp_load32(c, event + 0x18) >> 30);
     *c = saved;
-    hos_log("cheats: pouch %s %+d (event status %u)", items[item], delta, result);
+    return result;
+}
+
+/* QueryGetPouchContentNumByActorName (f_82a3c260): f_805b63e0(pouch manager, &name, 0, 0) counts one content. */
+static int oot_pouch_count(Ctx *c, const char *name) {
+    const uint64_t manager = recomp_load64(c, 0x84e98e28ULL);
+    A64Fn count = a64_lookup(0x805b63e0ULL);
+    if (!manager || !count || strlen(name) >= 0x60) return -1;
+    const Ctx saved = *c;
+    const uint64_t frame = (c->x[31] - 0x80) & ~0xfULL;
+    memcpy(A64_PTR(frame + 0x10), name, strlen(name) + 1);
+    recomp_store64_sp(c, frame, frame + 0x10);
+    c->x[31] = frame;
+    c->x[0] = manager, c->x[1] = frame, c->x[2] = 0, c->x[3] = 0;
+    count(c);
+    const int n = (int)(int32_t)c->x[0];
+    *c = saved;
+    return n;
+}
+
+static void oot_edit_pouch(Ctx *c, int action) {
+    static const char *const items[] = {
+        "Item_DekuSeed", "Item_DekuNut", "Item_DekuStick", "Item_Bomb", "Item_Arrow_Normal"
+    };
+    const unsigned item = (unsigned)(action - 200) / 32;
+    const int delta = (action - 200) % 32 - 10;
+    if (item >= sizeof items / sizeof items[0] || !delta || delta < -10 || delta > 10) return;
+    const int result = oot_pouch_change(c, items[item], delta);
+    if (result >= 0) hos_log("cheats: pouch %s %+d (event status %d)", items[item], delta, result);
+}
+
+/* The Inventory page (gpu/vk/oot_cheat_items.h): counts go to the menu twice a second, edits come back as actions. */
+#define OOT_ITEM_NAME(label, name, kind) name,
+#define OOT_ITEM_KIND(label, name, kind) kind,
+#define OOT_NO_SECTION(name)
+static const char *const oot_item_names[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, OOT_ITEM_NAME)};
+static const unsigned char oot_item_kinds[] = {OOT_CHEAT_ITEMS(OOT_NO_SECTION, OOT_ITEM_KIND)};
+#define OOT_ITEM_COUNT (sizeof oot_item_names / sizeof oot_item_names[0])
+
+static int oot_item_count(Ctx *c, const char *name);
+
+static void oot_inventory_refresh(Ctx *c, int64_t now) {
+    void rx_option_set(int id, int value);
+    static int64_t next;
+    static int probed;
+    if (now < next) return;
+    next = now + 500000000LL;
+    for (unsigned i = 0; i < OOT_ITEM_COUNT; i++) rx_option_set(OOT_CHEAT_ITEM_BASE + (int)i, oot_item_count(c, oot_item_names[i]));
+    if (!probed && oot_pouch_count(c, "Item_DekuSeed") >= 0) {
+        probed = 1;   /* (one line naming every count, both spellings: which names the pouch knows) */
+        static const char *const probes[] = {OOT_CHEAT_ITEM_PROBES};
+        const unsigned total = (unsigned)(OOT_ITEM_COUNT + sizeof probes / sizeof probes[0]);
+        char line[512];
+        size_t used = 0;
+        for (unsigned i = 0; i < total; i++) {   /* (several short lines: the log cuts long ones) */
+            const char *name = i < OOT_ITEM_COUNT ? oot_item_names[i] : probes[i - OOT_ITEM_COUNT];
+            used += (size_t)snprintf(line + used, sizeof line - used, " %s=%d", name, oot_pouch_count(c, name));
+            if (used > 300 || i + 1 == total) hos_log("cheats: inventory probe:%s", line), used = 0;
+        }
+    }
+}
+
+/* Masks share one slot (the Happy Mask Shop lends one at a time). The game takes "Item_Mask_X" when adding one and
+   may keep it as "Armor_Child_Mask_X", so both spellings count and a new mask first returns the one held. */
+static int oot_mask_alias(const char *name, char *alias, size_t size) {
+    if (!strncmp(name, "Armor_Child_Mask_", 17)) return snprintf(alias, size, "Item_Mask_%s", name + 17), 1;
+    return 0;
+}
+
+static int oot_item_count(Ctx *c, const char *name) {
+    char alias[64];
+    const int n = oot_pouch_count(c, name);
+    if (!oot_mask_alias(name, alias, sizeof alias)) return n;
+    const int m = oot_pouch_count(c, alias);
+    return n > m ? n : m;
+}
+
+static void oot_inventory_edit(Ctx *c, int action) {
+    const unsigned item = (unsigned)(action - OOT_CHEAT_ITEM_ACTION) / 256, op = (unsigned)(action - OOT_CHEAT_ITEM_ACTION) % 256;
+    if (item >= OOT_ITEM_COUNT) return;
+    const char *name = oot_item_names[item];
+    char alias[64];
+    const int is_mask = oot_mask_alias(name, alias, sizeof alias);
+    const int have = oot_item_count(c, name);
+    int delta = 0;
+    if (op == 200) delta = have > 0 ? -have : 1;   /* unlock / relock */
+    else if (op < 128) delta = (int)op - 64;
+    if (!delta || have < 0) return;
+    if (is_mask && delta > 0) {   /* return whichever mask is in the slot first */
+        for (unsigned i = 0; i < OOT_ITEM_COUNT; i++) {
+            char other_alias[64];
+            if (i == item || !oot_mask_alias(oot_item_names[i], other_alias, sizeof other_alias)) continue;
+            const char *spellings[2] = {oot_item_names[i], other_alias};
+            for (unsigned k = 0; k < 2; k++) {
+                const int held = oot_pouch_count(c, spellings[k]);
+                if (held > 0) hos_log("cheats: inventory returned %s (status %d)", spellings[k], oot_pouch_change(c, spellings[k], -held));
+            }
+        }
+        delta = 1;
+    }
+    int result = -1;
+    if (is_mask && delta < 0) {   /* remove under whichever spelling holds it */
+        const char *spellings[2] = {name, alias};
+        for (unsigned k = 0; k < 2; k++) {
+            const int held = oot_pouch_count(c, spellings[k]);
+            if (held > 0) result = oot_pouch_change(c, spellings[k], -held);
+        }
+    } else {
+        result = oot_pouch_change(c, is_mask ? alias : name, delta);   /* (masks are added as Item_Mask_X, as the shop does) */
+    }
+    hos_log("cheats: inventory %s %+d (had %d, now %d, event status %d)", name, delta, have, oot_item_count(c, name), result);
 }
 
 static void oot_set_time(Ctx *c, unsigned hour) {
@@ -447,6 +555,309 @@ static void oot_set_time(Ctx *c, unsigned hour) {
     set_time(c);
     *c = saved;
     hos_log("cheats: requested %02u:00", hour);
+}
+
+/* Cross-map teleport (build e0f3ccfa). Map changes in this game only run through an event: an entrance actor
+   requests the Dm_SY_BancChangeGo event with NextBanc / NextStartPos / BootEventName arguments, the event calls
+   GameSystemActor's ReserveBancChange, and the sequence's ChangeBancOnEvent loads the map when the event ends.
+   This builds the same event request (see work/oot-teleport-research.md). The menu labels in gpu/vk/vk_menu.cpp
+   (teleport_names) follow this table's order. */
+typedef struct {
+    const char *child_banc, *child_start, *child_boot;
+    const char *adult_banc, *adult_start, *adult_boot;
+} OotDestination;
+static const OotDestination oot_destinations[] = {   /* (generated: work/oot-teleport-tools/write_destinations.py) */
+    {"KokiriForest_Child", "LostWoodBridge_FrontOfHyruleField", "Dm_SY_BancChangeArrive",
+     "KokiriForest_Adult", "LostWoodBridge_FrontOfHyruleField", "Dm_SY_BancChangeArrive"},   /* Kokiri Forest */
+    {"HyruleField_Child", "HyruleField_FrontOfLostWoodBridge", "Dm_SY_BancChangeArrive",
+     "HyruleField_Adult", "HyruleField_FrontOfLostWoodBridge", "Dm_SY_BancChangeArrive"},   /* Hyrule Field */
+    {"KakarikoVillage_Child", "KakarikoVillage_Entrance", "Dm_SY_BancChangeArrive_KakarikoVillage_01",
+     "KakarikoVillage_Adult", "KakarikoVillage_Entrance", "Dm_SY_BancChangeArrive_KakarikoVillage_01"},   /* Kakariko Village */
+    {"Market_Child", "Market_Entrance", "Dm_SY_BancChangeArrive_Market_02",
+     "Market_Adult", "Market_Entrance", "Dm_SY_BancChangeArrive_Market_02"},   /* Market */
+    {"HyruleCastle", "HyruleCastle_Entrance", "Dm_SY_BancChangeArrive_HyruleCastle_01",
+     "GanonCastle", "GanonCastleEntrance", "Dm_SY_BancChangeArrive_GanonCastle_01"},   /* Hyrule Castle */
+    {"LostWood_Child", "LostWood_FrontOfSacredForestMeadow", "Dm_SY_BancChangeArrive_LostWood",
+     "LostWood_Adult", "LostWood_FrontOfSacredForestMeadow", "Dm_SY_BancChangeArrive_LostWood"},   /* Lost Woods */
+    {"SacredForestMeadow_Child", "OutsideOfForestTemple", "Dm_SY_BancChangeArrive_SacredForestMeadow_01",
+     "SacredForestMeadow_Adult", "OutsideOfForestTemple", "Dm_SY_BancChangeArrive_SacredForestMeadow_01"},   /* Sacred Forest Meadow */
+    {"HyruleField_Child", "LakeHylia_FromGerudoValley", "Dm_SY_BancChangeArrive_LakeHylia_02",
+     "HyruleField_Adult", "LakeHylia_FromGerudoValley", "Dm_SY_BancChangeArrive_LakeHylia_02"},   /* Lake Hylia */
+    {"Graveyard_Child", "GraveYard_KakarikoSide", "Dm_SY_BancChangeArrive_Graveyard_01",
+     "Graveyard_Adult", "GraveYard_KakarikoSide", "Dm_SY_BancChangeArrive_Graveyard_01"},   /* Graveyard */
+    {"DeathMountainTrail_Child", "MountainTrail_KakarikoSide", "Dm_SY_BancChangeArrive_DeathMountainTrail_01",
+     "DeathMountainTrail_Adult", "MountainTrail_KakarikoSide", "Dm_SY_BancChangeArrive_DeathMountainTrail_01"},   /* Death Mountain Trail */
+    {"DeathMountainCrater_Child", "Crater_GoronCitySide", "DeathMountainCrater_Arrive",
+     "DeathMountainCrater_Adult", "Crater_GoronCitySide", "DeathMountainCrater_Arrive"},   /* Death Mountain Crater */
+    {"GoronCity_Child", "GoronCity_MountainTrailSide", "Dm_SY_BancChangeArrive_GoronCity_01",
+     "GoronCity_Adult", "GoronCity_MountainTrailSide", "Dm_SY_BancChangeArrive_GoronCity_01"},   /* Goron City */
+    {"ZoraRiver_Child", "ZoraRiver_Entrance", "Dm_SY_BancChangeArrive",
+     "ZoraRiver_Adult", "ZoraRiver_Entrance", "Dm_SY_BancChangeArrive"},   /* Zora's River */
+    {"ZoraDomain_Child", "ZoraDomain_FromZoraRiver", "Dm_SY_BancChangeArrive",
+     "ZoraDomain_Adult", "ZoraDomain_FromZoraRiver", "Dm_SY_BancChangeArrive"},   /* Zora's Domain */
+    {"ZoraFountain_Child", "ZoraFountain_FromZoraDomain", "Dm_SY_BancChangeArrive",
+     "ZoraFountain_Adult", "ZoraFountain_FromZoraDomain", "Dm_SY_BancChangeArrive"},   /* Zora's Fountain */
+    {"GerudoValley_Child", "GerudoValley_Entrance", "FromHyruleField_ArriveGerudoValley",
+     "GerudoValley_Adult", "GerudoValley_Entrance", "FromHyruleField_ArriveGerudoValley"},   /* Gerudo Valley */
+    {NULL, NULL, NULL,
+     "GerudoFortress_Adult", "GerudoFortress_FromHountedWasteland", "Dm_SY_BancChangeArrive_GerudoFortress_02"},   /* Gerudo Fortress */
+    {"HountedWasteland_Child", "HountedWasteland_FromGerudoFortress", "FromGerudoFortress_ArriveWateland",
+     "HountedWasteland_Adult", "HountedWasteland_FromGerudoFortress", "FromGerudoFortress_ArriveWateland"},   /* Haunted Wasteland */
+    {"DesertColossus_Child", "DesertColossus_FromHountedWasteland", "Dm_SY_BancChangeArrive_DesertColossus_01",
+     "DesertColossus_Adult", "DesertColossus_FromHountedWasteland", "Dm_SY_BancChangeArrive_DesertColossus_01"},   /* Desert Colossus */
+    {"InsideTheDekuTree", "Entrance", "Dm_SY_BancChangeArrive_InsideTheDekuTree_01",
+     "InsideTheDekuTree", "Entrance", "Dm_SY_BancChangeArrive_InsideTheDekuTree_01"},   /* Inside the Deku Tree */
+    {"DodongoCavern", "DodongoCavern_MountainTrailSide", "Dm_SY_BancChangeArrive",
+     "DodongoCavern", "DodongoCavern_MountainTrailSide", "Dm_SY_BancChangeArrive"},   /* Dodongo's Cavern */
+    {"InsideJabuJabuBelly", "InsideJabuJabuBelly_FromZoraFountain", "Dm_SY_BancChangeArrive",
+     "InsideJabuJabuBelly", "InsideJabuJabuBelly_FromZoraFountain", "Dm_SY_BancChangeArrive"},   /* Jabu-Jabu's Belly */
+    {"ForestTemple", "ForestTemple", "Dm_SY_BancChangeArrive",
+     "ForestTemple", "ForestTemple", "Dm_SY_BancChangeArrive"},   /* Forest Temple */
+    {"FireTemple", "FireTemple", "Dm_SY_BancChangeArrive",
+     "FireTemple", "FireTemple", "Dm_SY_BancChangeArrive"},   /* Fire Temple */
+    {"WaterTemple", "WaterTemple_FromLakeHylia", "SageOfWater_Arrival_WaterTemple",
+     "WaterTemple", "WaterTemple_FromLakeHylia", "SageOfWater_Arrival_WaterTemple"},   /* Water Temple */
+    {"ShadowTemple", "Entrance", "ShadowTemple_Arrive",
+     "ShadowTemple", "Entrance", "ShadowTemple_Arrive"},   /* Shadow Temple */
+    {"SpiritTemple", "SpiritTemple_FromRightHand", "Dm_SY_BancChangeArrive",
+     "SpiritTemple", "SpiritTemple_FromRightHand", "Dm_SY_BancChangeArrive"},   /* Spirit Temple */
+    {"BottomOfTheWell", "Well_KakarikoSide", "Dm_SY_BancChangeArrive",
+     "BottomOfTheWell", "Well_KakarikoSide", "Dm_SY_BancChangeArrive"},   /* Bottom of the Well */
+    {"IceCavern", "IceCavern_FromZoraFountain", "SageOfWater_Arrival_IceCavern",
+     "IceCavern", "IceCavern_FromZoraFountain", "SageOfWater_Arrival_IceCavern"},   /* Ice Cavern */
+    {"GerudoTrainingGround", "GerudoTrainingGround_FromGerudoFortress", "FromGerudoFortress_ArriveTrainingGround",
+     "GerudoTrainingGround", "GerudoTrainingGround_FromGerudoFortress", "FromGerudoFortress_ArriveTrainingGround"},   /* Gerudo Training Ground */
+    {"InsideGanonCastle", "Entrance", "Dm_SY_BancChangeArrive_InsideGanonCastle_01",
+     "InsideGanonCastle", "Entrance", "Dm_SY_BancChangeArrive_InsideGanonCastle_01"},   /* Ganon's Castle */
+};
+#define OOT_AGE_ACTION 999   /* (the Cheats page's Age row) */
+#define OOT_TELEPORT_ACTION 1000   /* (pouch edits use 200 to 348) */
+#define OOT_GAMEDATA_SLOT 0x84c9e180ULL   /* GameDataMgr, as ReserveBancChange's readers load it */
+#define OOT_EVENTMGR_SLOT 0x84c9e090ULL   /* EventMgr, as SeqOneShotRequestEvent loads it */
+#define OOT_EVENT_ARG_SIZE 0x1b20ULL      /* EventRequestArg: SeqOneShotRequestEvent reserves this much stack */
+
+static uint64_t oot_singleton(Ctx *c, uint64_t slot) {
+    const uint64_t holder = recomp_load64(c, slot);
+    return holder ? recomp_load64(c, holder) : 0;
+}
+
+/* GameDataMgr getters by MurMur3 name hash: f_8022d9c0 (bool) and f_80cd0ea0 (String64). 1 when found. */
+static int oot_gamedata_bool(Ctx *c, uint32_t hash, int *value) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    A64Fn get = a64_lookup(0x8022d9c0ULL);
+    if (!mgr || !get) return 0;
+    const Ctx saved = *c;
+    const uint64_t out = (c->x[31] - 0x40) & ~0xfULL;
+    recomp_store64_sp(c, out, 0);
+    c->x[31] = out;
+    c->x[0] = mgr, c->x[1] = out, c->x[2] = hash;
+    get(c);
+    const int found = (int)(c->x[0] & 1);
+    *value = recomp_load8(c, out) & 1;
+    *c = saved;
+    return found;
+}
+
+static int oot_gamedata_string(Ctx *c, uint32_t hash, char *buf, size_t size) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    A64Fn get = a64_lookup(0x80cd0ea0ULL);
+    buf[0] = 0;
+    if (!mgr || !get) return 0;
+    const Ctx saved = *c;
+    const uint64_t out = (c->x[31] - 0x40) & ~0xfULL;
+    recomp_store64_sp(c, out, 0);
+    c->x[31] = out;
+    c->x[0] = mgr, c->x[1] = out, c->x[2] = hash;
+    get(c);
+    const int found = (int)(c->x[0] & 1);
+    const uint64_t text = recomp_load64(c, out);
+    *c = saved;
+    if (!found || !text) return 0;
+    for (size_t i = 0; i + 1 < size; i++) {
+        buf[i] = (char)recomp_load8(c, text + i);
+        buf[i + 1] = 0;
+        if (!buf[i]) break;
+    }
+    return 1;
+}
+
+/* One argument of an EventRequestArg: the array of 200-byte entries at arg+8, capacity arg+0, count arg+16.
+   Entry: +0 type (1 string pointer, 4 bool), +8 name buffer, +16 its capacity, +152 the value. As
+   QueryBancChangeEventRequestArg (f_829df380) fills them. A string value is a pointer the request does not copy. */
+static int oot_event_arg(Ctx *c, uint64_t arg, const char *name, uint32_t type, uint64_t value) {
+    const uint32_t capacity = recomp_load32(c, arg), count = recomp_load32(c, arg + 16);
+    if (count >= capacity) return 0;
+    const uint64_t entry = recomp_load64(c, arg + 8) + (uint64_t)count * 200;
+    const uint64_t name_buf = recomp_load64(c, entry + 8);
+    const uint32_t name_cap = recomp_load32(c, entry + 16);
+    const size_t length = strlen(name);
+    if (!name_buf || length + 1 > name_cap) return 0;
+    memcpy(A64_PTR(name_buf), name, length + 1);
+    if (type == 4) recomp_store8(c, entry + 152, value & 1);
+    else recomp_store64(c, entry + 152, value);
+    recomp_store32(c, entry, type);
+    recomp_store32(c, arg + 16, count + 1);
+    return 1;
+}
+
+static struct {
+    int64_t requested_at, check_at;
+    unsigned destination;
+} teleport;
+
+static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
+    if (index >= sizeof oot_destinations / sizeof oot_destinations[0]) return 0;
+    const int64_t now = hos_now_ns();
+    if (teleport.requested_at && now - teleport.requested_at < 8000000000LL) {
+        hos_log("cheats: teleport ignored, a request is still in progress");
+        return 0;
+    }
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    A64Fn make_arg = a64_lookup(0x80d99f10ULL), request = a64_lookup(0x80d9a820ULL);
+    A64Fn set_link = a64_lookup(0x802dc440ULL), release_link = a64_lookup(0x8022b6f0ULL);
+    if (!events || !make_arg || !request || !set_link || !release_link) {
+        hos_log("cheats: teleport unavailable (event manager %#llx)", (unsigned long long)events);
+        return 0;
+    }
+    if (recomp_load64(c, events + 104)) {   /* (the Main sequence's "Event" test: an event is playing) */
+        hos_log("cheats: teleport waits until the current event ends");
+        return 0;
+    }
+    int loading = 0, child = 1;
+    if (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading) {   /* Sequence_IsLoadingBanc */
+        hos_log("cheats: teleport ignored while a map loads");
+        return 0;
+    }
+    if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) hos_log("cheats: Sequence_IsChildhood not found, using child maps");
+    const OotDestination *d = &oot_destinations[index];
+    const char *banc = child ? d->child_banc : d->adult_banc;
+    const char *start = child ? d->child_start : d->adult_start;
+    const char *boot = child ? d->child_boot : d->adult_boot;
+    if (!banc) {
+        hos_log("cheats: teleport %u has no %s map", index, child ? "child" : "adult");
+        return 0;
+    }
+
+    /* The event reads its string arguments after this request returns, so they live in memory that stays. */
+    static uint64_t strings;
+    if (!strings) strings = hos_sys_alloc(512, 16);
+    if (!strings) return 0;
+    memset(A64_PTR(strings), 0, 512);
+    memcpy(A64_PTR(strings), banc, strlen(banc) + 1);
+    memcpy(A64_PTR(strings + 128), start, strlen(start) + 1);
+    memcpy(A64_PTR(strings + 256), boot, strlen(boot) + 1);
+
+    const char *event_env = getenv("HOS_OOT_TELEPORT_EVENT");
+    const char *event = event_env && *event_env ? event_env : "Dm_SY_BancChangeGo";
+    const char *starter_env = getenv("HOS_OOT_TELEPORT_STARTER");
+    const int with_starter = !(starter_env && !strcmp(starter_env, "0"));
+
+    const Ctx saved = *c;
+    const uint64_t arg = (c->x[31] - OOT_EVENT_ARG_SIZE - 0x100) & ~0xfULL;
+    c->x[31] = arg;
+    c->x[0] = arg;
+    make_arg(c);
+    int ok = 1;
+    {   /* the event's name: arg+6800 points at its buffer, arg+6808 the capacity */
+        const uint64_t buf = recomp_load64(c, arg + 6800);
+        const uint32_t cap = recomp_load32(c, arg + 6808);
+        if (!buf || strlen(event) + 1 > cap) ok = 0;
+        else memcpy(A64_PTR(buf), event, strlen(event) + 1);
+    }
+    ok = ok && oot_event_arg(c, arg, "NextBanc", 1, strings);
+    ok = ok && oot_event_arg(c, arg, "NextStartPos", 1, strings + 128);
+    ok = ok && oot_event_arg(c, arg, "BootEventName", 1, strings + 256);
+    ok = ok && oot_event_arg(c, arg, "IsCheckAir", 4, 0);
+    if (ok && with_starter) {   /* the starter actor (arg+0x1950), as OneShotEventMemberRequestEventByEventName sets it */
+        c->x[31] = arg;
+        c->x[0] = arg + 0x1950, c->x[1] = actor, c->x[2] = 0;
+        set_link(c);
+    }
+    uint64_t result = 0;
+    if (ok) {
+        c->x[31] = arg;
+        c->x[0] = events, c->x[1] = arg;
+        request(c);
+        result = c->x[0];
+    }
+    /* SeqOneShotRequestEvent's cleanup of the arg's two actor links */
+    for (unsigned i = 0; i < 2; i++) {
+        const uint64_t link = arg + (i ? 0x1950 : 0x1968);
+        recomp_store64(c, link, 0x84994b20ULL);
+        c->x[31] = arg;
+        c->x[0] = link;
+        release_link(c);
+    }
+    *c = saved;
+    teleport.requested_at = now;
+    teleport.check_at = now + 1500000000LL;
+    teleport.destination = index;
+    hos_log("cheats: teleport %s to %s at %s (boot %s, event %s, starter %d): request %s, result %#llx",
+            child ? "child" : "adult", banc, start, boot, event, with_starter, ok ? "sent" : "not built",
+            (unsigned long long)result);
+    return ok;   /* (sent; the request's own result is only logged) */
+}
+
+/* Writes a GameData bool directly: GameDataMgr+32 is the (hash, index) table (+44 its size), the bools are 24-byte
+   entries at GameDataMgr+24 (+16 their count) with the value at +22, as f_8022d9c0 reads them. 1 when found. */
+static int oot_gamedata_set_bool(Ctx *c, uint32_t hash, int value) {
+    const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+    if (!mgr) return 0;
+    const uint64_t table = recomp_load64(c, mgr + 32);
+    const uint32_t size = recomp_load32(c, mgr + 44);
+    if (!table || !size) return 0;
+    for (uint32_t probe = 0, slot = hash % size; probe < size; probe++, slot = (slot + 1) % size) {
+        const uint32_t key = recomp_load32(c, table + slot * 8ULL);
+        if (!key) return 0;
+        if (key != hash) continue;
+        const uint32_t index = recomp_load32(c, table + slot * 8ULL + 4), count = recomp_load32(c, mgr + 16);
+        if (index >= count) return 0;
+        recomp_store8(c, recomp_load64(c, mgr + 24) + index * 24ULL + 22, value ? 1 : 0);
+        return 1;
+    }
+    return 0;
+}
+
+/* Age toggle: flips Sequence_IsChildhood (what the Temple of Time event sets) and reloads the current map, or the
+   Market when this map is not in oot_destinations, through the teleport so the other age's map and Link load. */
+static void oot_toggle_age(Ctx *c, uint64_t actor) {
+    int child = 1;
+    if (!oot_gamedata_bool(c, 0xcea220d3u, &child)) {
+        hos_log("cheats: age toggle: Sequence_IsChildhood not found");
+        return;
+    }
+    char current[80];
+    oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
+    unsigned target = 3;   /* Market (the Temple of Time is in it) */
+    for (unsigned i = 0; i < sizeof oot_destinations / sizeof oot_destinations[0]; i++) {
+        const OotDestination *d = &oot_destinations[i];
+        const char *other = child ? d->adult_banc : d->child_banc;
+        if (other && ((d->child_banc && !strcmp(d->child_banc, current)) || (d->adult_banc && !strcmp(d->adult_banc, current)))) {
+            target = i;
+            break;
+        }
+    }
+    if (!oot_gamedata_set_bool(c, 0xcea220d3u, !child)) {
+        hos_log("cheats: age toggle: could not write Sequence_IsChildhood");
+        return;
+    }
+    hos_log("cheats: age toggle: %s -> %s, reloading via destination %u (current map \"%s\")",
+            child ? "child" : "adult", child ? "adult" : "child", target, current);
+    if (!oot_teleport(c, actor, target)) {
+        oot_gamedata_set_bool(c, 0xcea220d3u, child);
+        hos_log("cheats: age toggle undone, the map change was not requested");
+    }
+}
+
+static void oot_teleport_followup(Ctx *c) {
+    if (!teleport.check_at || hos_now_ns() < teleport.check_at) return;
+    teleport.check_at = 0;
+    char next[80], current[80];
+    oot_gamedata_string(c, 0xee27bf71u, next, sizeof next);     /* Sequence_ReservedNextBanc */
+    oot_gamedata_string(c, 0x1d6189dau, current, sizeof current);   /* Sequence_CurrentBanc */
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    hos_log("cheats: teleport check: reserved \"%s\", current \"%s\", event playing %d", next, current,
+            events && recomp_load64(c, events + 104) ? 1 : 0);
 }
 
 static uint64_t oot_gameplay_view(Ctx *c) {
@@ -480,8 +891,17 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     __atomic_store_n(&flight_player_seen, now, __ATOMIC_RELAXED);
     if (marked_actor != actor || now - last_player_tick > 2000000000LL) marked_controller = 0;
     last_player_tick = now;
-    const int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
-    if (action >= 200) {
+    int action = rx_option(HOS_OPT_CHEAT_ACTION, 0);
+    if (!action) action = __atomic_exchange_n(&hos_oot_live_action, 0, __ATOMIC_RELAXED);
+    oot_teleport_followup(c);
+    oot_inventory_refresh(c, now);
+    if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
+        oot_inventory_edit(c, action);
+    } else if (action == OOT_AGE_ACTION) {
+        oot_toggle_age(c, actor);
+    } else if (action >= OOT_TELEPORT_ACTION) {
+        oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
+    } else if (action >= 200) {
         oot_edit_pouch(c, action);
     } else if (action >= 100 && action < 124) {
         oot_set_time(c, action - 100);
