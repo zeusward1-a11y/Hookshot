@@ -20,6 +20,7 @@ def main():
     source=(ROOT/'gpu/vk/vk_memory.cpp').read_text(encoding='utf-8')
     guard=source[source.index('bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {'):source.index('    p.lo = lo;',source.index('bool import_pool('))]
     lookup=block(source,'Pool* pool_lookup(uint64_t guest, uint64_t size) {')
+    chunking=source[source.index('uint64_t import_chunk() {'):source.index('Pool* pool_lookup(uint64_t guest, uint64_t size) {')]
     cache=block(source,'Pool* pool_of(uint64_t guest, uint64_t size) {')
     prefetch=block(source,'void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {')
     fixture='''#include <algorithm>
@@ -56,7 +57,7 @@ void import_remember_failure(uint64_t, uint64_t) {}
 '''+guard+'''
     p.lo=lo;p.hi=hi;imports++;return true;
 }
-'''+prefetch+'\n'+lookup+'\n'+cache+'''
+'''+prefetch+'\n'+chunking+'\n'+lookup+'\n'+cache+'''
 int check_prefetch(int mode) {
     const uint64_t base=0x1000000000ull,chunk=16ull<<20;
     guest_pools.push_back({base,base+8*chunk});
@@ -96,6 +97,18 @@ int main(int argc,char **argv) {
         CHECK(pool_lookup(address+100,64)==p && imports==1);
         p=pool_lookup(expected+4*chunk+123,64);CHECK(p && p->lo==expected+4*chunk && p->hi==expected+5*chunk && imports==2);
         p=pool_lookup(expected+chunk-16,64);CHECK(p && p->lo==expected && p->hi==expected+2*chunk && retires==1);
+        if(chunk==(16ull<<20)) {
+            // a game pool across a chunk's end: its first binding imports both chunks (span_game_pools)
+            const uint64_t far=base+0x40000000ull,far2=base+0x50000000ull;
+            guest_pools.push_back({far+chunk-4096,far+chunk+4096});
+            guest_pools.push_back({far2+chunk-4096,far2+chunk+4096});
+            p=pool_lookup(far+chunk-64,32);CHECK(p && p->lo==far && p->hi==far+2*chunk);
+            CHECK(pool_lookup(far+chunk+64,32)==p);   // (the binding across the end: no import again)
+            // a spanned import that fails (past the device's limit here) is made again without the span
+            const uint64_t limit=max_import_size;max_import_size=chunk;
+            p=pool_lookup(far2+chunk-64,32);CHECK(p && p->lo==far2 && p->hi==far2+chunk);
+            max_import_size=limit;
+        }
     }
     const int before=imports;
     CHECK(!pool_lookup(base+extent+1,1));
