@@ -52,6 +52,7 @@ ARGS = {
     "nx2/test_draw_parameters.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_coop_spirv.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_spirv_struct_identity.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
+    "tests/test_astc_bc_policy.py": ["--cxx", "g++"],
 }
 
 # Python packages some tests import (CI installs them; the runner itself needs none)
