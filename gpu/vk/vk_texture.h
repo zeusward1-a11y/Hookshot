@@ -117,7 +117,8 @@ uint64_t texture_segment();
 /// A parallel replay's segments, in queue order: each one's init command buffer (begun; submitted right before its
 /// uploads). A new image's first layout change (UNDEFINED -> GENERAL, and its clear) that a segment's worker makes goes
 /// to the earliest segment's still being recorded, not to the maker's own uploads: a segment before the maker's that
-/// uses it is submitted first, and found it UNDEFINED (VUID-vkCmdDraw-None-09600 with RX_VK_PARALLEL only)
+/// uses it is submitted first, and found it UNDEFINED (VUID-vkCmdDraw-None-09600 with RX_VK_PARALLEL only). A null one: that
+/// segment has none (it could not be begun) and is passed over; with none open, the maker's uploads take it, as before
 void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n);
 /// This thread records segment `index` of them (-1: none, after it)
 void texture_segment_worker(int index);

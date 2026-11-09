@@ -1410,16 +1410,21 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandPool(dev.device, j->r->upload_pool, 0);
         vkBeginCommandBuffer(j->r->upload, &bi);
-        vkResetCommandPool(dev.device, j->r->init_pool, 0);
-        vkBeginCommandBuffer(j->r->init, &bi);
         j->g = seg[k];
         j->order = base + k;
         j->index = (int)k;
         jobs.push_back(std::move(j));
     }
-    {
+    {   // (each one's init command buffer, begun. One that cannot be leaves the segment's new images to its uploads, as before)
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         std::vector<VkCommandBuffer> inits;
-        for (auto& jp : jobs) inits.push_back(jp->r->init);
+        for (auto& jp : jobs) {
+            VkCommandBuffer c = jp->r->init;
+            if (!c || vkResetCommandPool(dev.device, jp->r->init_pool, 0) != VK_SUCCESS || vkBeginCommandBuffer(c, &bi) != VK_SUCCESS)
+                c = VK_NULL_HANDLE;
+            inits.push_back(c);
+        }
         texture_segments_begin(inits.data(), inits.size());
     }
     const auto t_seg0 = std::chrono::steady_clock::now();
@@ -3533,6 +3538,36 @@ void register_sampler_queued(int id, const nvn_samp_par* p) {
 uint64_t fence() { return async_on() || sync_waits_on() ? q_values.load() : pushed.load(); }
 uint64_t get_pushed() { return fence(); }
 
+// (a parallel replay's segments) each recording's init command pool and buffer: made with RX_VK_PARALLEL only (par_threads
+// is the process's), last in replay_start, which runs once a process. All or none: a failure gives back what was made and
+// the start fails, as with the recordings' other pools. Kept as long as the device, like those
+void init_pools_destroy() {
+    for (Recording& r : recordings) {
+        if (r.init_pool) vkDestroyCommandPool(dev.device, r.init_pool, nullptr);   // (its command buffer with it)
+        r.init_pool = VK_NULL_HANDLE, r.init = VK_NULL_HANDLE;
+    }
+}
+bool init_pools_make(const VkCommandPoolCreateInfo& pi) {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    for (Recording& r : recordings) {
+        VkCommandPool pool = VK_NULL_HANDLE;   // (the outputs are kept only on success)
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        if (vkCreateCommandPool(dev.device, &pi, nullptr, &pool) != VK_SUCCESS) {
+            init_pools_destroy();
+            return false;
+        }
+        r.init_pool = ai.commandPool = pool;
+        if (vkAllocateCommandBuffers(dev.device, &ai, &cb) != VK_SUCCESS) {
+            init_pools_destroy();
+            return false;
+        }
+        r.init = cb;
+    }
+    return true;
+}
+
 } // namespace
 
 bool replay_start() {
@@ -3563,9 +3598,6 @@ bool replay_start() {
         vkAllocateCommandBuffers(dev.device, &ai, &r.cmd);
         ai.commandPool = r.upload_pool;
         vkAllocateCommandBuffers(dev.device, &ai, &r.upload);
-        if (vkCreateCommandPool(dev.device, &pi, nullptr, &r.init_pool) != VK_SUCCESS) return false;
-        ai.commandPool = r.init_pool;
-        vkAllocateCommandBuffers(dev.device, &ai, &r.init);
     }
     ai.commandBufferCount = 1;
     for (Frame& f : frames) {
@@ -3578,6 +3610,7 @@ bool replay_start() {
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         vkCreateSemaphore(dev.device, &si, nullptr, &f.acquired);
     }
+    if (par_threads() >= 2 && !init_pools_make(pi)) return false;   // (last: nothing after it fails and leaves them made)
     logf("vk: replay ready (%s; push descriptors %s (%u), extended dynamic state 3 %s, custom border colours %s)",
          dev.offscreen ? "offscreen" : "window", dev.push_descriptor ? "yes" : "no", dev.max_push_descriptors,
          dev.eds3_blend ? "yes" : "no", dev.custom_border_color ? "yes" : "no");
