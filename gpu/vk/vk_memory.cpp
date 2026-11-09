@@ -609,15 +609,22 @@ void stamp_page(uint64_t p, uint32_t g) {
 } // namespace
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
-bool capture_owns(uint64_t guest);
+const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
 void memory_collect_written() {
     uint32_t* pages = nullptr;
     const int64_t n = host->collect_written(&pages);
     if (n > 0) {
         const uint32_t g = ++gen_now;
+        // (the captured ranges once a call: a lock, a pool-list refresh and three searches for every dirty page cost the
+        // replay thousands of lock cycles a submit, the cost that retired gpu_pages' lock below)
+        const auto& owned = capture_ranges_merged();
+        const auto in_capture = [&owned](uint64_t guest) {
+            auto it = std::upper_bound(owned.begin(), owned.end(), std::make_pair(guest, ~uint64_t(0)));
+            return it != owned.begin() && guest < std::prev(it)->second;
+        };
         for (int64_t i = 0; i < n; i++) {
             const uint64_t guest = (uint64_t)pages[i] << kPageShift;
-            if (capture_owns(guest)) {   // (written after its submit's capture: the next capture takes it, as it is then)
+            if (!owned.empty() && in_capture(guest)) {   // (written after its submit's capture: the next capture takes it, as it is then)
                 uint64_t avail = 0;
                 if (const uint8_t* q = host->gpu_ptr(guest, &avail)) host->mark_written(q, 4096);
                 continue;
@@ -1410,17 +1417,34 @@ std::unique_ptr<Capture> capture_make() {
     return c;
 }
 
-bool capture_owns(uint64_t guest) {
+/// The ranges the captures take (the mirrored pools, the texture storage, the small pools): their union, sorted and
+/// merged, as of now; empty while no capture was made (memory_collect_written: a page in them written after its
+/// submit's capture is left for the next capture). Built again only when one of the three lists changed, as
+/// capture_make keeps its own union; the reference is the calling thread's until its next call
+const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
+    static const std::vector<std::pair<uint64_t, uint64_t>> none;
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> merged;
+    static thread_local uint64_t ver = ~uint64_t(0);
     // (no capture is ever made without the replay thread (RX_VK_ASYNC=0): the mirrored pools' writes were left for one
     // that never came, and the pools kept their first contents: a grey world)
-    if (!capture_on() || !captures_seen.load(std::memory_order_relaxed)) return false;
+    if (!capture_on() || !captures_seen.load(std::memory_order_relaxed)) return none;
     std::lock_guard lk(cap_ranges_mu);
     refresh_pool_ranges_locked();   // (a pool made since the last capture: the next one takes its pages, not this)
-    auto in = [guest](const std::vector<std::pair<uint64_t, uint64_t>>& v) {
-        auto it = std::upper_bound(v.begin(), v.end(), std::make_pair(guest, ~uint64_t(0)));
-        return it != v.begin() && guest < std::prev(it)->second;
-    };
-    return in(cap_ranges) || in(tex_cap_ranges) || in(pool_cap_ranges);
+    if (ver != cap_ranges_ver) {
+        ver = cap_ranges_ver;
+        std::vector<std::pair<uint64_t, uint64_t>> all = cap_ranges;
+        all.insert(all.end(), tex_cap_ranges.begin(), tex_cap_ranges.end());
+        all.insert(all.end(), pool_cap_ranges.begin(), pool_cap_ranges.end());
+        std::sort(all.begin(), all.end());
+        merged.clear();
+        for (const auto& r : all) {
+            if (!merged.empty() && r.first <= merged.back().second)
+                merged.back().second = std::max(merged.back().second, r.second);
+            else
+                merged.push_back(r);
+        }
+    }
+    return merged;
 }
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
