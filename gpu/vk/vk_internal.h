@@ -231,6 +231,7 @@ void precompile_run(void (*progress)(size_t done, size_t total));
 bool prepare_run(void (*progress)(size_t done, size_t total), bool background);
 bool prepare_is_update();
 void prepare_background();
+void state_list_run();                        // (an update: the state list's pipelines noted before precompile_run)
 void predict_run(void (*progress)(size_t done, size_t total));   // (after a prepare_run that prepared: the notes' predictions)
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 
