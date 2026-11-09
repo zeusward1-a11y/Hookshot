@@ -28,6 +28,7 @@ OS = "windows" if WINDOWS else "linux"
 ARGS = {
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
+    "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
     "tests/test_layout_failures.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
