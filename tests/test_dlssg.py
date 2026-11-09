@@ -128,8 +128,8 @@ def check_sources():
 
     # (the shader caches' stamp hashes vk_api.h, nx2/build.py: no new renderer table entry, the caches stay valid)
     api = read("gpu/vk/vk_api.h")
-    # (version 6 is the official one since #785; DLSS-G adds no entry of its own)
-    need("frame_start" not in api and "#define MKWVK_API_VERSION 6" in api, "vk_api.h changed: the shader caches would be thrown away")
+    # (version 7 is the official one since #946, the menu's mouse; DLSS-G adds no entry of its own)
+    need("frame_start" not in api and "#define MKWVK_API_VERSION 7" in api, "vk_api.h changed: the shader caches would be thrown away")
 
     # (the review's follow-ups)
     swap = code(block(main, "bool create_swapchain("))
@@ -170,7 +170,8 @@ def check_sources():
     menu = read("gpu/vk/vk_menu.cpp")
     need('"DLSS Frame Generation", &opts.dlssg, 0, 4, 1, tx_dlssg' in menu, "no DLSS Frame Generation row")
     need('dlssg::parse_multiplier(getenv("RX_DLSSG")' in menu, "RX_DLSSG does not set the row")
-    need("dlssg::menu_step(*r.value, press[4])" in menu, "the row does not step Off, 2x, 3x, 4x")
+    # (set_row: the keys' and the mouse's changes alike since #946)
+    need("dlssg::menu_step(*r.value, dir > 0)" in block(menu, "void set_row("), "the row does not step Off, 2x, 3x, 4x")
     return failures
 
 
