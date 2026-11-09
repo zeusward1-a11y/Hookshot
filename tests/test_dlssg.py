@@ -128,7 +128,8 @@ def check_sources():
 
     # (the shader caches' stamp hashes vk_api.h, nx2/build.py: no new renderer table entry, the caches stay valid)
     api = read("gpu/vk/vk_api.h")
-    need("frame_start" not in api and "#define MKWVK_API_VERSION 4" in api, "vk_api.h changed: the shader caches would be thrown away")
+    # (version 6 is the official one since #785; DLSS-G adds no entry of its own)
+    need("frame_start" not in api and "#define MKWVK_API_VERSION 6" in api, "vk_api.h changed: the shader caches would be thrown away")
 
     # (the review's follow-ups)
     swap = code(block(main, "bool create_swapchain("))
