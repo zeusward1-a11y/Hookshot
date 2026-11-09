@@ -48,6 +48,7 @@
 #include "host_shaders/bc_encoder_comp_spv.h"
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
+#include "keep_rendered.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -3071,8 +3072,11 @@ void texture_frame(uint64_t completed) {
         static const bool evict_rendered = getenv("RX_VK_EVICT_RENDERED") != nullptr;
         // (one unused for 3600 presents (a minute) goes: a course left behind; the game draws it again when it comes
         // back to that course. Without it a course change kept 1.4 GB arrays and VRAM ran over)
-        // (600 presents when the process is over what the driver allows: then the driver pages VRAM to system memory)
-        const uint64_t keep_rendered = known && used > allowed ? 600 : 3600;
+        // (600 presents near what the driver allows, at the budget's 97%: past it the driver pages VRAM to system memory.
+        // AMD's driver reports the use at most at what it allows, so "over it" never held there: keep_rendered.h.
+        // RX_VK_KEEP_RENDERED_OVER=1: only past what it allows, as before)
+        static const bool keep_over_only = getenv("RX_VK_KEEP_RENDERED_OVER") != nullptr;
+        const uint64_t keep_rendered = keep_rendered::presents(known, used, allowed, keep_over_only);
         const bool overwritten = drawn_over(tex);   // (above)
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
