@@ -2660,19 +2660,19 @@ uint64_t texture_segment() {
 void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n) {
     std::lock_guard lk(seg_init_mu);
     seg_inits.assign(n, SegInit{});
-    for (size_t i = 0; i < n; i++) seg_inits[i].cmd = init_cmds[i], seg_inits[i].open = init_cmds[i] != VK_NULL_HANDLE;
+    for (size_t i = 0; i < n; i++) seg_inits[i].cmd = init_cmds[i], seg_inits[i].open = true;
 }
 void texture_segment_worker(int index) {
     tl_seg_index = index;
 }
-bool texture_segment_end(int index) {
+int texture_segment_end(int index) {
     std::lock_guard lk(seg_init_mu);
-    if (index < 0 || index >= (int)seg_inits.size()) return false;
+    if (index < 0 || index >= (int)seg_inits.size()) return 0;
     SegInit& s = seg_inits[index];
     s.open = false;   // (no new image's change goes to it from here: it is ended)
-    if (!s.cmd) return false;   // (not begun)
     if (s.used) full_barrier(s.cmd);   // (before its uploads and its commands)
-    return vkEndCommandBuffer(s.cmd) == VK_SUCCESS && s.used;   // (one that could not be ended is not submitted)
+    if (vkEndCommandBuffer(s.cmd) != VK_SUCCESS) return s.used ? -1 : 0;
+    return s.used ? 1 : 0;
 }
 bool texture_marked(const Texture* tex) {
     return !tex || (tex->gpu_written && !tex->released && tex->uploaded && tex->owned_frame == frame_no &&

@@ -5,7 +5,8 @@
 // queue order, the image layouts tracked as the GPU would see them. The workers run on threads of their own: one after
 // another in the order a case sets (the one that makes an image first need not be the first segment in the queue), or
 // all at once, held at fixed points by latches (a worker waits for another to be inside its init recording, or for an
-// earlier segment's submit).
+// earlier segment's submit). A command buffer can be made to fail its begin or its end; replay_handle's part after the
+// segments (begin_recording) is modelled as a recording of its own.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
 #include <atomic>
@@ -88,7 +89,7 @@ void vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage i, VkImageLayout, c
 VkResult vkResetCommandPool(VkDevice, VkCommandPool, VkCommandPoolResetFlags) {
     return VK_SUCCESS;
 }
-std::string fail_begin;   // (init_begin_fail: this command buffer cannot be begun)
+std::string fail_begin, fail_end;   // (this command buffer cannot be begun / ended)
 VkResult vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo*) {
     CHECK(cb);
     if (cb->name == fail_begin) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -97,6 +98,7 @@ VkResult vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo
 }
 VkResult vkEndCommandBuffer(VkCommandBuffer cb) {
     CHECK(cb && cb->begun && !cb->ended);
+    if (cb->name == fail_end) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     cb->ended = true;
     return VK_SUCCESS;
 }
@@ -147,7 +149,17 @@ void vkDestroyCommandPool(VkDevice, VkCommandPool p, const VkAllocationCallbacks
 }
 
 namespace mkwvk {
-void logf(const char*, ...) {}
+std::mutex log_mu;
+std::string log_text;
+void logf(const char* f, ...) {
+    char line[512];
+    va_list a;
+    va_start(a, f);
+    std::vsnprintf(line, sizeof line, f, a);
+    va_end(a);
+    std::lock_guard l(log_mu);
+    log_text += std::string(line) + "\n";
+}
 void full_barrier(VkCommandBuffer cmd, const char* = "") {
     record(cmd, 'F');
 }
@@ -212,9 +224,15 @@ struct Segment {
     // x / z: wait for latch x (a worker inside the texture's initialization) / z (segment 0 submitted),
     // L: the initialization holds the segments' init lock (seg_init_mu) while it records; then latch y lets it go on
     std::string script;
+    const uint8_t* end = nullptr;   // (kStop: to the command buffer's end, every segment's commands in order)
 };
+const uint8_t* const kStop = reinterpret_cast<const uint8_t*>("stop");
+const std::vector<Segment>* cur_segs;
 void record_segment(VkCommandBuffer& cmd, const Segment& g) {
-    for (char a : g.script) {
+    std::string script = g.script;
+    if (g.end == kStop)
+        for (size_t k = 1; k < cur_segs->size(); k++) script += (*cur_segs)[k].script;
+    for (char a : script) {
         if (a == 't') texture_use(), record(cmd, 'U', kTex);
         if (a == 's' || a == 'S') scratch_use(a == 'S');
         if (a == 'x' || a == 'z') latch[(int)a].wait();
@@ -242,6 +260,7 @@ std::atomic<int64_t> par_lock_wait_ns{0}, par_locks{0};
 std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;
+bool jobs_started;
 struct RunJobs {
     void notify_all();
 };
@@ -253,6 +272,7 @@ struct {
     std::condition_variable done;
 } par_pool;
 void RunJobs::notify_all() {
+    jobs_started = true;
     std::vector<std::function<void()>> jobs;
     {
         std::lock_guard lk(par_pool.mu);
@@ -289,10 +309,42 @@ Recording& begin_segment_recording(uint64_t) {
     r.value = 100 + k, r.slot = k;
     return r;
 }
+// (replay_handle's part after the segments: the replay thread's next recording, submitted later as [its uploads, it])
+Recording post;
+Recording* rec_cur = nullptr;
+int rec_parts = 0;
+Recording& begin_recording(uint64_t value) {
+    post.cmd = make_cb("post", 0), post.upload = make_cb("postupload", 0);
+    vkBeginCommandBuffer(post.cmd, nullptr);
+    vkBeginCommandBuffer(post.upload, nullptr);
+    post.value = value;
+    texture_begin_recording(post.upload, value);
+    draw_begin_recording(post.slot, post.cmd, value);
+    return post;
+}
+void submit_post() {
+    VkCommandBufferSubmitInfo cb[2]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+    uint32_t n = 0;
+    if (texture_uploads_recorded()) cb[n++].commandBuffer = post.upload;
+    cb[n++].commandBuffer = post.cmd;
+    vkEndCommandBuffer(post.upload);
+    vkEndCommandBuffer(post.cmd);
+    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = n, si.pCommandBufferInfos = cb;
+    vkQueueSubmit2(VK_NULL_HANDLE, 1, &si, VK_NULL_HANDLE);
+}
+/// replay_handle from its segments on (the dry pass, the part before and the slots' order are the caller's)
 void submit_segments(std::vector<Segment> seg, std::vector<int> order) {
     run_order = order;
+    cur_segs = &seg;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    const uint8_t* const stop = kStop;
+    uint64_t seq = 10;
     const uint64_t base = 1;
+    [&]() -> const uint8_t* {
 #include "init_jobs.inc"
+        return nullptr;
+    }();
     for (auto& w : workers) w.join();
 }
 #include "init_pools.inc"
@@ -303,11 +355,14 @@ std::string ops_text(const VkCommandBuffer_T* cb) {
     for (const Op& o : cb->ops) s += std::string(s.empty() ? "" : " ") + o.kind + (o.image ? image_name(o.image) : "");
     return s;
 }
-/// The submitted command buffers in queue order: each image has one UNDEFINED -> GENERAL change, before every use
-void play(const char* name) {
+std::string queue_text() {
     std::string order;
     for (auto* cb : queue) order += " " + cb->name + "[" + ops_text(cb) + "]";
-    std::printf("%s: queue%s\n", name, order.c_str());
+    return order;
+}
+/// The submitted command buffers in queue order: each image has one UNDEFINED -> GENERAL change, before every use
+void play(const char* name) {
+    std::printf("%s: queue%s\n", name, queue_text().c_str());
     std::map<VkImage, int> made, early;
     for (auto* cb : queue)
         for (const Op& o : cb->ops) {
@@ -392,12 +447,37 @@ int main(int argc, char** argv) {
         play(c.c_str());
         if (named("init_0") && !named("init_0")->ops.empty())
             std::printf("  FAIL: init_0 (submitted) was recorded into\n"), failures++;
-    } else if (c == "init_begin_fail") {   // (segment 0's init command buffer cannot be begun: its new images go to its uploads)
-        fail_begin = "init_0";
-        submit_segments({{"t"}, {"t"}}, {0, 1});
+    } else if (c == "init_begin_fail") {   // (segment 1's init command buffer cannot be begun: no worker starts, and the
+                                           // whole command buffer is recorded in order on the replay thread, after the segments)
+#if HAVE_SEG_INIT
+        fail_begin = "init_1";
+        submit_segments({{"-"}, {"t"}, {"t"}}, {0, 2, 1});
+        if (jobs_started) std::printf("  FAIL: a segment's worker started\n"), failures++;
+        submit_post();
         play(c.c_str());
-        if (init_of(kTex) != "upload_0")
-            std::printf("  FAIL: the texture's initialization is in %s, not upload_0\n", init_of(kTex).c_str()), failures++;
+        for (auto* cb : queue)
+            if (cb->name.rfind("post", 0) != 0) std::printf("  FAIL: segment command buffer %s submitted\n", cb->name.c_str()), failures++;
+        if (init_of(kTex) != "postupload_0")
+            std::printf("  FAIL: the texture's initialization is in %s, not postupload_0\n", init_of(kTex).c_str()), failures++;
+        if (!named("post_0") || ops_text(named("post_0")) != "F Ut Ut") std::printf("  FAIL: not every segment's draw was recorded\n"), failures++;
+#else
+        std::printf("init_begin_fail: no init command buffers in this code\n");
+#endif
+    } else if (c == "init_end_fail") {   // (segment 1's init command buffer, which holds the texture's initialization, cannot be
+                                         // ended: segment 0 is submitted, segments 1 and 2 (which use the texture) are not)
+#if HAVE_SEG_INIT
+        fail_end = "init_1";
+        submit_segments({{"-"}, {"t"}, {"t"}}, {0, 2, 1});
+        std::printf("%s: queue%s\n", c.c_str(), queue_text().c_str());
+        if (queue.size() != 1 || queue[0]->name != "cmd_0") std::printf("  FAIL: want only cmd_0 submitted\n"), failures++;
+        for (auto* cb : queue)
+            for (const Op& o : cb->ops)
+                if (o.image == kTex)
+                    std::printf("  FAIL: %s, submitted, uses the texture whose initialization was lost\n", cb->name.c_str()), failures++;
+        if (log_text.find("could not be ended") == std::string::npos) std::printf("  FAIL: the failure was not logged\n"), failures++;
+#else
+        std::printf("init_end_fail: no init command buffers in this code\n");
+#endif
     } else if (c == "alloc_fail") {   // (init_pools_make: each of its pool creations and allocations failing in turn)
 #if HAVE_INIT_POOLS
         const int n = (int)(sizeof(recordings) / sizeof(recordings[0]));

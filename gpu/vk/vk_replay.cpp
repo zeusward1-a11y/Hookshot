@@ -1400,7 +1400,8 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         uint64_t order;
         int index = 0;
         std::atomic<bool> done{false};
-        bool uploads = false, inits = false;
+        bool uploads = false;
+        int inits = 0;   // (texture_segment_end's)
     };
     std::vector<std::unique_ptr<Job>> jobs;
     for (size_t k = 0; k < seg.size(); k++) {
@@ -1415,18 +1416,35 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         j->index = (int)k;
         jobs.push_back(std::move(j));
     }
-    {   // (each one's init command buffer, begun. One that cannot be leaves the segment's new images to its uploads, as before)
+    std::vector<VkCommandBuffer> inits;   // (each one's init command buffer, begun)
+    {
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        std::vector<VkCommandBuffer> inits;
-        for (auto& jp : jobs) {
-            VkCommandBuffer c = jp->r->init;
-            if (!c || vkResetCommandPool(dev.device, jp->r->init_pool, 0) != VK_SUCCESS || vkBeginCommandBuffer(c, &bi) != VK_SUCCESS)
-                c = VK_NULL_HANDLE;
-            inits.push_back(c);
-        }
-        texture_segments_begin(inits.data(), inits.size());
+        for (auto& jp : jobs)
+            if (jp->r->init && vkResetCommandPool(dev.device, jp->r->init_pool, 0) == VK_SUCCESS &&
+                vkBeginCommandBuffer(jp->r->init, &bi) == VK_SUCCESS)
+                inits.push_back(jp->r->init);
+            else
+                break;
     }
+    if (inits.size() != jobs.size()) {
+        // (one could not be begun: no worker has started, and the segments are not recorded. The whole command buffer is
+        // recorded here as one segment, as a short one is, into what follows (the post-part as below): its new images are
+        // made in queue order. The segments' recordings go unsubmitted; their slots come round again as unused ones)
+        static int told;
+        if (told++ < 8) logf("vk: parallel replay: a segment's init command buffer could not be begun: recorded on the replay thread");
+        texture_set_segment(++seq);
+        Recording& rest = begin_recording(rec_cur_value);
+        full_barrier(rest.cmd);
+        rec_cur = &rest;
+        cmd = rest.cmd;
+        rec_parts++;
+        Segment whole = seg[0];
+        whole.end = stop;
+        record_segment(cmd, whole);
+        return stop;
+    }
+    texture_segments_begin(inits.data(), inits.size());
     const auto t_seg0 = std::chrono::steady_clock::now();
     const int64_t wait0 = par_lock_wait_ns.load(), locks0 = par_locks.load();
     par_active = true;
@@ -1458,16 +1476,23 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         }
     }
     par_pool.cv.notify_all();
+    bool init_lost = false;
     for (auto& jp : jobs) {   // (in order, each as soon as it is done)
         Job* j = jp.get();
         {
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
         }
+        if (j->inits < 0 && !init_lost) {   // (its init command buffer could not be ended: new images' first changes lost.
+            init_lost = true;               // Only it and the segments after it can use those images: as a failed submit)
+            logf("vk: segment %llu: its init command buffer could not be ended: it and the segments after it are not submitted",
+                 (unsigned long long)j->r->value);
+        }
+        if (init_lost) continue;
         VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
         uint32_t n = 0;
-        if (j->inits) cb[n++].commandBuffer = j->r->init;   // (new images made in it or after it: first in the queue)
+        if (j->inits > 0) cb[n++].commandBuffer = j->r->init;   // (new images made in it or after it: first in the queue)
         if (j->uploads) cb[n++].commandBuffer = j->r->upload;
         cb[n++].commandBuffer = j->r->cmd;
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};

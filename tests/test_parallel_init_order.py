@@ -13,8 +13,9 @@ of an image must come after its one UNDEFINED -> GENERAL change, and the serial 
 as before. Some cases run the segments' workers one after another in a set order (a later segment makes the image, an
 earlier one uses it; the BC3 scratch and its second one); others run them at once, held at fixed points: a worker closes
 its segment while another records into that segment's init command buffer, a worker makes an image after an earlier
-segment was submitted, and a segment's init command buffer cannot be begun. The init pools' startup (init_pools_make)
-is run with each pool creation and allocation failing in turn.
+segment was submitted. When a segment's init command buffer cannot be begun, no worker may start and the whole command
+buffer is recorded in order on the replay thread; when one cannot be ended, neither its segment nor any later one is
+submitted. The init pools' startup (init_pools_make) is run with each pool creation and allocation failing in turn.
 
 python -I -B tests/test_parallel_init_order.py --cxx clang++ --headers path/to/Vulkan-Headers/include
 """
@@ -28,7 +29,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("later_makes", "three", "scratch", "scratch2", "in_order", "serial", "close_race", "after_submit", "init_begin_fail",
-         "alloc_fail")
+         "init_end_fail", "alloc_fail")
 
 
 def block(source, marker):
@@ -72,7 +73,7 @@ def main():
     hooks = [block(texture, m) for m in (
         "void texture_set_segment(uint64_t seg) {", "void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {",
         "bool texture_uploads_recorded() {")]
-    hooks += [block(texture, m) for m in ("void texture_segments_begin(", "void texture_segment_worker(", "bool texture_segment_end(")
+    hooks += [block(texture, m) for m in ("void texture_segments_begin(", "void texture_segment_worker(", "int texture_segment_end(")
               if m in texture]
     have_pools = "bool init_pools_make(" in replay
     if have_pools:   # (the last fallible step of replay_start: no later failure returns with them made)
