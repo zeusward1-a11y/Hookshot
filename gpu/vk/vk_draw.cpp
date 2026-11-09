@@ -1818,6 +1818,7 @@ bool log_img_wanted(uint64_t key) {   // (hookshot) RX_VK_LOG_IMG=<key prefix,..
 
 VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, VkFormat storage_as = VK_FORMAT_UNDEFINED,
                             Texture** tex_out = nullptr, uint32_t* level_out = nullptr) {
+    auto& handle_hits = ::mkwvk::handle_hits;   // (the thread-local once: see bind_descriptors)
     const uint32_t version = texture_slot_version((int)(handle & 0xFFFFF));
     const uint64_t dgen = texture_destroy_generation();
     const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
@@ -2146,6 +2147,8 @@ bool table_track_open(int logged, int seen, int unlimited) {
 }
 
 void build_descriptors(const NvnState& s, const Program& p) {
+    DescWriter& dw = ::mkwvk::dw;   // (the thread-locals once: see bind_descriptors)
+    std::vector<const Texture*>& draw_sampled = ::mkwvk::draw_sampled;
     dw.reset();
     draw_sampled.clear();
     dump_written.clear();
@@ -2607,6 +2610,9 @@ int words_same_store(const VkWriteDescriptorSet& w, uint64_t* o, const uint64_t*
 }
 
 bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p) {
+    // (the thread-locals once: llvm-mingw calls the file's TLS init check at every use of one with a constructor, ~2.4%
+    // of the replay thread on a 3900X, 11-08)
+    DescWriter& dw = ::mkwvk::dw;
     if (dw.writes.empty()) return true;
     Pushed& ps = pushed[bp == VK_PIPELINE_BIND_POINT_COMPUTE];
     if (p.push) {
