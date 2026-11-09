@@ -1125,6 +1125,13 @@ def main(a=None):
     # changed; the builder says how much stays and lets it go. Kept in a development checkout)
     if os.path.normcase(work) != os.path.normcase(os.path.abspath(os.path.join(ROOT, "work"))):
         shutil.rmtree(exefs, ignore_errors=True)
+        # (players asked for the space back: the translated code and the compiled objects (4 GB and more) go too once the game is
+        # ready, on Windows and Linux alike. The next update translates and compiles again, about as long as a first build.
+        # HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, as before)
+        if os.environ.get("HOOKSHOT_KEEP_BUILD_FILES", "0") in ("", "0"):
+            for sub in ("sa", "objcache", "probe"):
+                shutil.rmtree(os.path.join(work, sub), ignore_errors=True)
+            print("the build files in %s were deleted (HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quicker updates)" % work, flush=True)
     total_seconds = time.time() - STARTED
     previous = record_times(work, run_files, compile_seconds, total_seconds, modules=plan[1],
                             kind="update" if a.update else "build")

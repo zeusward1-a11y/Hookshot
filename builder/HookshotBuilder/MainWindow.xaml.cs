@@ -623,7 +623,9 @@ public partial class MainWindow : Window
         if (WorkNote == null) return;
         var work = Storage.Work;
         WorkReset.Visibility = Storage.WorkChosen ? Visibility.Visible : Visibility.Collapsed;
-        WorkNote.Text = $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick. They can be freed after the build.";
+        WorkNote.Text = Storage.KeepBuildFiles
+            ? $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)}, kept in {work} so that updates are quick (HOOKSHOT_KEEP_BUILD_FILES)."
+            : $"Build files: about {Storage.Gb(Storage.BuildFilesBytes)} in {work} while it builds, deleted when the game is ready.";
         WorkNote.Foreground = (Brush)FindResource("InkSoft");
         try
         {
@@ -944,7 +946,7 @@ public partial class MainWindow : Window
         }
         if (Finder.ShortcutError != null) AddLog("shortcut not made: " + Finder.ShortcutError);
         ShowPage(ReadyPage);
-        _ = ShowStorageUse();
+        _ = FreeAfterBuild();
     }
 
     // (issue: 5 GB and more left in %LOCALAPPDATA% and never said. Said here, with the way to let it go)
@@ -961,6 +963,19 @@ public partial class MainWindow : Window
         FreeButton.IsEnabled = true;
         FreeButton.Content = "Free up space";
         StorageRow.Visibility = Visibility.Visible;
+    }
+
+    // (players asked for the space back: the build files (translated code, compiled objects), the setup's and updater's downloads and
+    // older builder versions go as soon as the game is ready. The next update then translates and compiles again (about as long as
+    // this build). HOOKSHOT_KEEP_BUILD_FILES=1 keeps them for quick updates, with the Free up space button as before)
+    async Task FreeAfterBuild()
+    {
+        if (!Storage.KeepBuildFiles)
+        {
+            var left = await Task.Run(Storage.Free);
+            if (left >= 100L << 20) AddLog($"build files: {Storage.Gb(left)} could not be deleted (a file in use); they go after the next build");
+        }
+        await ShowStorageUse();
     }
 
     async void FreeSpace(object sender, RoutedEventArgs e)

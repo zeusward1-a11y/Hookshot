@@ -16,6 +16,9 @@ static class Storage
     /// About what a build leaves in the build files folder (the translated code and its compiled objects): said before the build
     public const long BuildFilesBytes = 4L << 30;
 
+    /// HOOKSHOT_KEEP_BUILD_FILES=1: the build files stay after a build (quick updates); otherwise they go when the game is ready
+    public static bool KeepBuildFiles => Environment.GetEnvironmentVariable("HOOKSHOT_KEEP_BUILD_FILES") is { Length: > 0 } v && v != "0";
+
     /// Where builds keep their files: the folder the player chose (work.txt), else the builder's own
     public static string Work
     {
