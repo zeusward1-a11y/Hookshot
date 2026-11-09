@@ -1672,8 +1672,9 @@ uint64_t oldest_unfinished() {
 // its wait, a present or hold_ms; the release follows it. RX_VK_RELEASE_DRAIN=1: as before ----
 void do_texture_released(const nvn_tex* t);
 void do_program_released(const nvn_prog* p);
-std::vector<nvn_tex> held_tex_releases;    // (sync_order_mu)
-std::vector<nvn_prog> held_prog_releases;  // (sync_order_mu)
+std::mutex held_mu;   // (its own: sync_order_mu is held while whole submissions replay, and every release waited for them)
+std::vector<nvn_tex> held_tex_releases;    // (held_mu)
+std::vector<nvn_prog> held_prog_releases;  // (held_mu)
 std::atomic<int64_t> st_held_releases{0};
 bool hold_releases() {
     static const bool v = !getenv("RX_VK_RELEASE_DRAIN") || atoi(getenv("RX_VK_RELEASE_DRAIN")) == 0;
@@ -1684,11 +1685,14 @@ void update_blocked() {
     for (const auto& [queue, q] : qruns) n += q.blocked();
     if (n && !blocked_n.load()) blocked_since = std::chrono::steady_clock::now();
     blocked_n = n;
-    if (!n && (!held_tex_releases.empty() || !held_prog_releases.empty())) {   // (the stopped work has gone on: its releases now)
+    if (!n) {   // (the stopped work has gone on: its releases now)
         std::vector<nvn_tex> ts;
         std::vector<nvn_prog> ps;
-        ts.swap(held_tex_releases);
-        ps.swap(held_prog_releases);
+        {
+            std::lock_guard hl(held_mu);
+            ts.swap(held_tex_releases);
+            ps.swap(held_prog_releases);
+        }
         for (const nvn_tex& t : ts) do_texture_released(&t);
         for (const nvn_prog& p : ps) do_program_released(&p);
     }
@@ -3402,13 +3406,17 @@ void texture_released_of(const nvn_tex* t) {
     if (!t) return;
     tex_pages_add(t, -1);
     if (!async_on()) {
-        if (hold_releases() && sync_waits_on()) {   // (PR 430: after the stopped work that may use it, when it goes on)
-            std::lock_guard lk(sync_order_mu);
-            if (blocked_n.load()) {
+        // (PR 430: after the stopped work that may use it, when it goes on. The lock is held_mu, only while queues are
+        // stopped: sync_order_mu, taken on every release, made the thread finalizing textures (OptimizeChangeBank) wait for whole
+        // submissions being replayed under it, 45% of its time in Kokiri. A release just after the stopped work went on waits
+        // for the next update_blocked: the next submit or present)
+        if (hold_releases() && sync_waits_on() && blocked_n.load()) {
+            {
+                std::lock_guard hl(held_mu);
                 held_tex_releases.push_back(*t);
-                if (++st_held_releases % 2000 == 1) logf("vk: releases kept for stopped work: %lld", (long long)st_held_releases.load());
-                return;
             }
+            if (++st_held_releases % 2000 == 1) logf("vk: releases kept for stopped work: %lld", (long long)st_held_releases.load());
+            return;
         }
         sync_drain(1);   // (after the stopped work that may use it)
         return do_texture_released(t);
@@ -3420,13 +3428,13 @@ void texture_released_of(const nvn_tex* t) {
 void program_released_locked(const nvn_prog* p) {
     if (!p) return;
     if (!async_on()) {
-        if (hold_releases() && sync_waits_on()) {   // (PR 430: as texture releases)
-            std::lock_guard lk(sync_order_mu);
-            if (blocked_n.load()) {
+        if (hold_releases() && sync_waits_on() && blocked_n.load()) {   // (PR 430: as texture releases, on held_mu)
+            {
+                std::lock_guard hl(held_mu);
                 held_prog_releases.push_back(*p);
-                st_held_releases++;
-                return;
             }
+            st_held_releases++;
+            return;
         }
         sync_drain(1);
         return do_program_released(p);
