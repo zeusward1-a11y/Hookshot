@@ -85,6 +85,10 @@ struct Recording {
     VkCommandPool upload_pool = VK_NULL_HANDLE;   // (its own: a parallel replay's threads record uploads into it while the
                                                   // replay thread records cmd, and a pool is one thread's at a time)
     VkCommandBuffer cmd = VK_NULL_HANDLE, upload = VK_NULL_HANDLE;
+    // (a parallel replay's segment: new images' first layout changes, submitted before its uploads. Its own pool: any
+    // segment's worker records into the earliest open segment's, while that segment's worker records cmd and upload)
+    VkCommandPool init_pool = VK_NULL_HANDLE;
+    VkCommandBuffer init = VK_NULL_HANDLE;
     uint64_t value = 0;   // the timeline value its submit signals (reusable once reached)
     int slot = 0;         // its index: the draw path keeps a descriptor pool and stream per recording
     // (its slot comes round again once its own submit is done: a fence of its own. The timeline is signalled as far
@@ -1394,8 +1398,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         Recording* r;
         Segment g;
         uint64_t order;
+        int index = 0;
         std::atomic<bool> done{false};
-        bool uploads = false;
+        bool uploads = false, inits = false;
     };
     std::vector<std::unique_ptr<Job>> jobs;
     for (size_t k = 0; k < seg.size(); k++) {
@@ -1405,9 +1410,17 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkResetCommandPool(dev.device, j->r->upload_pool, 0);
         vkBeginCommandBuffer(j->r->upload, &bi);
+        vkResetCommandPool(dev.device, j->r->init_pool, 0);
+        vkBeginCommandBuffer(j->r->init, &bi);
         j->g = seg[k];
         j->order = base + k;
+        j->index = (int)k;
         jobs.push_back(std::move(j));
+    }
+    {
+        std::vector<VkCommandBuffer> inits;
+        for (auto& jp : jobs) inits.push_back(jp->r->init);
+        texture_segments_begin(inits.data(), inits.size());
     }
     const auto t_seg0 = std::chrono::steady_clock::now();
     const int64_t wait0 = par_lock_wait_ns.load(), locks0 = par_locks.load();
@@ -1420,11 +1433,14 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
             Job* j = jp.get();
             par_pool.jobs.push_back([j, &seg_cv, &seg_mu] {
                 texture_set_segment(j->order);
+                texture_segment_worker(j->index);
                 texture_begin_recording(j->r->upload, j->r->value);
                 draw_begin_recording(j->r->slot, j->r->cmd, j->r->value);
                 VkCommandBuffer c = j->r->cmd;
                 record_segment(c, j->g);
                 j->uploads = texture_uploads_recorded();
+                j->inits = texture_segment_end(j->index);   // (after its last new image)
+                texture_segment_worker(-1);
                 vkEndCommandBuffer(j->r->upload);
                 vkEndCommandBuffer(j->r->cmd);
                 {
@@ -1443,8 +1459,10 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
         }
-        VkCommandBufferSubmitInfo cb[2]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
+        VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
+                                        {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
         uint32_t n = 0;
+        if (j->inits) cb[n++].commandBuffer = j->r->init;   // (new images made in it or after it: first in the queue)
         if (j->uploads) cb[n++].commandBuffer = j->r->upload;
         cb[n++].commandBuffer = j->r->cmd;
         VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
@@ -1462,6 +1480,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         par_pool.done.wait(lk, [] { return par_pool.pending == 0; });
     }
     par_active = false;
+    texture_segments_begin(nullptr, 0);
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();
     segs_n += (double)seg.size();
     static double wait_ms, locks_n;
@@ -3544,6 +3563,9 @@ bool replay_start() {
         vkAllocateCommandBuffers(dev.device, &ai, &r.cmd);
         ai.commandPool = r.upload_pool;
         vkAllocateCommandBuffers(dev.device, &ai, &r.upload);
+        if (vkCreateCommandPool(dev.device, &pi, nullptr, &r.init_pool) != VK_SUCCESS) return false;
+        ai.commandPool = r.init_pool;
+        vkAllocateCommandBuffers(dev.device, &ai, &r.init);
     }
     ai.commandBufferCount = 1;
     for (Frame& f : frames) {

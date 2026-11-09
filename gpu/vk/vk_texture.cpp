@@ -240,6 +240,48 @@ VkCommandBuffer upload_cmd() {
     return up_cmd;
 }
 
+// ---- (parallel replay) a new image's first layout change, in queue order ----
+// The segments' workers record at once, and the one that makes an image first need not be the first in the queue to use
+// it: a later segment's worker made it (its UNDEFINED -> GENERAL change in its own uploads, submitted after the earlier
+// segment), the earlier one used it (a copy into it again, the BC3 encoder's dispatch: its uploads, at the start of its
+// command buffers), and the queue reached that use with the image UNDEFINED (VUID-vkCmdDraw-None-09600, RX_VK_PARALLEL
+// only). The change goes to the init command buffer of the earliest segment still being recorded instead: those before
+// it were done before the image was made, so never used it, and each segment's init is submitted before its uploads.
+struct SegInit {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    bool used = false, open = false;
+};
+std::mutex seg_init_mu;
+std::vector<SegInit> seg_inits;    // (the submission's segments, in queue order; seg_init_mu)
+thread_local int tl_seg_index = -1;   // (the segment this thread records; -1: none)
+/// While it lives, upload_cmd() is the earliest open segment's init command buffer (a segment's worker only)
+struct InitRedirect {
+    std::unique_lock<std::mutex> lk;
+    SegInit* to = nullptr;
+    VkCommandBuffer saved_cmd = VK_NULL_HANDLE;
+    bool saved_used = false;
+    explicit InitRedirect(bool want = true) {
+        if (!want || tl_seg_index < 0) return;
+        lk = std::unique_lock<std::mutex>(seg_init_mu);
+        for (int i = 0; i <= tl_seg_index && i < (int)seg_inits.size(); i++)
+            if (seg_inits[i].open) { to = &seg_inits[i]; break; }
+        if (!to) { lk.unlock(); return; }   // (none open: its own is, while it records)
+        saved_cmd = up_cmd, saved_used = up_used;
+        up_cmd = to->cmd, up_used = to->used;
+    }
+    void done() {
+        if (to) {
+            to->used = up_used;
+            up_cmd = saved_cmd, up_used = saved_used;
+            to = nullptr;
+        }
+        if (lk.owns_lock()) lk.unlock();
+    }
+    ~InitRedirect() { done(); }
+    InitRedirect(const InitRedirect&) = delete;
+    InitRedirect& operator=(const InitRedirect&) = delete;
+};
+
 // ---- staging: host-visible arenas, reused once the submission that filled them completed ----
 struct Arena {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -546,6 +588,9 @@ bool bc_scratch_layout(VkCommandBuffer cmd, bool resized = false) {
         bc_used_at = std::chrono::steady_clock::now();
         bc_last_value = rec_value;
     }
+    // (a segment's worker: a fresh scratch's layout change in queue order, as a new image's)
+    InitRedirect redirect((bc_scratch2_fresh && bc_scratch2) || bc_scratch_fresh);
+    if (redirect.to) cmd = upload_cmd();
     if (bc_scratch2_fresh && bc_scratch2) {   // (hookshot-amd: the second scratch, once made)
         bc_scratch2_fresh = false;
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1674,6 +1719,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
+    InitRedirect redirect;   // (a parallel replay's worker: into the earliest open segment's init command buffer)
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1709,6 +1755,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         vkCmdPipelineBarrier2(cmd, &di);
     }
     Texture* p = tex.get();
+    redirect.done();
     static uint32_t ids;
     p->id = ++ids;
     p->first_seen = frame_no;
@@ -2609,6 +2656,23 @@ void texture_set_segment(uint64_t seg) {
 }
 uint64_t texture_segment() {
     return tl_seg;
+}
+void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n) {
+    std::lock_guard lk(seg_init_mu);
+    seg_inits.assign(n, SegInit{});
+    for (size_t i = 0; i < n; i++) seg_inits[i].cmd = init_cmds[i], seg_inits[i].open = true;
+}
+void texture_segment_worker(int index) {
+    tl_seg_index = index;
+}
+bool texture_segment_end(int index) {
+    std::lock_guard lk(seg_init_mu);
+    if (index < 0 || index >= (int)seg_inits.size()) return false;
+    SegInit& s = seg_inits[index];
+    s.open = false;   // (no new image's change goes to it from here: it is ended)
+    if (s.used) full_barrier(s.cmd);   // (before its uploads and its commands)
+    vkEndCommandBuffer(s.cmd);
+    return s.used;
 }
 bool texture_marked(const Texture* tex) {
     return !tex || (tex->gpu_written && !tex->released && tex->uploaded && tex->owned_frame == frame_no &&
