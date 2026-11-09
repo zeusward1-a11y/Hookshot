@@ -51,13 +51,12 @@ ARGS = {
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
-    # (local: gcc warns on the extracted file's unused delay and filter tables with -Werror; clang does not, #1063)
-    "tests/test_audio_effects.py": ["--cc", "clang"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],
     "tests/test_menu_hit.py": ["--cxx", "g++"],
     "tests/test_nvn_buffer_map.py": ["--cc", "gcc"],
     "tests/test_audio_voice_biquad.py": ["--cc", "gcc"],
-    "tests/test_audio_effects.py": ["--cc", "gcc"],
+    # (local: gcc treats the extracted file's unused delay and filter tables as errors under -Werror; clang does not)
+    "tests/test_audio_effects.py": ["--cc", "clang"],
     "tests/test_cpp_preflight.py": ["--cxx", "g++"],
     "tests/test_invalidate_vcore.py": ["--cxx", "g++"],
     "tests/test_linux_driver_fault_guard.py": ["--cxx", "{cxx}"],
