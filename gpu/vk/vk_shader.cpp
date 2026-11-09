@@ -643,6 +643,37 @@ uint32_t answer_handle(const NvnState& s, const Program& p, const Program::Answe
 uint8_t answer_of(uint32_t handle, bool image) {
     return image ? (uint8_t)(handle ? texture_answer(handle) & 0x80 : 0xFF) : texture_answer(handle);
 }
+// Only ignore an answer bit when the translated module already has the corresponding type.
+// Keep the entries themselves: handle/version tracking and binding-stage masks still use them.
+uint8_t canonical_answer(const Program& p, const Program::Answer& a, uint8_t type) {
+    static const bool strict = [] {
+        const char* capture = getenv("RX_VK_CAPTURE");
+        return getenv("RX_VK_HANDLES_LIVE") || getenv("RX_VK_REGISTER_AT_ONCE") ||
+               (capture && atoi(capture) == 0);
+    }();
+    if (strict) return type;
+    const auto& info = p.stages[a.stage].info;
+    if (a.image) {
+        const auto& d = info.image_descriptors[a.desc];
+        if (d.is_integer) {
+            switch (d.format) {
+            case Shader::ImageFormat::R8_UINT:
+            case Shader::ImageFormat::R16_UINT:
+            case Shader::ImageFormat::R32_UINT:
+            case Shader::ImageFormat::R32G32_UINT:
+            case Shader::ImageFormat::R32G32B32A32_UINT:
+                return 0x80;
+            default:
+                break;
+            }
+        }
+    } else {
+        const auto& d = info.texture_descriptors[a.desc];
+        if (d.is_depth && !d.is_integer) return type & 0x7f;
+    }
+    return type;
+}
+
 uint64_t answers_hash(const Program& p) {
     uint64_t h = 0;
     for (const Program::Answer& a : p.answers)
@@ -668,6 +699,7 @@ void record_answers(Program& p, const NvnState& s) {
                 p.answers.push_back({(uint16_t)k, (uint16_t)i, h ? answer_of(h, true) : (uint8_t)(images[i].is_integer ? 0x80 : 0), true});
             }
     }
+    for (Program::Answer& a : p.answers) a.type = canonical_answer(p, a, a.type);
     p.variant = answers_hash(p);
 }
 /// Whether the textures bound now answer what the variant's translation was told (a variant whose translation
@@ -675,7 +707,7 @@ void record_answers(Program& p, const NvnState& s) {
 bool still_valid(const NvnState& s, const Program& p) {
     for (const Program::Answer& a : p.answers) {
         const uint32_t h = answer_handle(s, p, a);
-        if (h && answer_of(h, a.image) != a.type) return false;
+        if (h && canonical_answer(p, a, answer_of(h, a.image)) != canonical_answer(p, a, a.type)) return false;
     }
     return true;
 }

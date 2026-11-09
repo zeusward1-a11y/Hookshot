@@ -48,6 +48,7 @@ ARGS = {
     "nx2/test_mesh_dynamic_state.py": ["--cxx", "g++"],
     "nx2/test_timeline_modes.py": ["--cxx", "g++"],
     "tests/test_keep_rendered.py": ["--cxx", "g++"],
+    "tests/test_program_answer_domains.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
     "nx2/test_bc_storage_views.py": ["--headers", "{vulkan_headers}"],
     "nx2/test_mesh_first_types.py": ["--headers", "{spirv_headers}"],
     "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
