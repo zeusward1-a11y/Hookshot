@@ -18,6 +18,7 @@
 #include <softpub.h>
 #include <wintrust.h>
 
+#include "dlss_result.h"
 #include "vk_menu.h"
 
 namespace mkwvk {
@@ -63,6 +64,7 @@ struct State {
     bool options_set = false;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0;   // (the sizes the options were last set for)
     sl::DLSSPreset preset{};                    // (and the preset asked for)
+    uint32_t over_budget = 0;                   // (frames drawn with Streamline's eWarnOutOfVRAM: dlss_result.h)
 };
 State st;
 
@@ -551,9 +553,13 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
                             tm{&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
                             to{&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
             const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to};
-            if ((r = st.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, (uint32_t)std::size(inputs),
-                                         reinterpret_cast<sl::CommandBuffer*>(cmd))) != sl::Result::eOk)
+            r = st.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, (uint32_t)std::size(inputs),
+                                    reinterpret_cast<sl::CommandBuffer*>(cmd));
+            if (!dlss_drawn(r)) {
                 stage = "slEvaluateFeature";
+            } else if (r == sl::Result::eWarnOutOfVRAM && st.over_budget++ % 600 == 0) {   // (drawn: a warning only)
+                logf("vk: dlss: drawn over the VRAM budget (Streamline's eWarnOutOfVRAM, %u frames so far)", st.over_budget);
+            }
         }
         // back to GENERAL, the output written (also when the evaluation failed: the caller's layouts hold)
         barriers(cmd, {barrier(color, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(depth, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
