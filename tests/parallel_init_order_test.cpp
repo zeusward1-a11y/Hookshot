@@ -175,6 +175,7 @@ void memory_rb_recording_begun() {}
 VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;
 bool is_bc(VkFormat) { return false; }
 bool is_astc(VkFormat) { return false; }
+thread_local uint64_t bc_part_texels = 0;   // (553cad3: the BC3 parts this recording's upload holds, reset as it begins)
 #include "init_upload.inc"
 #include "init_hooks.inc"
 
