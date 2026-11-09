@@ -138,6 +138,10 @@ jobs:
         run: cmake --build ${{ runner.temp }}/global-load-16 --parallel 2
       - name: Emit and inspect real IR modules
         run: ${{ runner.temp }}/global-load-16/global_load_16_ir ${{ runner.temp }}/global-load-16/modules
+      - name: Check real-IR compare-exchange loop contracts
+        env:
+          RX_VK_FOLLOW_STORES: '1'
+        run: ${{ runner.temp }}/global-load-16/global_load_16_ir --cas-loops ${{ runner.temp }}/global-load-16/modules
       - name: Validate every emitted module
         shell: bash
         # (--uniform-buffer-standard-layout: the back end's device has uniformBufferStandardLayout, gpu/vk/vk_main.cpp
