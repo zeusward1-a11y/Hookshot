@@ -1739,6 +1739,7 @@ uint64_t oldest_unfinished() {
 // its wait, a present or hold_ms; the release follows it. RX_VK_RELEASE_DRAIN=1: as before ----
 void do_texture_released(const nvn_tex* t);
 void do_program_released(const nvn_prog* p);
+bool sync_waits_on();
 std::mutex held_mu;   // (its own: sync_order_mu is held while whole submissions replay, and every release waited for them)
 std::vector<nvn_tex> held_tex_releases;    // (held_mu)
 std::vector<nvn_prog> held_prog_releases;  // (held_mu)
@@ -1852,6 +1853,11 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         q.waiting = true;
         q.handles.assign(handles, handles + n);
         q.cb = cb, q.p = stop, q.value = value;
+        // (local, on PR 958) the stop said at once, under replay_mu, for the releases (texture_released_of): blocked_n was only
+        // set by update_blocked after this returns (submit_q), and a release in between, which no longer takes sync_order_mu,
+        // freed a texture the rest of this stopped submission still uses. In the sync mode this runs under sync_order_mu, as
+        // blocked_since's other writers and readers do (update_blocked, sync_watch)
+        if (sync_waits_on() && !blocked_n.load()) blocked_since = std::chrono::steady_clock::now(), blocked_n = 1;
         if (st_stops++ < 12) {
             const nvn_p_wait_event w = wait_at(stop);
             logf("vk: submission %llu (queue %#llx) stopped at command buffer %d's wait for event %#llx %s %u (has %u)",
@@ -2257,12 +2263,15 @@ void invalidate(uint64_t gpu, uint64_t size) {
     std::lock_guard lk(replay_mu);
     texture_flush_to_guest(gpu, size);
 }
-void do_texture_released(const nvn_tex* t) {
-    std::lock_guard lk(replay_mu);
+void texture_released_under_replay_mu(const nvn_tex* t) {
     if (t) {
         mkwvk::texture_released(t->serial);   // (vk_bank.cpp: the registrations of it)
         mkwvk::texture_released(t);           // (vk_texture.cpp: its image may take CPU writes again)
     }
+}
+void do_texture_released(const nvn_tex* t) {
+    std::lock_guard lk(replay_mu);
+    texture_released_under_replay_mu(t);
 }
 
 // ---- presents ----
@@ -3494,7 +3503,11 @@ void texture_released_of(const nvn_tex* t) {
         // stopped: sync_order_mu, taken on every release, made the thread finalizing textures (OptimizeChangeBank) wait for whole
         // submissions being replayed under it, 45% of its time in Kokiri. A release just after the stopped work went on waits
         // for the next update_blocked: the next submit or present)
-        if (hold_releases() && sync_waits_on() && blocked_n.load()) {
+        if (hold_releases() && sync_waits_on()) {
+            if (!blocked_n.load()) {   // (local, on PR 958: asked again under replay_mu, where run_submit says a stop, and
+                std::lock_guard lk(replay_mu);   // released under it: no stop can come between the answer and the release)
+                if (!blocked_n.load()) return texture_released_under_replay_mu(t);
+            }
             {
                 std::lock_guard hl(held_mu);
                 held_tex_releases.push_back(*t);
@@ -3512,7 +3525,11 @@ void texture_released_of(const nvn_tex* t) {
 void program_released_locked(const nvn_prog* p) {
     if (!p) return;
     if (!async_on()) {
-        if (hold_releases() && sync_waits_on() && blocked_n.load()) {   // (PR 430: as texture releases, on held_mu)
+        if (hold_releases() && sync_waits_on()) {   // (PR 430: as texture releases, on held_mu)
+            if (!blocked_n.load()) {   // (local, on PR 958: as texture_released_of, the answer and the release under replay_mu)
+                std::lock_guard lk(replay_mu);
+                if (!blocked_n.load()) return program_released(p);
+            }
             {
                 std::lock_guard hl(held_mu);
                 held_prog_releases.push_back(*p);

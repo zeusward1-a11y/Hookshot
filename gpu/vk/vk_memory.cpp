@@ -1469,6 +1469,10 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 }
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
+    // (local, on PR 936) the wait with no copy too: a capture past 256 MB (an area's load) or one whose buffer could not be had
+    // has no copy, and its pages are read from guest memory later, as before; skipping the wait there read them before the
+    // write-back landed, the exposure flash at a load that RX_VK_CAPTURE_WAIT=1 (the game's thread waiting) never had
+    if (c->late_value && !c->map) vk_timeline_wait(c->late_value);
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
         vk_timeline_wait(c->late_value);
         uint8_t* const base = (uint8_t*)host->guest_base();
