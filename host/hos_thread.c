@@ -582,6 +582,13 @@ void hos_thread_pin(void *h, const char *name) {
                                   THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST};
     if ((p = match_name_spec(prios, nprios, name)) && p->value >= -2 && p->value <= 2)
         SetThreadPriority(h, levels[p->value + 2]);
+    else if (strstr(name, "OptimizeChange") && !getenv("HOS_OCB_NORMAL")) {
+        /* (OoT's OptimizeChangeBank (guest priority 27, a background thread) walks every placed object of the
+           area by name, again and again (Kokiri: ~344 names, ~250k lookups a second). On the console it only gets the
+           time nothing more important wants; at the host's normal priority it took the renderer's and the driver's
+           cores and the frame waited (Kokiri, RX 6600 + 5600G: 17-20 fps; lowest: 21-28). HOS_OCB_NORMAL=1: as before) */
+        SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
+    }
 }
 
 /* ---- time ------------------------------------------------------------------------------------------------ */
