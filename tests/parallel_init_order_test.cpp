@@ -258,6 +258,7 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
 void draw_begin_recording(int, VkCommandBuffer, uint64_t) {}
 void queue_flush_locked() {}
 void checkpoints_report() {}
+[[noreturn]] void device_lost() { std::_Exit(3); }   // (vk_replay.cpp: the report, then the process ends)
 struct {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
