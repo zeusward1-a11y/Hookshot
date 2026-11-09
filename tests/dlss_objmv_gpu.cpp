@@ -133,7 +133,7 @@ static void compare(Gpu& g, const char* name, const Run& r, bool on, bool prev_o
     for (VkImage i : {g.motion.image, g.out.image}) layout(cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     float push[20];
     std::copy_n(r.clip, 16, push);   // (vk_draw.cpp dlss_motion_pass: the clip-to-previous, a, b, on, prev_ok)
-    push[16] = r.a1, push[17] = r.b1, push[18] = on ? 1.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;
+    push[16] = r.a1, push[17] = r.b1, push[18] = on ? 2.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;   // (2: on, and counted)
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.set, 0, nullptr);
     vkCmdPushConstants(cb, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
@@ -298,6 +298,11 @@ int main() {
     s.box = {{-2.0, 0.0, -6.0}, {1.0, 3.0, -4.0}};
     const Cam sc0{{0, 1.5, 6.0}, {0, 1.2, -20}}, sc1{{0.25, 1.55, 5.7}, {1.5, 1.0, -20}};
     compare(g, "still world", two_frames(s, sc0, s, sc1), true, true);
+    Scene k;   // (sky_turn: the cleared depth behind, a quick turn; the shader's SKY_DEPTH against the model's kSkyDepth)
+    k.has_wall = false, k.has_box = true;
+    k.box = {{-1.0, 0.0, -10.0}, {1.0, 2.0, -8.0}};
+    const Cam kc0{{0, 1.5, 6.0}, {0, 1.2, -20}}, kc1{{0, 1.5, 6.0}, {std::tan(8.0 * 3.14159265358979 / 180.0) * 26.0, 1.2, -20}};
+    compare(g, "sky turn", two_frames(k, kc0, k, kc1), true, true);
     compare(g, "off", two_frames(r0, rc0, r1, rc1, false, true), false, true);
     compare(g, "first frame", two_frames(r0, rc0, r1, rc1, true, false), true, false);
 

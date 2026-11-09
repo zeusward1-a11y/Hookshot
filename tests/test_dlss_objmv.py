@@ -69,8 +69,11 @@ def main():
     need("objmv::depth_terms(ds.used.cur.data(), a, b)" in passc and "objmv_on()" in passc, "the pass has no depth terms or no switch")
     need("ds.dist_frame + 1 == now && ds.dist_size == size" in passc and "!cut" in passc,
          "last frame's distances are used without being last frame's, at this size, after no cut")
-    need("push[16] = a, push[17] = b, push[18] = on ? 1.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;" in passc,
+    need("push[16] = a, push[17] = b, push[18] = on ? (count ? 2.0f : 1.0f) : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;" in passc,
          "the push constants are not the shader's layout")
+    # the counts into host memory: only on the frames the log counts (every frame cost GPU time), and they are those frames
+    need("const bool count = on && now % kObjmvCountEvery == 0;" in passc and "ds.objmv_frames += prev_ok && count;" in passc,
+         "the own-motion counts are added every frame, or the log's frames are not the counted ones")
     need('getenv("RX_DLSS_OBJMV")' in code(block(draw, "bool objmv_on(")), "RX_DLSS_OBJMV does not turn it off")
     need(re.search(r"dlss_image\(ds\.dist\[0\], ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R32_SFLOAT", draw) and
          re.search(r"dlss_image\(ds\.dist\[1\], ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R32_SFLOAT", draw),
@@ -79,6 +82,12 @@ def main():
     tol = re.search(r"const float TOLERANCE = ([0-9.]+);", shader)
     model = re.search(r"constexpr float kTolerance = ([0-9.]+)f;", read("gpu/vk/dlss_objmv.h"))
     need(tol and model and float(tol.group(1)) == float(model.group(1)), "the shader's tolerance is not the model's")
+    sky = re.search(r"const float SKY_DEPTH = ([0-9.]+);", shader)
+    sky_model = re.search(r"constexpr float kSkyDepth = ([0-9.]+)f;", read("gpu/vk/dlss_objmv.h"))
+    need(sky and sky_model and float(sky.group(1)) == float(sky_model.group(1)), "the shader's sky depth is not the model's")
+    cshader = code(shader)
+    need("valid && depth < SKY_DEPTH" in cshader, "the shader checks the sky for own motion")
+    need("params.depth.z > 1.5 && gl_LocalInvocationIndex == 0" in cshader, "the shader adds to the host counts every frame")
     need("layout(binding = 2, r32f) uniform readonly image2D dist_prev;" in shader and
          "layout(binding = 4, std430) buffer Counts" in shader, "the shader's bindings are not the pass's")
 

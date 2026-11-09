@@ -20,6 +20,13 @@
 namespace mkwvk::objmv {
 
 constexpr float kTolerance = 0.04f;   // (a still surface reprojected lands within ~1%; a character a step from the wall: 10% and more)
+/// Not checked from this depth on: the sky (the depth buffer's clear value, nothing drawn) and what sits at the far plane keep the
+/// camera's motion, the right one for them. The cleared depth is the far plane, a plane and not a sphere, so under a turn the distance
+/// predicted there missed last frame's by more than the tolerance at the screen's sides while the pixel stayed sky: held still, the
+/// sky stuck to the screen (tests/dlss_objmv_test.cpp sky_turn). With the game's near 0.1 and far 25005 this is ~7100 units away
+/// (d = f (w - n) / ((f - n) w)): real scenery nearer is checked as before, the followed character is 300-600 units away
+/// (runner_game_scale), and anything farther keeps the camera's motion, right for what does not move
+constexpr float kSkyDepth = 0.99999f;
 
 /// The game's projection depth terms from its view-projection (column vectors, m[r*4+c], OpenGL's clip): view distance = b / (z_ndc
 /// + a), with a = -(f + n) / (f - n) and b = -2 f n / (f - n) of the rows (row 2 against row 3, which is -back for a perspective).
@@ -82,7 +89,7 @@ inline Counts motion_pass(int w, int h, const float* depth, const float clip_to_
             }
             const float here = on ? view_distance(clip[2], a, b) : 0.0f;
             dist_out[(size_t)py * w + px] = here;
-            if (on && prev_ok && here > 0.0f && d >= 0 && d <= 1 && prev[3] > 1e-6f) {
+            if (on && prev_ok && here > 0.0f && d >= 0 && d < kSkyDepth && prev[3] > 1e-6f) {   // (not the sky: kSkyDepth)
                 const float there = prev[3] * here;   // (last frame's distance the camera's motion predicts: w_prev / w_cur * w_cur)
                 c.checked++;
                 const float wx = px + 0.5f, wy = py + 0.5f;

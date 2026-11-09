@@ -84,6 +84,29 @@ static void runner() {
     CHECK(r.counts.held > 0 && r.counts.held <= r.counts.moved && r.counts.moved <= r.counts.checked);
 }
 
+/// The runner at the game's scale: near 0.1 and far 25005 (the game's projection, the log's "near 0.100010954, far 25005.932"),
+/// Link 50 units tall 300 units ahead, the camera following him. kSkyDepth leaves the check to everything nearer than ~7100 units:
+/// he is still found. (A threshold of 0.999 would cut the check at ~100 units and leave him with the camera's motion; the scenes
+/// above, 0.5 to 800 units, would not see it)
+static void runner_game_scale() {
+    Scene s0, s1;
+    s0.wall_z = s1.wall_z = -3000.0;                 // (the far side of the field)
+    s0.has_box = s1.has_box = true;
+    s0.box = {{-15.0, 0.0, -15.0}, {15.0, 50.0, 15.0}};
+    s1.box = {{-15.0, 0.0, -35.0}, {15.0, 50.0, -5.0}};   // (20 units on: a run step)
+    Cam c0{{0, 80, 300}, {0, 40, 0}}, c1{{0, 80, 280}, {0, 40, -20}};
+    c0.n = c1.n = 0.1, c0.f = c1.f = 25005.0;
+    const Run r = two_frames(s0, c0, s1, c1);
+    int box = 0, box_zero = 0;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (inside_box(r, x, y, 2)) box++, box_zero += len(r.mv, y * W + x) < 1e-6f;   // (2: off his outline, as runner)
+    std::printf("runner at the game's scale: box %d px, %d zero; moved %u held %u of %u\n", box, box_zero, r.counts.moved,
+                r.counts.held, r.counts.checked);
+    CHECK(box > 30);
+    CHECK(box_zero >= box * 9 / 10);
+}
+
 /// The camera strafes beside Link, who keeps his place on screen. A box seen face on, it moves without changing its distance: the
 /// check sees it only where the camera's motion lands past his outline (the band as wide as that motion along the edge it trails).
 /// Its middle keeps the camera's motion: this method's limit (a body's own relief helps in the game)
@@ -178,13 +201,40 @@ static void off_and_first() {
     }
 }
 
+/// The sky (the depth buffer's clear value, nothing drawn) under a quick turn of the camera: it keeps the camera's motion. The cleared
+/// depth is the far plane, a plane and not a sphere: the distance the turn predicts there misses last frame's by 11-15% at the
+/// screen's sides (8 degrees, this FOV; held from ~4 degrees a frame on), more than the tolerance, and the same pixel was sky last frame too, so the check held it still on screen: the
+/// sky and the horizon stuck to the screen while the camera turned (the blur the player saw with own motion on, 09/11/2026)
+static void sky_turn() {
+    Scene s;
+    s.has_wall = false;
+    s.has_box = true;
+    s.box = {{-1.0, 0.0, -10.0}, {1.0, 2.0, -8.0}};   // (something drawn, so that not every pixel is sky)
+    const double turn = std::tan(8.0 * 3.14159265358979 / 180.0) * 26.0;   // (8 degrees between two frames: a quick turn at 40 fps)
+    const Cam c0{{0, 1.5, 6.0}, {0, 1.2, -20}}, c1{{0, 1.5, 6.0}, {turn, 1.2, -20}};
+    const Run r = two_frames(s, c0, s, c1);
+    int sky = 0, sky_changed = 0, sky_still = 0;
+    for (int i = 0; i < W * H; i++) {
+        if (r.depth1[i] < 1.0f) continue;
+        sky++;
+        const bool changed = r.mv[i * 2] != r.cam_mv[i * 2] || r.mv[i * 2 + 1] != r.cam_mv[i * 2 + 1];
+        sky_changed += changed, sky_still += changed && len(r.mv, i) == 0.0f;
+    }
+    std::printf("sky turn: sky %d px, %d changed from the camera's motion (%d made still); moved %u held %u of %u\n", sky, sky_changed,
+                sky_still, r.counts.moved, r.counts.held, r.counts.checked);
+    CHECK(sky > W * H / 2);
+    CHECK(sky_changed == 0);
+}
+
 int main() {
     depth_terms();
     runner();
+    runner_game_scale();
     strafe();
     still_world();
     crossing();
     off_and_first();
+    sky_turn();
     failures += scene_failures;
     std::printf("dlss own motion: %d failures\n", failures);
     return failures ? 1 : 0;

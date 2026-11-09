@@ -30,6 +30,7 @@ struct Box {   // (axis-aligned)
 };
 struct Scene {
     double wall_z = -40;   // (a wall facing the camera, everywhere)
+    bool has_wall = true;  // (false: the sky behind, the depth buffer's clear value 1 where nothing is drawn)
     bool has_box = false;
     Box box{};
 };
@@ -80,7 +81,7 @@ inline void draw(const Scene& s, const float vp[16], std::vector<float>& depth, 
             for (int i = 0; i < 3; i++) d[i] = b[i] - a[i];
             double best = 1e30, hit[3];
             bool box = false;
-            if (std::fabs(d[2]) > 1e-12) {   // (the wall)
+            if (s.has_wall && std::fabs(d[2]) > 1e-12) {   // (the wall)
                 const double t = (s.wall_z - a[2]) / d[2];
                 if (t > 0 && t < best) best = t;
             }

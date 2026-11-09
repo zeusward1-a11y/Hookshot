@@ -5978,7 +5978,7 @@ struct DlssState {
     VmaAllocation counts_mem = nullptr;
     void* counts_map = nullptr;
     uint32_t counts_seen[3] = {};
-    uint32_t objmv_frames = 0;   // (frames the check ran in, since the last log)
+    uint32_t objmv_frames = 0;   // (frames counted for the log since the last one: 1 in kObjmvCountEvery of those the check ran in)
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     const char* reason = nullptr;   // (the last fallback's)
     uint64_t repeats = 0;
@@ -6149,12 +6149,15 @@ bool objmv_on() {
 /// The motion pass (shaders/dlss_motion.comp): the camera's motion of each pixel from its depth and, with the check, own motion for
 /// what moves by itself (the character the camera follows: zero). Last frame's distances are used when they are of the frame just
 /// before, at this size, and the camera did not cut
+constexpr uint32_t kObjmvCountEvery = 30;   // (the own-motion counts of the 600-frame log: 20 frames of it)
 void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& clip, uint64_t now, bool cut) {
     float a = 0, b = 0;
     const bool on = objmv_on() && objmv::depth_terms(ds.used.cur.data(), a, b);
     // (last frame's distances: of the frame just before, at this size (a new size makes the images again), no camera cut)
     const uint64_t size = (uint64_t)rw << 32 | rh;
     const bool prev_ok = on && !cut && ds.dist_frame != ~0ull && ds.dist_frame + 1 == now && ds.dist_size == size;
+    // (the log's counts: one frame in kObjmvCountEvery adds to them, the shader's atomics into host memory cost GPU time every frame)
+    const bool count = on && now % kObjmvCountEvery == 0;
     DlssImg& out = ds.dist[ds.dist_cur];
     const DlssImg& prev = ds.dist[ds.dist_cur ^ 1];
     const VkDescriptorImageInfo ii{ds.nearest, ds.used.depth_view, VK_IMAGE_LAYOUT_GENERAL}, oi{VK_NULL_HANDLE, ds.motion.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -6169,7 +6172,7 @@ void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& 
     wr[0].pImageInfo = &ii, wr[1].pImageInfo = &oi, wr[2].pImageInfo = &pi, wr[3].pImageInfo = &di, wr[4].pBufferInfo = &ci;
     float push[20];
     std::copy(clip.begin(), clip.end(), push);
-    push[16] = a, push[17] = b, push[18] = on ? 1.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;
+    push[16] = a, push[17] = b, push[18] = on ? (count ? 2.0f : 1.0f) : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.motion_pipe);
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.mv_layout, 0, 5, wr);
     vkCmdPushConstants(cmd, ds.mv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
@@ -6180,7 +6183,7 @@ void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& 
     VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
     vkCmdPipelineBarrier2(cmd, &hd);
-    if (on) ds.dist_cur ^= 1, ds.dist_frame = now, ds.dist_size = size, ds.objmv_frames += prev_ok;
+    if (on) ds.dist_cur ^= 1, ds.dist_frame = now, ds.dist_size = size, ds.objmv_frames += prev_ok && count;
     else ds.dist_frame = ~0ull;
     static bool told;
     if (!told) {
@@ -6198,8 +6201,8 @@ void objmv_log() {
     const uint32_t moved = now[0] - ds.counts_seen[0], held = now[1] - ds.counts_seen[1], checked = now[2] - ds.counts_seen[2];
     std::copy_n(now, 3, ds.counts_seen);
     if (!objmv_on()) return;
-    logf("vk: dlss: own motion over %u frames: %.2f%% of %.0f checked pixels a frame moved by themselves, %.2f%% held still on screen "
-         "(the followed character: no motion)", ds.objmv_frames, checked ? 100.0 * moved / checked : 0.0,
+    logf("vk: dlss: own motion over %u counted frames (1 in %u): %.2f%% of %.0f checked pixels a frame moved by themselves, %.2f%% held still on screen "
+         "(the followed character: no motion)", ds.objmv_frames, kObjmvCountEvery, checked ? 100.0 * moved / checked : 0.0,
          ds.objmv_frames ? (double)checked / ds.objmv_frames : 0.0, checked ? 100.0 * held / checked : 0.0);
     ds.objmv_frames = 0;
 }

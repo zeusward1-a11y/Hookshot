@@ -17,10 +17,12 @@ layout(binding = 4, std430) buffer Counts { uint moved; uint held; uint checked;
 
 layout(push_constant, row_major) uniform Parameters {
     mat4 clip_to_previous_clip;
-    vec4 depth;   // x, y: view distance = y / (z_ndc + x); z > 0: the check on; w > 0.5: dist_prev holds last frame's
+    vec4 depth;   // x, y: view distance = y / (z_ndc + x); z > 0: the check on (> 1.5: and this frame counted for the log);
+                  // w > 0.5: dist_prev holds last frame's
 } params;
 
 const float TOLERANCE = 0.04;   // (dlss_objmv.h kTolerance)
+const float SKY_DEPTH = 0.99999;   // (dlss_objmv.h kSkyDepth: from here on, the sky and the far plane keep the camera's motion)
 shared uint s_moved, s_held, s_checked;
 
 float view_distance(float zn) {
@@ -67,7 +69,7 @@ void main() {
         bool on = params.depth.z > 0.0;
         float here = on ? view_distance(clip.z) : 0.0;
         if (on) imageStore(dist_out, pixel, vec4(here));
-        if (on && params.depth.w > 0.5 && here > 0.0 && valid) {
+        if (on && params.depth.w > 0.5 && here > 0.0 && valid && depth < SKY_DEPTH) {   // (not the sky: SKY_DEPTH)
             float there = previous.w * here;   // (last frame's distance the camera's motion predicts)
             atomicAdd(s_checked, 1u);
             vec2 win = vec2(pixel) + 0.5;
@@ -82,7 +84,9 @@ void main() {
         imageStore(motion, pixel, vec4(pixels, 0, 0));
     }
     barrier();
-    if (gl_LocalInvocationIndex == 0 && s_checked > 0u) {   // (one atomic a workgroup: the 600-frame log's counts)
+    // (one atomic a workgroup, only on the frames the 600-frame log counts: the buffer is host memory, and every workgroup of
+    // every frame adding to it across the bus cost milliseconds of GPU time a frame)
+    if (params.depth.z > 1.5 && gl_LocalInvocationIndex == 0 && s_checked > 0u) {
         atomicAdd(counts.moved, s_moved);
         atomicAdd(counts.held, s_held);
         atomicAdd(counts.checked, s_checked);
