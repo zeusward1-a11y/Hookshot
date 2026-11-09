@@ -806,10 +806,12 @@ def main():
     t0, failed = time.time(), []
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
         # (as each ends, not in order: the builder app shows progress from these lines, and the biggest file comes first)
-        for src, secs, err in (f.result() for f in concurrent.futures.as_completed([ex.submit(compile_one, j) for j in jobs])):
+        submitted = {ex.submit(compile_one, job): job for job in jobs}
+        for future in concurrent.futures.as_completed(submitted):
+            src, secs, err = future.result()
             size = os.path.getsize(src) >> 20
             if err:
-                failed.append(src)
+                failed.append(submitted[future])
                 print("not compiled yet: %s (%d MB, %.0fs), tried again alone at the end:\n%s"
                       % (os.path.basename(src), size, secs, err[-1500:]), flush=True)
             else:
@@ -823,9 +825,8 @@ def main():
     # (a compiler that ran out of memory beside the others dies "due to signal": a player's 24 MB code_021.c, 2026-11-08. The
     # files that failed are compiled again one at a time, with all the memory, before the build gives up)
     still = 0
-    for src in failed:
-        job = next(j for j in jobs if j[1] == src)
-        _, secs, err = compile_one(job)
+    for job in failed:
+        src, secs, err = compile_one(job)
         size = os.path.getsize(src) >> 20
         if err:
             still += 1
