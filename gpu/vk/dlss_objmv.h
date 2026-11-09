@@ -56,12 +56,18 @@ struct Counts {
 
 /// The motion pass for one frame, as the shader runs it: depth (the depth buffer's values, w x h), clip_to_prev (vk_draw.cpp
 /// clip_to_previous), the depth terms; dist_prev (last frame's distances, prev_ok when they are there and at this size); on: the
-/// check (RX_DLSS_OBJMV). Writes the vectors (render pixels, 2 a pixel) and this frame's distances
+/// check (RX_DLSS_OBJMV); jx, jy: the viewport offset the scene was drawn with (DLSS's jitter, render pixels, x right, y down);
+/// mask_value: DLSS's bias mask where the surface moved by itself (0: none written); keep: the camera's vectors stay where it kept
+/// its place on screen (a mask-only check). Writes the vectors (render pixels, 2 a pixel, unjittered), this frame's distances and,
+/// given, the mask. pjx, pjy: the jitter last frame's distances (dist_prev) were drawn with
 inline Counts motion_pass(int w, int h, const float* depth, const float clip_to_prev[16], float a, float b, bool on, bool prev_ok,
-                          const float* dist_prev, std::vector<float>& mv, std::vector<float>& dist_out) {
+                          const float* dist_prev, std::vector<float>& mv, std::vector<float>& dist_out, float jx = 0.0f,
+                          float jy = 0.0f, float mask_value = 0.0f, bool keep = false, std::vector<float>* mask = nullptr,
+                          float pjx = 0.0f, float pjy = 0.0f) {
     Counts c;
     mv.assign((size_t)w * h * 2, 0.0f);
     dist_out.assign((size_t)w * h, 0.0f);
+    if (mask) mask->assign((size_t)w * h, 0.0f);
     const auto miss = [&](float wx, float wy, float expect) {   // (the closest of 3x3; 0 off screen; 1e9 where last frame had none)
         const int qx = (int)std::floor(wx), qy = (int)std::floor(wy);
         if (qx < 0 || qy < 0 || qx > w - 1 || qy > h - 1) return 0.0f;
@@ -78,7 +84,7 @@ inline Counts motion_pass(int w, int h, const float* depth, const float clip_to_
     for (int py = 0; py < h; py++)
         for (int px = 0; px < w; px++) {
             const float d = depth[(size_t)py * w + px];
-            const float sx = (px + 0.5f) / w, sy = (py + 0.5f) / h;
+            const float sx = (px + 0.5f - jx) / w, sy = (py + 0.5f - jy) / h;   // (where an unjittered draw puts this surface)
             const float clip[4] = {sx * 2 - 1, sy * -2 + 1, d * 2 - 1, 1};
             float prev[4];
             for (int r = 0; r < 4; r++) prev[r] = M[r * 4] * clip[0] + M[r * 4 + 1] * clip[1] + M[r * 4 + 2] * clip[2] + M[r * 4 + 3] * clip[3];
@@ -89,16 +95,22 @@ inline Counts motion_pass(int w, int h, const float* depth, const float clip_to_
             }
             const float here = on ? view_distance(clip[2], a, b) : 0.0f;
             dist_out[(size_t)py * w + px] = here;
+            float moved = 0.0f;
             if (on && prev_ok && here > 0.0f && d >= 0 && d < kSkyDepth && prev[3] > 1e-6f) {   // (not the sky: kSkyDepth)
                 const float there = prev[3] * here;   // (last frame's distance the camera's motion predicts: w_prev / w_cur * w_cur)
                 c.checked++;
-                const float wx = px + 0.5f, wy = py + 0.5f;
+                const float wx = px + 0.5f + pjx - jx, wy = py + 0.5f + pjy - jy;   // (last frame's surfaces sat at its jitter)
                 if (miss(wx + mx, wy + my, there) > kTolerance) {
                     c.moved++;
-                    if (miss(wx, wy, here) < kTolerance) mx = my = 0, c.held++;   // (it kept its place on screen: the followed one)
+                    moved = 1.0f;
+                    if (miss(wx, wy, here) < kTolerance) {   // (it kept its place on screen: the followed one)
+                        if (!keep) mx = my = 0;
+                        c.held++;
+                    }
                 }
             }
             mv[((size_t)py * w + px) * 2] = mx, mv[((size_t)py * w + px) * 2 + 1] = my;
+            if (mask && mask_value > 0.0f) (*mask)[(size_t)py * w + px] = moved * mask_value;
         }
     return c;
 }

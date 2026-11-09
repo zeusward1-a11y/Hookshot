@@ -53,6 +53,8 @@ struct DlssImage {
 struct DlssView {
     const float* view_projection = nullptr;
     const float* clip_to_previous = nullptr;
+    float jitter[2] = {0.0f, 0.0f};   // (the scene's sub-pixel offset this frame, render pixels: vk_draw.cpp dlss_jitter_of)
+    const DlssImage* bias = nullptr;  // (DLSS's bias mask at the render size, R16F, GENERAL: where it takes this frame's colour)
 };
 /// Records one DLSS evaluation on cmd: color, depth and motion at the render size, output at the output size (STORAGE |
 /// SAMPLED | TRANSFER_SRC | TRANSFER_DST, the caller's). All in GENERAL before and after. frame: dlss_frame_id(), whose constants

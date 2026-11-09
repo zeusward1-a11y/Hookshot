@@ -6,7 +6,10 @@
 // The camera's motion of each pixel from its depth. Then, with the check on (params.depth.z), each pixel's view distance is kept for
 // the next frame (dist_out) and the camera's vector is checked against last frame's (dist_prev): where last frame's distance at the
 // place the vector points to disagrees with the one it predicts, the surface moved by itself; when last frame's distance at the same
-// pixel agrees, it kept its place on screen (the character the camera follows) and its vector is zero.
+// pixel agrees, it kept its place on screen (the character the camera follows) and its vector is zero (unless params.jitter.w: the
+// camera's vectors are kept, for a mask-only check). With params.jitter.z > 0 the pass also writes DLSS's bias mask (mask_out): that
+// value where the surface moved by itself, 0 elsewhere, so DLSS takes this frame's colour there over a history that holds something
+// else (the trail behind a running Link, swaying grass), as NX2navi's dlaa_mv.comp does for Ocarina (MIT).
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D scene_depth;
@@ -14,11 +17,16 @@ layout(binding = 1, rg16f) uniform writeonly image2D motion;
 layout(binding = 2, r32f) uniform readonly image2D dist_prev;
 layout(binding = 3, r32f) uniform writeonly image2D dist_out;
 layout(binding = 4, std430) buffer Counts { uint moved; uint held; uint checked; uint frames; } counts;
+layout(binding = 5, r16f) uniform writeonly image2D mask_out;   // (R16F: vk_draw.cpp, Streamline takes no R8)
 
 layout(push_constant, row_major) uniform Parameters {
     mat4 clip_to_previous_clip;
     vec4 depth;   // x, y: view distance = y / (z_ndc + x); z > 0: the check on (> 1.5: and this frame counted for the log);
                   // w > 0.5: dist_prev holds last frame's
+    vec4 jitter;  // xy: the viewport offset the scene's camera draws took this frame (render pixels, x right, y down; 0 without);
+                  // z: the bias mask's value where the surface moved by itself (0: no mask written); w > 0.5: keep the camera's
+                  // vectors where it kept its place on screen (the check only marks it)
+    vec4 previous;  // xy: the jitter the frame of dist_prev was drawn with (its surfaces sit that much off their unjittered place)
 } params;
 
 const float TOLERANCE = 0.04;   // (dlss_objmv.h kTolerance)
@@ -54,8 +62,10 @@ void main() {
     if (all(lessThan(pixel, extent))) {   // (no return before the barriers below)
         vec2 size = vec2(extent);
         float depth = texelFetch(scene_depth, pixel, 0).r;
-        vec2 screen = (vec2(pixel) + 0.5) / size;
-        // The captured Zelda path is unjittered, with [-1, 1] clip depth and negative viewport height.
+        // The surface this pixel shows sits where an unjittered draw puts it: its centre less the jitter the scene was drawn
+        // with (vk_draw.cpp dlss_jitter_of), so the vectors are unjittered, as DLSS expects by default. [-1, 1] clip depth and
+        // negative viewport height.
+        vec2 screen = (vec2(pixel) + 0.5 - params.jitter.xy) / size;
         vec4 clip = vec4(screen * vec2(2, -2) + vec2(-1, 1), depth * 2 - 1, 1);
         vec4 previous = params.clip_to_previous_clip * clip;
         vec2 pixels = vec2(0);
@@ -69,19 +79,24 @@ void main() {
         bool on = params.depth.z > 0.0;
         float here = on ? view_distance(clip.z) : 0.0;
         if (on) imageStore(dist_out, pixel, vec4(here));
+        float moved = 0.0;
         if (on && params.depth.w > 0.5 && here > 0.0 && valid && depth < SKY_DEPTH) {   // (not the sky: SKY_DEPTH)
             float there = previous.w * here;   // (last frame's distance the camera's motion predicts)
             atomicAdd(s_checked, 1u);
-            vec2 win = vec2(pixel) + 0.5;
+            // (last frame's distances were drawn with its own jitter: a surface at this frame's unjittered place u sat at u + its
+            // jitter there, so both looks move by that less this frame's)
+            vec2 win = vec2(pixel) + 0.5 + params.previous.xy - params.jitter.xy;
             if (miss(win + pixels, there, extent) > TOLERANCE) {
                 atomicAdd(s_moved, 1u);
+                moved = 1.0;
                 if (miss(win, here, extent) < TOLERANCE) {   // (it kept its place on screen: the followed character)
-                    pixels = vec2(0);
+                    if (params.jitter.w < 0.5) pixels = vec2(0);
                     atomicAdd(s_held, 1u);
                 }
             }
         }
         imageStore(motion, pixel, vec4(pixels, 0, 0));
+        if (params.jitter.z > 0.0) imageStore(mask_out, pixel, vec4(moved * params.jitter.z));
     }
     barrier();
     // (one atomic a workgroup, only on the frames the 600-frame log counts: the buffer is host memory, and every workgroup of

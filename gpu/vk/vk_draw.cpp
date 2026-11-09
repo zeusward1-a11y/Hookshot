@@ -52,6 +52,7 @@
 #include "shaders/dlss_debug_comp_spv.h"
 #include "vk_dlss.h"
 #include "dlss_objmv.h"
+#include "dlss_jitter.h"
 #include "vk_menu.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -2925,6 +2926,8 @@ void checkpoints_report() {
     }
 }
 
+bool dlss_jitter_of(const NvnState& s, const Targets& at, float& x, float& y);   // (hookshot: DLSS's jitter, with the DLSS frame code)
+
 namespace {
 
 // ---- the open render pass ----
@@ -3180,10 +3183,16 @@ int dyn_pack(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, boo
 }
 
 void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh) {
+    // (hookshot) DLSS's sub-pixel jitter on the scene camera's draws (window x right and y down: dlss_jitter_of), decided before the
+    // shortcut below and part of its key: a draw of the scene and one of something else with the same state otherwise took each
+    // other's viewport (the review of 09/11)
+    float jx = 0, jy = 0;
+    const bool jittered = dlss_jitter_of(s, at, jx, jy);
     float df[kDynF];
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
+    df[0] += jx, df[1] += jy;   // (the viewport's x and y: 0 added without the jitter)
     if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
         pass.wm_or |= dyn_fast.wm0, pass.wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
@@ -3212,6 +3221,7 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     float vx = s.viewport[0][0], vy = s.viewport[0][1], vw = s.viewport[0][2], vh = s.viewport[0][3];
     if (vw == 0.0f && vh == 0.0f) vx = 0, vy = 0, vw = (float)at.width, vh = (float)at.height;
     d.vp = {vx, vy + vh, vw, -vh, std::clamp(s.depth_near, 0.0f, 1.0f), std::clamp(s.depth_far, 0.0f, 1.0f)};
+    if (jittered) d.vp.x += jx, d.vp.y += jy;
     d.sc = {{0, 0}, {at.width, at.height}};
     if (s.scissor[2] > 0 && s.scissor[3] > 0) {
         const int32_t x0 = std::max(0, s.scissor[0]), y0 = std::max(0, s.scissor[1]);
@@ -5987,6 +5997,26 @@ struct DlssCamera {
     uint32_t w = 0, h = 0;
     Mat cur{}, prev{};
 };
+// (jitter, RX_DLSS_JITTER) The scene camera's draws take a sub-pixel viewport offset, Halton(2,3), as a jittered projection moves
+// what it rasterises: DLSS then gets a new sample of each pixel every frame and rebuilds the detail the render size loses (with no
+// jitter it can only smooth an upscale: the soft picture in motion, 09/11). Which draws: those whose vertex constant buffer 3 is
+// the scene context (dlss_note_camera's checks: +0x120/+0x124 the target's size, +0xa8/+0xac -1 and 0), so geometry and its
+// depth-only draws move together and full-screen passes, the HUD and shadow maps (other blocks) do not. NX2navi (MIT) jittered
+// every pass drawing with the scene depth in Ocarina and saw the picture go white; full-screen passes are not what a jittered
+// projection moves, so they are left as they are here. Only after a frame DLSS made, and held off for 8 frames after a jittered
+// frame it did not make (that frame shook on screen), 60 when another came within two seconds
+struct DlssJitter {
+    float jx = 0, jy = 0;       // the offset the next scene draws take (render pixels, window x right, y down)
+    float ux = 0, uy = 0;       // the offset this frame's draws took (DLSS and the motion vectors get these)
+    uint64_t used_frame = ~0ull;   // the frame ux, uy are of
+    uint32_t index = 0, phases = 16;
+    jitter::Hold hold;          // (dlss_jitter.h: when a jittered frame DLSS did not make stops it)
+    uint64_t draws = 0;
+    struct Block { uint64_t addr; bool scene; };
+    Block blocks[16];           // (this frame's vertex constant buffers 3 already checked)
+    int nblocks = 0;
+    uint64_t blocks_frame = ~0ull;
+};
 struct DlssImg {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation mem = nullptr;
@@ -6004,10 +6034,13 @@ struct DlssState {
     VkPipelineLayout layout = VK_NULL_HANDLE, debug_layout = VK_NULL_HANDLE;
     uint32_t resets = 0, cuts = 0;   // (in the last 600 evaluations: history dropped, and of those the camera cuts)
     // (own motion, dlss_objmv.h) each pixel's view distance, this frame's and last frame's (R32F), the frame the last ones are of,
-    // the motion pass's own layout (five bindings, 80 bytes pushed) and its counts (moved, held, checked; host memory, read at the log)
+    // the motion pass's own layout (six bindings, 112 bytes pushed) and its counts (moved, held, checked; host memory, read at the log)
     DlssImg dist[2];
+    DlssImg mask;              // (DLSS's bias mask, R16F: RX_DLSS_OBJMV 2 and 3)
+    bool mask_made = false;    // (this frame's motion pass wrote it)
     int dist_cur = 0;
     uint64_t dist_frame = ~0ull, dist_size = 0;
+    float dist_jx = 0, dist_jy = 0;   // (the jitter the distances of dist_frame were drawn with)
     VkPipelineLayout mv_layout = VK_NULL_HANDLE;
     VkBuffer counts = VK_NULL_HANDLE;
     VmaAllocation counts_mem = nullptr;
@@ -6018,10 +6051,35 @@ struct DlssState {
     const char* reason = nullptr;   // (the last fallback's)
     uint64_t repeats = 0;
     bool ready = false, made = false;
+    DlssJitter jit;
 };
 DlssState ds;   // ponytail: one set of images, no lock: the replay records one frame at a time (RX_VK_PARALLEL would need ParLock here)
 
 bool dlss_on() { return opts.dlss && dlss_available(); }
+/// RX_DLSS_JITTER: 0 none (the default, as before), 1 on, -1 on with the offset given to DLSS negated (a test of the sign
+/// convention: the viewport moves the same way, only DLSS is told the opposite)
+int jitter_mode() {
+    static const int v = getenv("RX_DLSS_JITTER") ? atoi(getenv("RX_DLSS_JITTER")) : 0;
+    return v;
+}
+/// RX_VK_PARALLEL=2 and up (vk_replay.cpp par_threads): draws recorded on several threads
+bool parallel_replay() {
+    static const bool v = getenv("RX_VK_PARALLEL") && atoi(getenv("RX_VK_PARALLEL")) >= 2;
+    return v;
+}
+float halton(uint32_t i, uint32_t b) {
+    float f = 1, r = 0;
+    for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
+    return r;
+}
+/// The next frame's offset, right after DLSS made this one. As many phases as NVIDIA's DLSS guide asks for the ratio, 8 x (output /
+/// render)^2 (15 at Quality's 4/3 here), 16 at least and 72 at most (NX2navi's bounds)
+void next_jitter(uint32_t rw, uint32_t ow) {
+    const double r = rw ? (double)ow / rw : 1.0;
+    ds.jit.phases = std::clamp((uint32_t)std::ceil(8.0 * r * r - 1e-6), 16u, 72u);
+    const uint32_t i = ds.jit.index++ % ds.jit.phases + 1;
+    ds.jit.jx = halton(i, 2) - 0.5f, ds.jit.jy = halton(i, 3) - 0.5f;
+}
 // RX_DLSS_DEBUG=1..4 (dlss_debug.comp): motion, depth, or the reprojection error with and without the motion, drawn in place of
 // DLSS's output (DLSS still runs)
 int dlss_debug() { static const int v = getenv("RX_DLSS_DEBUG") ? atoi(getenv("RX_DLSS_DEBUG")) : 0; return v; }   // (the menu's Off takes effect at once; On needs the start's Streamline)
@@ -6116,15 +6174,16 @@ bool dlss_pipelines() {
         return pl;
     };
     {   // (the motion pass: depth, motion, last and this frame's distances, its counts; the clip-to-previous and the depth terms pushed)
-        VkDescriptorSetLayoutBinding mb[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding mb[6] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                               {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                               {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                               {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                              {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+                                              {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                              {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
         VkDescriptorSetLayoutCreateInfo ml = li;
-        ml.bindingCount = 5, ml.pBindings = mb;
+        ml.bindingCount = 6, ml.pBindings = mb;
         VkDescriptorSetLayout mset{};
-        const VkPushConstantRange mr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+        const VkPushConstantRange mr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 112};
         VkPipelineLayoutCreateInfo mp = pi;
         mp.pSetLayouts = &mset, mp.pPushConstantRanges = &mr;
         if (vkCreateDescriptorSetLayout(dev.device, &ml, nullptr, &mset) == VK_SUCCESS &&
@@ -6176,10 +6235,18 @@ void dlss_pass(VkCommandBuffer cmd, VkPipeline pipe, VkSampler sampler, VkImageV
     if (push) vkCmdPushConstants(cmd, ds.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, push);
     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
 }
-/// (hookshot) RX_DLSS_OBJMV=0: the camera's motion alone, as before the check (dlss_objmv.h)
-bool objmv_on() {
-    static const bool on = !(getenv("RX_DLSS_OBJMV") && atoi(getenv("RX_DLSS_OBJMV")) == 0);
-    return on;
+/// (hookshot) RX_DLSS_OBJMV (dlss_objmv.h): 0 the camera's motion alone, as before the check; 1 (unset) own motion, the followed
+/// character's vector zero; 2 the camera's vectors kept and DLSS's bias mask where the surface moved by itself (only DLSS super
+/// resolution changes: frame generation keeps the camera's vectors); 3 both, NX2navi's Ocarina default
+int objmv_mode() {
+    static const int v = getenv("RX_DLSS_OBJMV") ? std::clamp(atoi(getenv("RX_DLSS_OBJMV")), 0, 3) : 1;
+    return v;
+}
+bool objmv_on() { return objmv_mode() != 0; }
+/// RX_DLSS_BIAS=<percent>: how much DLSS favours this frame's colour where the mask is (65 by default, NX2navi's)
+float objmv_bias() {
+    static const float v = getenv("RX_DLSS_BIAS") ? std::clamp(atoi(getenv("RX_DLSS_BIAS")), 1, 100) / 100.0f : 0.65f;
+    return v;
 }
 /// The motion pass (shaders/dlss_motion.comp): the camera's motion of each pixel from its depth and, with the check, own motion for
 /// what moves by itself (the character the camera follows: zero). Last frame's distances are used when they are of the frame just
@@ -6196,20 +6263,27 @@ void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& 
     DlssImg& out = ds.dist[ds.dist_cur];
     const DlssImg& prev = ds.dist[ds.dist_cur ^ 1];
     const VkDescriptorImageInfo ii{ds.nearest, ds.used.depth_view, VK_IMAGE_LAYOUT_GENERAL}, oi{VK_NULL_HANDLE, ds.motion.view, VK_IMAGE_LAYOUT_GENERAL},
-        pi{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL}, di{VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL};
+        pi{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL}, di{VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL},
+        mi{VK_NULL_HANDLE, ds.mask.view, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorBufferInfo ci{ds.counts, 0, 16};
-    VkWriteDescriptorSet wr[5];
-    for (uint32_t i = 0; i < 5; i++) {
+    VkWriteDescriptorSet wr[6];
+    for (uint32_t i = 0; i < 6; i++) {
         wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[i].dstBinding = i, wr[i].descriptorCount = 1;
         wr[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
     wr[0].pImageInfo = &ii, wr[1].pImageInfo = &oi, wr[2].pImageInfo = &pi, wr[3].pImageInfo = &di, wr[4].pBufferInfo = &ci;
-    float push[20];
+    wr[5].pImageInfo = &mi;
+    // (the mask only once last frame's distances are there: without them nothing is checked, and an empty mask says nothing)
+    ds.mask_made = on && prev_ok && objmv_mode() >= 2;
+    float push[28] = {};
     std::copy(clip.begin(), clip.end(), push);
     push[16] = a, push[17] = b, push[18] = on ? (count ? 2.0f : 1.0f) : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;
+    if (ds.jit.used_frame == now) push[20] = ds.jit.ux, push[21] = ds.jit.uy;   // (the jitter this frame's scene was drawn with)
+    if (ds.mask_made) push[22] = objmv_bias(), push[23] = objmv_mode() == 2 ? 1.0f : 0.0f;   // (the mask; 2: the vectors kept)
+    if (prev_ok) push[24] = ds.dist_jx, push[25] = ds.dist_jy;   // (last frame's distances were drawn with its jitter)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.motion_pipe);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.mv_layout, 0, 5, wr);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.mv_layout, 0, 6, wr);
     vkCmdPushConstants(cmd, ds.mv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
     vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
     VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the counts, read on the CPU at the log)
@@ -6218,13 +6292,15 @@ void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& 
     VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
     vkCmdPipelineBarrier2(cmd, &hd);
-    if (on) ds.dist_cur ^= 1, ds.dist_frame = now, ds.dist_size = size, ds.objmv_frames += prev_ok && count;
+    if (on) ds.dist_cur ^= 1, ds.dist_frame = now, ds.dist_size = size, ds.objmv_frames += prev_ok && count, ds.dist_jx = push[20],
+            ds.dist_jy = push[21];
     else ds.dist_frame = ~0ull;
     static bool told;
     if (!told) {
         told = true;
-        logf("vk: dlss: own motion %s", on ? "on: what moves by itself is checked against last frame's depth (RX_DLSS_OBJMV=0: camera only)"
-                                           : objmv_on() ? "off: the scene's projection is not a perspective one" : "off (RX_DLSS_OBJMV=0): the camera's motion alone");
+        logf("vk: dlss: own motion %s (RX_DLSS_OBJMV=%d%s)", on ? "on: what moves by itself is checked against last frame's depth"
+                                           : objmv_on() ? "off: the scene's projection is not a perspective one" : "off: the camera's motion alone",
+             objmv_mode(), objmv_mode() == 2 ? ": the camera's vectors kept, DLSS's bias mask" : objmv_mode() == 3 ? ": and DLSS's bias mask" : "");
     }
 }
 /// The 600-frame log's line on own motion: of the pixels checked, those that moved by themselves and those held still on screen
@@ -6288,6 +6364,43 @@ void dlss_note_camera(const NvnState& s, const Targets& at) {
     std::copy_n(c + 0x180 / 4, 16, ds.cam.prev.begin());
 }
 
+/// From dynamic_state, every draw: the viewport offset of DLSS's jitter (DlssJitter) when this draw is the scene camera's. False:
+/// the viewport as the game set it
+bool dlss_jitter_of(const NvnState& s, const Targets& at, float& x, float& y) {
+    // (the scene's size, the one DLSS took last: a shadow map or a reflection with a block of the same shape is not jittered.
+    // Not with the parallel replay: ds.jit is the replay thread's, RX_VK_PARALLEL records draws on several)
+    if (!jitter_mode() || !dlss_on() || !at.depth || at.depth_format != VK_FORMAT_D32_SFLOAT || at.samples != VK_SAMPLE_COUNT_1_BIT ||
+        at.width != ds.used.w || at.height != ds.used.h || parallel_replay())
+        return false;
+    DlssJitter& j = ds.jit;
+    const uint64_t now = texture_frame_no();
+    // (once a frame: a jittered frame DLSS did not make stops the jitter for a while, dlss_jitter.h)
+    if (const uint64_t missed = j.hold.frame_start(now); missed != ~0ull && j.hold.holds <= 8)
+        logf("vk: dlss: jitter held for %d frames (frame %llu was jittered and DLSS did not make it)", j.hold.left, (unsigned long long)missed);
+    // (after a frame DLSS made: the first one after a pause, a cut or a menu goes unjittered)
+    if (j.hold.held() || ds.last_frame == ~0ull || ds.last_frame + 1 != now) return false;
+    const nvn_p_bind_buf& u = s.ubo[0][0];   // (Maxwell's cbuf 3 of the vertex stage)
+    if (!u.addr || (u.size && u.size < 0x128)) return false;
+    if (j.blocks_frame != now) j.blocks_frame = now, j.nblocks = 0;
+    int i = 0;
+    while (i < j.nblocks && j.blocks[i].addr != u.addr) i++;
+    bool scene;
+    if (i < j.nblocks) {
+        scene = j.blocks[i].scene;
+    } else {
+        float ab[2], wh[2];
+        scene = ub_read(u.addr + 0xa8, ab, sizeof ab) && ub_read(u.addr + 0x120, wh, sizeof wh) && ab[0] == -1.0f && ab[1] == 0.0f &&
+                wh[0] == (float)at.width && wh[1] == (float)at.height;
+        if (j.nblocks < 16) j.blocks[j.nblocks++] = {u.addr, scene};
+    }
+    if (!scene) return false;
+    x = j.jx, y = j.jy;
+    if (j.used_frame != now) j.used_frame = now, j.ux = x, j.uy = y;
+    j.hold.used(now);
+    j.draws++;
+    return true;
+}
+
 /// DLSS's colour for this frame into ds.color (encode: square-root encode it, the tonemapped scene; else the network's own input,
 /// encoded already), with the checks that decide the frame; ds.used the camera it goes with. False: the game's passes run
 bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
@@ -6306,7 +6419,11 @@ bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd) ||
         // (own motion's view distances, this and last frame's: made with RX_DLSS_OBJMV=0 too, the motion pass binds them always)
         !dlss_image(ds.dist[0], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd) ||
-        !dlss_image(ds.dist[1], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd))
+        !dlss_image(ds.dist[1], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd) ||
+        // (the bias mask, bound always as the distances are; written and given to DLSS with RX_DLSS_OBJMV 2 and 3)
+        // (R16F, not R8: Streamline 2.14's Vulkan format table takes VK_FORMAT_R8_UNORM to its own format one way only, and a
+        // copy of an R8 mask failed "Cannot have undefined format" four times a frame, sl.chi/vulkan.cpp getFormat, 09/11)
+        !dlss_image(ds.mask, ds.cam.w, ds.cam.h, VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd))
         return dlss_fallback("images not made"), false;
     int32_t push[16] = {encode ? 1 : 0};
     gprof_begin(cmd);
@@ -6379,7 +6496,9 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
                  (unsigned long long)now, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
         }
         if (ds.evals % 600 == 599) {   // (a cut every frame would mean +0x180 is not last frame's camera: no history, no ghosting)
-            logf("vk: dlss: the last 600 frames: %u history resets, %u of them camera cuts", ds.resets, ds.cuts);
+            logf("vk: dlss: the last 600 frames: %u history resets, %u of them camera cuts; jitter: %llu draws, %llu holds in all", ds.resets,
+                 ds.cuts, (unsigned long long)ds.jit.draws, (unsigned long long)ds.jit.hold.holds);
+            ds.jit.draws = 0;
             ds.resets = ds.cuts = 0;
             objmv_log();
         }
@@ -6392,6 +6511,13 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
         // (the frame's camera for the constants DLSS and DLSS Frame Generation share; the frame numbered by the game's presents)
         DlssView view;
         view.view_projection = ds.used.cur.data(), view.clip_to_previous = clip.data();
+        const DlssImage bias{ds.mask.image, ds.mask.view, VK_FORMAT_R16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+        if (ds.mask_made) view.bias = &bias;   // (RX_DLSS_OBJMV 2 and 3: DLSS's bias mask)
+        if (ds.jit.used_frame == now) {   // (the offset this frame's scene was drawn with; RX_DLSS_JITTER=-1 tells DLSS the opposite)
+            const float sign = jitter_mode() < 0 ? -1.0f : 1.0f;
+            view.jitter[0] = sign * ds.jit.ux, view.jitter[1] = sign * ds.jit.uy;
+        }
         ok = dlss_evaluate(cmd, color, depth, motion, output, reset, dlss_frame_id(), view);
         ds.evals++;
         if (ok) {
@@ -6399,6 +6525,13 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
                 logf("vk: dlss: DLSS draws the upscale from frame %llu (%ux%u -> %ux%u)", (unsigned long long)now, rw, rh, ow, oh);
             ds.reason = nullptr;
             ds.last_frame = now, ds.last_vp = ds.used.cur;
+            ds.jit.hold.made(now);   // (this frame, jittered or not, reached the screen through DLSS)
+            if (jitter_mode()) {
+                next_jitter(rw, ow);
+                static bool said;
+                if (!said && ds.jit.used_frame == now)
+                    said = true, logf("vk: dlss: jitter on the scene camera's draws: Halton(2,3), %u phases (RX_DLSS_JITTER=%d)", ds.jit.phases, jitter_mode());
+            }
         }
     }
     full_barrier(cmd);

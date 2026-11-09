@@ -106,7 +106,7 @@ struct Gpu {
     VkPipeline pipe;
     VkPipelineLayout pl;
     VkDescriptorSet set;
-    Img depth, motion, prev, out;
+    Img depth, motion, prev, out, mask;
     Buf up, down, counts;
     VkSampler sampler;
 };
@@ -130,19 +130,22 @@ static void compare(Gpu& g, const char* name, const Run& r, bool on, bool prev_o
     c.bufferOffset = px * 4;
     vkCmdCopyBufferToImage(cb, g.up.buffer, g.prev.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     for (VkImage i : {g.depth.image, g.prev.image}) layout(cb, i, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
-    for (VkImage i : {g.motion.image, g.out.image}) layout(cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-    float push[20];
-    std::copy_n(r.clip, 16, push);   // (vk_draw.cpp dlss_motion_pass: the clip-to-previous, a, b, on, prev_ok)
+    for (VkImage i : {g.motion.image, g.out.image, g.mask.image}) layout(cb, i, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    float push[28] = {};
+    std::copy_n(r.clip, 16, push);   // (vk_draw.cpp dlss_motion_pass: the clip-to-previous, a, b, on, prev_ok, the jitter)
     push[16] = r.a1, push[17] = r.b1, push[18] = on ? 2.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;   // (2: on, and counted)
+    push[20] = r.jx, push[21] = r.jy, push[22] = r.mask_value, push[23] = r.keep ? 1.0f : 0.0f, push[24] = r.jx0, push[25] = r.jy0;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g.pl, 0, 1, &g.set, 0, nullptr);
     vkCmdPushConstants(cb, g.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
     vkCmdDispatch(cb, (W + 7) / 8, (H + 7) / 8, 1);
-    for (VkImage i : {g.motion.image, g.out.image}) layout(cb, i, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    for (VkImage i : {g.motion.image, g.out.image, g.mask.image}) layout(cb, i, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     c.bufferOffset = 0;
     vkCmdCopyImageToBuffer(cb, g.motion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.down.buffer, 1, &c);
     c.bufferOffset = px * 4;
     vkCmdCopyImageToBuffer(cb, g.out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.down.buffer, 1, &c);
+    c.bufferOffset = px * 8;
+    vkCmdCopyImageToBuffer(cb, g.mask.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.down.buffer, 1, &c);
     VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     hb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, nullptr, 0, nullptr);
@@ -155,7 +158,8 @@ static void compare(Gpu& g, const char* name, const Run& r, bool on, bool prev_o
     const uint16_t* mv = (const uint16_t*)g.down.map;
     const float* dist = (const float*)((const char*)g.down.map + px * 4);
     const uint32_t* n = (const uint32_t*)g.counts.map;
-    size_t bad_mv = 0, bad_still = 0, bad_dist = 0;
+    const uint16_t* mask = (const uint16_t*)((const char*)g.down.map + px * 8);
+    size_t bad_mv = 0, bad_still = 0, bad_dist = 0, bad_mask = 0;
     float worst = 0;
     for (size_t i = 0; i < px; i++) {
         const float gx = half_to_float(mv[i * 2]), gy = half_to_float(mv[i * 2 + 1]), cx = r.mv[i * 2], cy = r.mv[i * 2 + 1];
@@ -164,14 +168,17 @@ static void compare(Gpu& g, const char* name, const Run& r, bool on, bool prev_o
         bad_mv += e > tol;
         bad_still += (gx == 0 && gy == 0) != (cx == 0 && cy == 0);
         if (on) bad_dist += std::fabs(dist[i] - r.dist[i]) > 1e-5f * std::max(1.0f, r.dist[i]);
+        if (r.mask_value > 0) bad_mask += std::fabs(half_to_float(mask[i]) - r.mask[i]) > 1e-3f;   // (R16F)
     }
     const objmv::Counts& m = r.counts;
     const auto close = [](uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) * 200u <= std::max(a, b) + 200u; };   // (0.5%)
-    std::printf("gpu %-12s vectors off %zu (worst %.4f px), stillness differs %zu, distances off %zu; moved %u/%u held %u/%u checked %u/%u "
-                "(shader/model)\n", name, bad_mv, worst, bad_still, bad_dist, n[0], m.moved, n[1], m.held, n[2], m.checked);
+    std::printf("gpu %-12s vectors off %zu (worst %.4f px), stillness differs %zu, distances off %zu, mask off %zu; moved %u/%u held %u/%u "
+                "checked %u/%u (shader/model)\n", name, bad_mv, worst, bad_still, bad_dist, bad_mask, n[0], m.moved, n[1], m.held, n[2],
+                m.checked);
     CHECK(bad_mv * 1000 <= px);       // (at most 0.1%: float against half, and a decision at the tolerance's edge)
     CHECK(bad_still * 1000 <= px);
     CHECK(bad_dist == 0);
+    CHECK(bad_mask * 1000 <= px);
     CHECK(close(n[0], m.moved) && close(n[1], m.held) && close(n[2], m.checked));
 }
 
@@ -230,23 +237,25 @@ int main() {
     g.motion = image(VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     g.prev = image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     g.out = image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    g.mask = image(VK_FORMAT_R16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     g.up = buffer((VkDeviceSize)W * H * 8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    g.down = buffer((VkDeviceSize)W * H * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    g.down = buffer((VkDeviceSize)W * H * 10, VK_BUFFER_USAGE_TRANSFER_DST_BIT);   // (motion, distances, the mask's halves)
     g.counts = buffer(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};   // (vk_draw.cpp's ds.nearest)
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCreateSampler(device, &sci, nullptr, &g.sampler);
-    // (vk_draw.cpp dlss_pipelines: the motion pass's five bindings and 80 bytes pushed; a plain set here, a pushed one there)
-    VkDescriptorSetLayoutBinding b[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    // (vk_draw.cpp dlss_pipelines: the motion pass's six bindings and 112 bytes pushed; a plain set here, a pushed one there)
+    VkDescriptorSetLayoutBinding b[6] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                          {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
                                          {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+                                         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                         {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 5, li.pBindings = b;
+    li.bindingCount = 6, li.pBindings = b;
     VkDescriptorSetLayout sl;
     vkCreateDescriptorSetLayout(device, &li, nullptr, &sl);
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 112};
     VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pli.setLayoutCount = 1, pli.pSetLayouts = &sl, pli.pushConstantRangeCount = 1, pli.pPushConstantRanges = &pr;
     vkCreatePipelineLayout(device, &pli, nullptr, &g.pl);
@@ -258,7 +267,7 @@ int main() {
     cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr};
     cpi.layout = g.pl;
     CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, nullptr, &g.pipe) == VK_SUCCESS);
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 3},
+    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4},
                                   {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1, dpi.poolSizeCount = 3, dpi.pPoolSizes = ps;
@@ -267,17 +276,18 @@ int main() {
     VkDescriptorSetAllocateInfo sai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     sai.descriptorPool = dp, sai.descriptorSetCount = 1, sai.pSetLayouts = &sl;
     vkAllocateDescriptorSets(device, &sai, &g.set);
-    const VkDescriptorImageInfo ii[4] = {{g.sampler, g.depth.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g.motion.view, VK_IMAGE_LAYOUT_GENERAL},
-                                         {VK_NULL_HANDLE, g.prev.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g.out.view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkDescriptorImageInfo ii[6] = {{g.sampler, g.depth.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g.motion.view, VK_IMAGE_LAYOUT_GENERAL},
+                                         {VK_NULL_HANDLE, g.prev.view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g.out.view, VK_IMAGE_LAYOUT_GENERAL},
+                                         {}, {VK_NULL_HANDLE, g.mask.view, VK_IMAGE_LAYOUT_GENERAL}};
     const VkDescriptorBufferInfo cbi{g.counts.buffer, 0, 16};
-    VkWriteDescriptorSet wr[5];
-    for (uint32_t i = 0; i < 5; i++) {
+    VkWriteDescriptorSet wr[6];
+    for (uint32_t i = 0; i < 6; i++) {
         wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         wr[i].dstSet = g.set, wr[i].dstBinding = i, wr[i].descriptorCount = 1, wr[i].descriptorType = b[i].descriptorType;
-        if (i < 4) wr[i].pImageInfo = &ii[i];
+        if (i != 4) wr[i].pImageInfo = &ii[i];
         else wr[i].pBufferInfo = &cbi;
     }
-    vkUpdateDescriptorSets(device, 5, wr, 0, nullptr);
+    vkUpdateDescriptorSets(device, 6, wr, 0, nullptr);
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = family;
     vkCreateCommandPool(device, &cpci, nullptr, &g.pool);
@@ -305,6 +315,24 @@ int main() {
     compare(g, "sky turn", two_frames(k, kc0, k, kc1), true, true);
     compare(g, "off", two_frames(r0, rc0, r1, rc1, false, true), false, true);
     compare(g, "first frame", two_frames(r0, rc0, r1, rc1, true, false), true, false);
+    // (DLSS's jitter: the scene drawn a sub-pixel off, the shader taking each pixel where an unjittered draw puts it, as the model)
+    compare(g, "jittered", two_frames(r0, rc0, r1, rc1, true, true, 0.375f, -0.2777f), true, true);
+    // (DLSS's bias mask: RX_DLSS_OBJMV 2, the camera's vectors kept, and 3, own motion too)
+    compare(g, "mask kept", two_frames(r0, rc0, r1, rc1, true, true, 0, 0, 0.65f, true), true, true);
+    compare(g, "mask+motion", two_frames(r0, rc0, r1, rc1, true, true, 0, 0, 0.65f, false), true, true);
+    // (both frames jittered, each its own: the check's looks into last frame's distances move by the difference)
+    compare(g, "both jittered", two_frames(r0, rc0, r1, rc1, true, true, 0.375f, -0.2777f, 0.65f, false, -0.25f, 0.1111f), true, true);
+    // (the camera walking at the wall: the vectors grow across the screen, so a shader taking the jitter the wrong way is 0.4 px off,
+    // far over the half-float tolerance; on the scenes above it was within it)
+    Scene wall;
+    wall.has_box = false;
+    const Cam wc0{{0, 1.5, 6.0}, {0, 1.2, -60}}, wc1{{0.4, 1.6, -14.0}, {0.6, 1.3, -60}};
+    compare(g, "jittered walk", two_frames(wall, wc0, wall, wc1, false, true, 0.375f, -0.2777f), false, true);
+    // (the looks with last frame's jitter and this frame's, where the 3x3 closest cannot hide them: objmv_scene.h look_offset)
+    compare(g, "look prev x", look_offset(0.9f, 0, 0, 0, false), true, true);
+    compare(g, "look this x", look_offset(0, 0, -0.9f, 0, false), true, true);
+    compare(g, "look prev y", look_offset(0, 0.9f, 0, 0, true), true, true);
+    compare(g, "look this y", look_offset(0, 0, 0, -0.9f, true), true, true);
 
     vkDestroyDevice(device, nullptr);   // (the rest goes with the process)
     vkDestroyInstance(inst, nullptr);

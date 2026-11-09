@@ -357,7 +357,7 @@ sl::float4x4 rows(const float* v) {
 sl::Constants frame_constants(const DlssView* view, bool reset, float rw, float rh) {
     sl::Constants c{};
     c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity();
-    c.jitterOffset = {0.0f, 0.0f};
+    c.jitterOffset = {view ? view->jitter[0] : 0.0f, view ? view->jitter[1] : 0.0f};   // (render pixels; the vectors are unjittered)
     c.mvecScale = {1.0f / rw, 1.0f / rh};   // (motion in render pixels; Streamline wants [-1,1] screen units)
     c.cameraPinholeOffset = {0.0f, 0.0f};
     c.cameraPos = {0.0f, 0.0f, 0.0f};
@@ -412,6 +412,12 @@ void barriers(VkCommandBuffer cmd, const std::array<VkImageMemoryBarrier2, 4>& b
     VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     d.imageMemoryBarrierCount = (uint32_t)b.size();
     d.pImageMemoryBarriers = b.data();
+    vkCmdPipelineBarrier2(cmd, &d);
+}
+void barriers(VkCommandBuffer cmd, const VkImageMemoryBarrier2& b) {   // (one image: the bias mask)
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.imageMemoryBarrierCount = 1;
+    d.pImageMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
 }
 
@@ -959,6 +965,7 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
                        barrier(depth, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R),
                        barrier(motion, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R),
                        barrier(output, any, dlss_out, G, G)});
+        if (view.bias) barriers(cmd, barrier(*view.bias, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R));
         sl::Resource rc = resource(color, R, VK_IMAGE_USAGE_SAMPLED_BIT), rd = resource(depth, R, VK_IMAGE_USAGE_SAMPLED_BIT),
                      rm = resource(motion, R, VK_IMAGE_USAGE_SAMPLED_BIT), ro = resource(output, G, out_usage);
         const sl::Extent render_area{0, 0, color.width, color.height}, output_area{0, 0, output.width, output.height};
@@ -967,8 +974,12 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
                         td{&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
                         tm{&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
                         to{&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
-        const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to};
-        r = st.evaluate_feature(sl::kFeatureDLSS, *t, inputs, (uint32_t)std::size(inputs), reinterpret_cast<sl::CommandBuffer*>(cmd));
+        // (the bias mask, given: DLSS takes this frame's colour there in proportion, over a history that holds something else)
+        sl::Resource rb = view.bias ? resource(*view.bias, R, VK_IMAGE_USAGE_SAMPLED_BIT) : sl::Resource{};
+        sl::ResourceTag tb{&rb, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area};
+        const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to, &tb};
+        r = st.evaluate_feature(sl::kFeatureDLSS, *t, inputs, (uint32_t)std::size(inputs) - (view.bias ? 0u : 1u),
+                                reinterpret_cast<sl::CommandBuffer*>(cmd));
         if (!dlss_drawn(r)) {
             stage = "slEvaluateFeature";
         } else if (r == sl::Result::eWarnOutOfVRAM && st.over_budget++ % 600 == 0) {   // (drawn: a warning only)
@@ -977,6 +988,7 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
         // back to GENERAL, the output written (also when the evaluation failed: the caller's layouts hold)
         barriers(cmd, {barrier(color, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(depth, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
                        barrier(motion, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(output, dlss_out, any, G, G)});
+        if (view.bias) barriers(cmd, barrier(*view.bias, VK_ACCESS_2_SHADER_READ_BIT, any, R, G));
         // (DLSS-G) the same depth and motion for frame generation at the present, in GENERAL here. Copied by Streamline as they are
         // now (eOnlyValidNow): the game's depth target is drawn into again before the present (and may be freed), and next frame's
         // motion pass rewrites ours

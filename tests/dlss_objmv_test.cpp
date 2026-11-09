@@ -226,6 +226,129 @@ static void sky_turn() {
     CHECK(sky_changed == 0);
 }
 
+/// DLSS's jitter (vk_draw.cpp dlss_jitter_of): the scene drawn with a sub-pixel viewport offset gives the unjittered vectors (DLSS's
+/// default) when the pass takes each pixel's surface where an unjittered draw puts it, its centre less the offset. The camera walks
+/// towards the wall, so the vectors grow across the screen: a pass that left the offset in, or took it the wrong way, is off by
+/// their gradient times the offset. The truth: each pixel's surface point (the ray's hit) seen by last frame's camera
+static void jittered_draw() {
+    Scene s;
+    s.has_box = false;   // (the wall alone: no silhouette, every pixel's depth exact)
+    const Cam c0{{0, 1.5, 6.0}, {0, 1.2, -60}}, c1{{0.4, 1.6, -14.0}, {0.6, 1.3, -60}};
+    float vp0[16], vp1[16], inv1[16], clip[16], a1 = 0, b1 = 0, a0 = 0, b0 = 0;
+    view_projection(c0, vp0), view_projection(c1, vp1);
+    CHECK(objmv::depth_terms(vp1, a1, b1) && objmv::depth_terms(vp0, a0, b0));
+    dlssg::invert4(vp1, inv1);
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            double v = 0;
+            for (int k = 0; k < 4; k++) v += (double)vp0[i * 4 + k] * inv1[k * 4 + j];
+            clip[i * 4 + j] = (float)v;
+        }
+    const float jx = 0.375f, jy = -0.2777f;   // (a Halton(2,3) point less 0.5)
+    std::vector<float> d1, mv, ignore;
+    std::vector<char> box;
+    std::vector<double> hit;
+    draw(s, vp1, d1, box, jx, jy, &hit);
+    const auto worst = [&](float tx, float ty) {   // (the largest error against the truth, in render pixels)
+        objmv::motion_pass(W, H, d1.data(), clip, a1, b1, false, false, nullptr, mv, ignore, tx, ty);
+        double e = 0;
+        for (int py = 2; py < H - 2; py++)
+            for (int px = 2; px < W - 2; px++) {
+                const double* q = hit.data() + (size_t)(py * W + px) * 3;
+                double c[4];
+                for (int r = 0; r < 4; r++) c[r] = vp0[r * 4] * q[0] + vp0[r * 4 + 1] * q[1] + vp0[r * 4 + 2] * q[2] + vp0[r * 4 + 3];
+                const double wx = (c[0] / c[3] * 0.5 + 0.5) * W, wy = (0.5 - c[1] / c[3] * 0.5) * H;   // (last frame, window y down)
+                const double ux = px + 0.5 - jx, uy = py + 0.5 - jy;   // (this frame, unjittered)
+                const int i = py * W + px;
+                e = std::max(e, std::hypot(mv[i * 2] - (wx - ux), mv[i * 2 + 1] - (wy - uy)));
+            }
+        return e;
+    };
+    const double right = worst(jx, jy), none = worst(0, 0), flipped = worst(-jx, -jy);
+    std::printf("jittered draw: worst error %.5f px with the offset, %.4f without it, %.4f the wrong way\n", right, none, flipped);
+    CHECK(right < 0.002);
+    CHECK(none > 0.05 && none > 20 * right);
+    CHECK(flipped > 1.5 * none);
+}
+
+/// DLSS's bias mask (RX_DLSS_OBJMV 2 and 3): the mask's value on every pixel the check found moved by itself, 0 elsewhere. With 2 the
+/// camera's vectors stay (frame generation keeps them; only DLSS super resolution takes the mask), with 3 the followed character's
+/// are zero as with 1. Link running away from the camera behind him: his pixels and the band he uncovered are masked
+static void bias_mask() {
+    Scene r0, r1;
+    r0.has_box = r1.has_box = true;
+    r0.box = {{-0.5, 0.0, 3.5}, {0.5, 1.8, 4.5}}, r1.box = {{-0.5, 0.0, 3.0}, {0.5, 1.8, 4.0}};
+    const Cam c0{{0, 1.2, 8.0}, {0, 1.0, -20}}, c1{{0, 1.2, 7.5}, {0, 1.0, -20.5}};
+    const Run plain = two_frames(r0, c0, r1, c1);                               // (1: own motion, no mask)
+    const Run kept = two_frames(r0, c0, r1, c1, true, true, 0, 0, 0.65f, true);   // (2)
+    const Run both = two_frames(r0, c0, r1, c1, true, true, 0, 0, 0.65f, false);  // (3)
+    uint32_t masked = 0, wrong_value = 0, box = 0, box_masked = 0;
+    bool kept_is_camera = true, both_is_plain = true, same_mask = true;
+    for (int i = 0; i < W * H; i++) {
+        const float m = kept.mask[i];
+        masked += m > 0, wrong_value += m != 0 && m != 0.65f;
+        same_mask = same_mask && m == both.mask[i];
+        kept_is_camera = kept_is_camera && kept.mv[i * 2] == kept.cam_mv[i * 2] && kept.mv[i * 2 + 1] == kept.cam_mv[i * 2 + 1];
+        both_is_plain = both_is_plain && both.mv[i * 2] == plain.mv[i * 2] && both.mv[i * 2 + 1] == plain.mv[i * 2 + 1];
+        if (inside_box(kept, i % W, i / W, 2)) box++, box_masked += m > 0;
+    }
+    std::printf("bias mask: %u pixels masked (moved %u), Link %u of %u masked; the vectors: kept %s, with motion %s\n", masked,
+                kept.counts.moved, box_masked, box, kept_is_camera ? "the camera's" : "CHANGED", both_is_plain ? "as 1" : "DIFFER");
+    CHECK(masked == kept.counts.moved && masked > 0 && wrong_value == 0);
+    CHECK(box > 0 && box_masked * 10 >= box * 9);   // (his inside, nine in ten at least)
+    CHECK(kept_is_camera && both_is_plain && same_mask);
+    bool none = true;   // (no mask asked: nothing written)
+    for (float v : plain.mask) none = none && v == 0.0f;
+    CHECK(none);
+    // an NPC crossing, not followed: moved, never held; the mask is on what moved, not only on what was held
+    Scene s0, s1;
+    s0.has_box = s1.has_box = true;
+    s0.box = {{-1.5, 0.0, -3.0}, {-0.5, 1.8, -2.0}};
+    s1.box = {{0.0, 0.0, -3.0}, {1.0, 1.8, -2.0}};
+    const Cam k0{{0, 1.0, 8.0}, {0, 1.0, -20}}, k1{{0.1, 1.0, 8.0}, {0.1, 1.0, -20}};
+    const Run cross = two_frames(s0, k0, s1, k1, true, true, 0, 0, 0.65f, true);
+    uint32_t cross_masked = 0;
+    for (float v : cross.mask) cross_masked += v > 0;
+    std::printf("bias mask, crossing: %u masked, moved %u, held %u\n", cross_masked, cross.counts.moved, cross.counts.held);
+    CHECK(cross.counts.held == 0 && cross.counts.moved > 200 && cross_masked == cross.counts.moved);
+}
+
+/// Both frames jittered, each with its own offset (the motion pass is given last frame's, vk_draw.cpp ds.dist_jx): the check finds
+/// the same that moved and the same held as with no jitter at all; without last frame's offset its looks land a fraction of a pixel
+/// off and a still world starts to look moved (the dense grass taken for motion, worse with jitter)
+static void both_jittered() {
+    Scene r0, r1;
+    r0.has_box = r1.has_box = true;
+    r0.box = {{-0.5, 0.0, 3.5}, {0.5, 1.8, 4.5}}, r1.box = {{-0.5, 0.0, 3.0}, {0.5, 1.8, 4.0}};
+    const Cam c0{{0, 1.2, 8.0}, {0, 1.0, -20}}, c1{{0, 1.2, 7.5}, {0, 1.0, -20.5}};
+    const Run plain = two_frames(r0, c0, r1, c1);
+    const Run jit = two_frames(r0, c0, r1, c1, true, true, 0.375f, -0.2777f, 0, false, -0.25f, 0.1111f);
+    std::printf("both jittered: moved %u held %u (unjittered %u, %u)\n", jit.counts.moved, jit.counts.held, plain.counts.moved,
+                plain.counts.held);
+    const auto near = [](uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) * 50 <= b + 50; };   // (2%: the edges' pixels)
+    CHECK(near(jit.counts.moved, plain.counts.moved) && near(jit.counts.held, plain.counts.held));
+    // a still world under a moving camera, both frames jittered: still nothing taken for motion
+    Scene s;
+    s.has_box = true;
+    s.box = {{-2.0, 0.0, -6.0}, {1.0, 3.0, -4.0}};
+    const Cam sc0{{0, 1.5, 6.0}, {0, 1.2, -20}}, sc1{{0.25, 1.55, 5.7}, {1.5, 1.0, -20}};
+    const Run still = two_frames(s, sc0, s, sc1, true, true, 0.375f, -0.2777f, 0, false, -0.25f, 0.1111f);
+    std::printf("both jittered, still world: moved %u of %u\n", still.counts.moved, still.counts.checked);
+    CHECK(still.counts.moved * 1000 <= still.counts.checked * 3);
+    // (the 3x3 closest hides a look a fraction of a pixel off on smooth scenes, so the two above pass without last frame's jitter
+    // too: the looks below do not)
+    // (the 3x3 closest hides a look a fraction of a pixel off on smooth scenes: objmv_scene.h look_offset puts the right distance
+    // where only the look that takes the jitters right finds it)
+    for (const Look& l : kLooks) {
+        const int line = l.rows ? W : H;
+        const int with = look_missed(look_offset(l.pjx, l.pjy, l.jx, l.jy, l.rows), l.rows);
+        const int without = look_missed(look_offset(0, 0, 0, 0, l.rows), l.rows);
+        const int wrong = look_missed(look_offset(-l.pjx, -l.pjy, -l.jx, -l.jy, l.rows), l.rows);
+        std::printf("look with %s: %d of %d taken for motion with it, %d without, %d the wrong way\n", l.what, with, line, without, wrong);
+        CHECK(with == 0 && without == line && wrong == line);
+    }
+}
+
 int main() {
     depth_terms();
     runner();
@@ -235,6 +358,9 @@ int main() {
     crossing();
     off_and_first();
     sky_turn();
+    jittered_draw();
+    bias_mask();
+    both_jittered();
     failures += scene_failures;
     std::printf("dlss own motion: %d failures\n", failures);
     return failures ? 1 : 0;

@@ -72,9 +72,24 @@ def main():
     need("push[16] = a, push[17] = b, push[18] = on ? (count ? 2.0f : 1.0f) : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;" in passc,
          "the push constants are not the shader's layout")
     # the counts into host memory: only on the frames the log counts (every frame cost GPU time), and they are those frames
-    need("const bool count = on && now % kObjmvCountEvery == 0;" in passc and "ds.objmv_frames += prev_ok && count;" in passc,
+    need("const bool count = on && now % kObjmvCountEvery == 0;" in passc and "ds.objmv_frames += prev_ok && count" in passc,
          "the own-motion counts are added every frame, or the log's frames are not the counted ones")
-    need('getenv("RX_DLSS_OBJMV")' in code(block(draw, "bool objmv_on(")), "RX_DLSS_OBJMV does not turn it off")
+    need('getenv("RX_DLSS_OBJMV")' in code(block(draw, "int objmv_mode(")) and "return objmv_mode() != 0;" in code(draw),
+         "RX_DLSS_OBJMV does not turn it off")
+    # the bias mask (RX_DLSS_OBJMV 2 and 3): written only with last frame's distances, given to DLSS that frame, 2 keeps the vectors
+    need("ds.mask_made = on && prev_ok && objmv_mode() >= 2;" in passc and
+         "if (ds.mask_made) push[22] = objmv_bias(), push[23] = objmv_mode() == 2 ? 1.0f : 0.0f;" in passc,
+         "the bias mask is not asked of the motion pass as RX_DLSS_OBJMV says")
+    need("if (ds.mask_made) view.bias = &bias;" in code(draw), "the bias mask is not given to DLSS")
+    dlss_src = code(read("gpu/vk/vk_dlss.cpp"))
+    need("if (view.bias) barriers(cmd, barrier(*view.bias, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R));" in dlss_src
+         and "if (view.bias) barriers(cmd, barrier(*view.bias, VK_ACCESS_2_SHADER_READ_BIT, any, R, G));" in dlss_src,
+         "the bias mask is not made ready for DLSS's read and back to GENERAL after")
+    need("if (prev_ok) push[24] = ds.dist_jx, push[25] = ds.dist_jy;" in passc and "ds.dist_jx = push[20]" in passc and "ds.dist_jy = push[21]" in passc,
+         "the motion pass is not given the jitter last frame's distances were drawn with")
+    dlss = read("gpu/vk/vk_dlss.cpp")
+    need("sl::kBufferTypeBiasCurrentColorHint" in code(dlss) and "(view.bias ? 0u : 1u)" in code(dlss),
+         "Streamline is not given the bias mask, or is given an empty one")
     need(re.search(r"dlss_image\(ds\.dist\[0\], ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R32_SFLOAT", draw) and
          re.search(r"dlss_image\(ds\.dist\[1\], ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R32_SFLOAT", draw),
          "the distance images are not made with the motion image")
