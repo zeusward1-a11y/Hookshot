@@ -70,6 +70,7 @@ ARGS = {
     "nx2/test_timeline_modes.py": ["--cxx", "g++"],
     "tests/test_keep_rendered.py": ["--cxx", "g++"],
     "tests/test_program_answer_domains.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
+    "nx2/test_texture_phi_dominance.py": ["--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"],
     "nx2/test_bc_storage_views.py": ["--headers", "{vulkan_headers}"],
     "nx2/test_mesh_first_types.py": ["--headers", "{spirv_headers}"],
     "nx2/test_texture_init_barrier.py": ["--headers", "{vulkan_headers}"],
@@ -104,7 +105,7 @@ SKIP = {
     "tests/test_linux_driver_fault_guard.py": ({"windows"}, "POSIX signals: the Linux guard"),
 }
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
-for _name in ("nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
+for _name in ("nx2/test_texture_phi_dominance.py", "nx2/test_depth_sample_types.py", "nx2/test_default_point_size.py", "nx2/test_draw_parameters.py", "nx2/test_coop_spirv.py",
               "nx2/test_spirv_struct_identity.py"):
     SKIP[_name] = ({"windows"}, "needs spirv-val: checked on Linux")
 
