@@ -118,6 +118,10 @@ Designed after totk-pc-recomp's runtime/vk_*.c (MIT) and Eden's renderer_vulkan,
   `RX_VK_TEX_MAX_MB` 512: the terrain arrays are 8192 x 8192 x 68 ASTC, 24 GB as RGBA8). New images are cleared.
   An LRU budget (`RX_VK_VRAM_MB`, 4096, less when `VK_EXT_memory_budget` says the process is near its share).
   Images are VRAM only (`requiredFlags`): VMA's fallback to system memory is what ate the user's RAM once.
+  Memory priorities (`VK_EXT_memory_priority`, `memory_priority.h`; opt-in, `RX_VK_MEMORY_PRIORITY=1`): everything is
+  made at the default, 0.5; with `VK_EXT_pageable_device_local_memory` a texture with memory of its own (dedicated, or
+  sparse chunks) unused for `RX_VK_PRIORITY_IDLE` presents (600) drops to 0.1 until it is used again, so the driver
+  moves it out of VRAM first.
 - **Uploads never end a pass**: each recording has a second command buffer, submitted right before it, for uploads,
   new images' layout changes and mirror syncs.
 - **Passes** stay open while the targets stay; clears run inside them (`vkCmdClearAttachments`, cut by the scissor,

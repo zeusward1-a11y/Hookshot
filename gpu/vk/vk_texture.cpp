@@ -48,6 +48,7 @@
 #include "host_shaders/bc_encoder_comp_spv.h"
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
+#include "memory_priority.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "bc_parts.h"
@@ -3031,6 +3032,37 @@ Texture* texture_for_present(const nvn_tex* t) {
     return best ? best : tex;
 }
 
+// (hookshot) with VK_EXT_pageable_device_local_memory, every 60 presents: a texture unused for RX_VK_PRIORITY_IDLE presents
+// (600) drops to the lowest priority, and is back at the default once used again (memory_priority.h). When the process holds
+// more VRAM than the driver allows, the driver moves the lowest out first: a course left behind, an area's terrain arrays,
+// not what the scene draws. Only memory of a texture's own changes: a dedicated allocation (the big ones, past the image
+// pool's blocks) or a sparse image's chunks. One in a pool block keeps the block's, the default
+static void texture_priorities() {
+    static const uint64_t idle = memory_priority::idle_presents(getenv("RX_VK_PRIORITY_IDLE"));
+    if (!idle || !vkSetDeviceMemoryPriorityEXT) return;
+    size_t idle_n = 0, changed = 0;
+    uint64_t idle_b = 0;
+    for (auto& kv : textures) {
+        Texture* t = kv.second.get();
+        const float want = memory_priority::for_texture(frame_no, t->last_frame, idle);
+        if (want != t->mem_priority) {
+            if (t->sparse) {
+                for (VkDeviceMemory m : t->sparse_chunks) vkSetDeviceMemoryPriorityEXT(dev.device, m, want);
+                t->mem_priority = want, changed++;
+            } else if (t->mem_own != 0) {
+                const int r = set_allocation_priority(t->allocation, want);
+                t->mem_own = r > 0 ? 1 : 0;   // (in a block, or no allocation: not asked again)
+                if (r > 0) t->mem_priority = want, changed++;
+            }
+        }
+        if (t->mem_priority == memory_priority::kIdle) idle_n++, idle_b += t->bytes;
+    }
+    static const bool log_all = getenv("RX_VK_LOG_PRIORITY") != nullptr;   // (each pass that changed one)
+    if (frame_no % 600 == 0 || (changed && log_all))
+        logf("vk: memory priority: %zu textures (%llu MB) at the idle priority, %zu changed now", idle_n,
+             (unsigned long long)(idle_b >> 20), changed);
+}
+
 void texture_frame(uint64_t completed) {
     completed_value = completed;
     frame_no++;
@@ -3100,6 +3132,7 @@ void texture_frame(uint64_t completed) {
         }
     }
     bc_scratch_idle();
+    if (dev.pageable_memory && frame_no % 60 == 0) texture_priorities();
     for (auto it = dead.begin(); it != dead.end();) {
         if (it->value > completed) {
             ++it;

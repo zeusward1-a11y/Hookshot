@@ -52,7 +52,9 @@ struct Device {
          sparse_buffers = false, // (sparse-bound buffers on the queue: a pool imported as several dma-bufs)
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
-         native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         memory_priority = false,   // (VK_EXT_memory_priority with its feature: memory_priority.h)
+         pageable_memory = false;   // (VK_EXT_pageable_device_local_memory with its feature: a priority changed after the allocation)
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool mesh_fallback = false;   // (hookshot) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
     VkPhysicalDeviceVulkan12Features vk12{};
@@ -228,6 +230,9 @@ bool create_device_buffer(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
 /// device-local heaps; false when unknown
 bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free = nullptr);
 void vma_log_heaps();
+/// (VK_EXT_pageable_device_local_memory) an allocation's priority now, when it has a memory object of its own: one in a
+/// block shares the block's (memory_priority.h). 1: set; 0: in a shared block, not set; -1: no extension or no allocation
+int set_allocation_priority(VmaAllocation allocation, float priority);
 PFN_vkGetInstanceProcAddr instance_proc();   // vk_main.cpp
 
 bool create_swapchain(uint32_t width, uint32_t height);

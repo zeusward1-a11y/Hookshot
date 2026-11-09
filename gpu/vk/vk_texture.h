@@ -80,6 +80,8 @@ struct Texture {
     uint64_t owned_frame = 0; // (the present its storage was last noted as render targets' (gpu_owned))
     uint32_t key_layout = 0, key_cls = 0;   // (the key's storage layout and format class)
     bool vw_listed = false;   // (in the list of GPU-written textures of virtual pools: texture_flush_to_guest)
+    float mem_priority = 0.5f;   // (the priority its memory was made at or last given: memory_priority.h, texture_priorities)
+    int8_t mem_own = -1;         // (its allocation a memory object of its own, whose priority can change: 1; in a block: 0; not asked: -1)
     std::unordered_map<uint64_t, VkImageView> views;
 };
 
