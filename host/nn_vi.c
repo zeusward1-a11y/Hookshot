@@ -2,6 +2,7 @@
    layer, and the display's vsync event, signaled at 60 Hz by a host thread. HDR and VRR are reported unsupported,
    so the game takes its SDR path. Frames are paced at the native NVN layer's window acquire (the end of this file). */
 #include "hos.h"
+#include "hos_fps.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdio.h>
@@ -321,7 +322,15 @@ void hos_vi_native_presented(void) {
         if (ms < 0) ms = getenv("HOS_FRAME_SLEEP_MS") ? atoi(getenv("HOS_FRAME_SLEEP_MS")) : 0;
         if (ms) hos_sleep_ns(ms * 1000000LL);
     }
-    const int64_t period = 1000000000LL / 60 * present_interval, now = hos_now_ns();
+    /* (HOS_FPS_CAP: the display queue at most that rate, a steady base for frame generation: hos_fps.h) */
+    static int cap = -1;
+    if (cap < 0) {
+        cap = hos_fps_cap_of(getenv("HOS_FPS_CAP"));
+        if (getenv("HOS_FPS_CAP"))
+            hos_log("vi: HOS_FPS_CAP=%s: %s", getenv("HOS_FPS_CAP"),
+                    !cap ? "not 20..60, ignored" : getenv("HOS_NO_PACING") ? "no effect with HOS_NO_PACING" : "frames held to it");
+    }
+    const int64_t period = hos_fps_period_ns(present_interval, cap), now = hos_now_ns();
     realtime_step(now);
     /* (behind by more than a frame: the next one is paced from now, with no burst to catch up) */
     next_frame_at = next_frame_at && now - next_frame_at < period ? next_frame_at + period : now + period;

@@ -53,6 +53,7 @@ ARGS = {
     "tests/test_dlss_actor_gpu.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
     "tests/test_imnmx_immediate.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
+    "tests/test_fps_cap.py": ["--cc", "gcc"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
     "tests/test_target_overlap.py": ["--cxx", "g++"],

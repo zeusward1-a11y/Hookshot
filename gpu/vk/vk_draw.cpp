@@ -5004,6 +5004,7 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
 }
 void dlss_note_camera(const NvnState& s, const Targets& at);   // (below, with the DLSS frame code)
 void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);   // (below: DLSS's actor motion)
+void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);   // (below: RX_DLSS_TRACE)
 bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p);
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
@@ -5125,6 +5126,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (!pl) SKIP_HERE();
     cur_program = &p;
     dlss_skin_check(s, p, d, at);   // (hookshot: a skinned draw of the scene, for DLSS's actor motion)
+    dlss_trace_draw(s, p, d, at);   // (RX_DLSS_TRACE: a frame's scene draws in the log)
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is
@@ -6685,6 +6687,48 @@ void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, con
         ds.actor_noted++;
     }
     ds.actor_ns += (std::chrono::steady_clock::now() - t0).count();
+}
+
+/// (hookshot, after #841's 26a5247: a diagnostic for DLSS's motion) RX_DLSS_TRACE=<frames>: every that many frames, one frame's
+/// draws into targets at least 640 wide, logged: the program, its targets' formats, the geometry and the uniform buffers (which
+/// draws are what: the skinned ones, the foliage the wind moves)
+void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
+    static const int every = getenv("RX_DLSS_TRACE") ? atoi(getenv("RX_DLSS_TRACE")) : 0;
+    if (every <= 0 || at.width < 640) return;
+    if (parallel_replay()) {   // (the replay threads record draws at once: one frame's draws are not one thread's)
+        static bool said;
+        if (!said) said = true, logf("vk: dlss-trace: off with the parallel replay (RX_VK_PARALLEL)");
+        return;
+    }
+    const uint64_t f = texture_frame_no();
+    if (f % (uint64_t)every != (uint64_t)every / 2) return;
+    char line[3072];
+    int n = snprintf(line, sizeof line, "vk: dlss-trace f%llu prog %016llx%s%s %ux%u prim %d c[", (unsigned long long)f,
+                     (unsigned long long)p.key, d.mesh ? " mesh" : "", p.fallback ? "(fb)" : "", at.width, at.height, d.prim);
+    for (int i = 0; i < at.n && n < 1800; i++) n += snprintf(line + n, sizeof line - n, "%s%d", i ? "," : "", (int)at.color_format[i]);
+    n += snprintf(line + n, sizeof line - n, "] d%d %s n%d i%d bv%d inst%d ib%llx g%d,%d,%d ind%llx", (int)at.depth_format,
+                  d.indexed ? "idx" : "arr", d.count, d.first, d.base_vertex, d.instances, (unsigned long long)d.ibuf,
+                  d.groups[0], d.groups[1], d.groups[2], (unsigned long long)d.indirect);
+    for (int v = 0; v < 4 && n < 1800; v++)
+        if (s.vbuf[v].address) n += snprintf(line + n, sizeof line - n, " vb%d=%llx/%llu/s%u", v, (unsigned long long)s.vbuf[v].address,
+                                             (unsigned long long)s.vbuf[v].size, s.vstream[v].stride);
+    n += snprintf(line + n, sizeof line - n, " va");
+    for (int i = 0; i < s.nvattr && i < 16 && n < 1800; i++) {
+        const nvn_va_st a = *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]);
+        n += snprintf(line + n, sizeof line - n, "%s%x@%u:%u", i ? "," : "=", a.fmt, a.offset, a.stream);
+    }
+    for (const Stage& st : p.stages) {
+        const int ns = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+        n += snprintf(line + n, sizeof line - n, " st%d:", ns);
+        for (int u = 0; u < 16 && n < 1900; u++)
+            if (s.ubo[ns][u].addr) n += snprintf(line + n, sizeof line - n, " u%d=%llx/%llu", u, (unsigned long long)s.ubo[ns][u].addr,
+                                                 (unsigned long long)s.ubo[ns][u].size);
+        for (int u = 0; u < 16 && n < 1900; u++)
+            if (s.ssbo[ns][u].addr) n += snprintf(line + n, sizeof line - n, " s%d=%llx/%llu", u, (unsigned long long)s.ssbo[ns][u].addr,
+                                                  (unsigned long long)s.ssbo[ns][u].size);
+    }
+    // (logf keeps 1023 characters a line: a long one goes in pieces, each after the first marked with +)
+    for (int pos = 0; pos < n && pos < (int)sizeof line - 1; pos += 900) logf("%s%.900s", pos ? "vk: dlss-trace + " : "", line + pos);
 }
 
 /// From dynamic_state, every draw: the viewport offset of DLSS's jitter (DlssJitter) when this draw is the scene camera's. False:

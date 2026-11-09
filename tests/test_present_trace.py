@@ -88,7 +88,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="present-trace-") as tmp:
         folder = Path(tmp)
         cpp, exe = folder / "fixture.cpp", folder / "fixture.exe"
-        cpp.write_text(PREFIX + helper + "\n" + actual + "\n" + SUFFIX, encoding="utf-8")
+        # (the presents pace their display queue by host/hos_fps.h: HOS_FPS_CAP)
+        header = args.source / "host/hos_fps.h"
+        fps = header.read_text(encoding="utf-8") if header.exists() else ""   # (a source from before the cap has none)
+        cpp.write_text(PREFIX + fps + helper + "\n" + actual + "\n" + SUFFIX, encoding="utf-8")
         if Path(args.cxx).name.lower() in ("cl", "cl.exe", "clang-cl", "clang-cl.exe"):
             command = [args.cxx, "/nologo", "/std:c++17", "/EHsc", "/W4", "/WX", str(cpp),
                        "/Fo" + str(folder / "fixture.obj"), "/Fe" + str(exe)]
