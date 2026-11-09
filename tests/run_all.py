@@ -27,6 +27,7 @@ OS = "windows" if WINDOWS else "linux"
 # skipped, or fails with --strict. Tests not listed run with no arguments and their own defaults.
 ARGS = {
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
+    "tests/test_screensaver.py": ["--cc", "gcc"],
     "tests/test_system_header_cache.py": ["--cc", "clang"],
     "tests/test_precompile_compute_guard.py": ["--cxx", "clang++"],
     "tests/test_input_background.py": ["--cc", "gcc"],
