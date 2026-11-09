@@ -4835,13 +4835,24 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
+    bool payload_created = false;
+    const auto failed = [&] {
+        // No draw has received these buffers yet. Only free allocations whose creation succeeded.
+        if (payload_created) destroy_buffer(f.payload, f.payload_mem);
+        destroy_buffer(f.records, f.records_mem);
+        f.records = f.payload = VK_NULL_HANDLE;
+        f.records_mem = f.payload_mem = nullptr;
+        f.records_address = f.payload_address = 0;
+        return false;
+    };
     f.records_address = fallback_buffer_address(f.records);
     if (p.fallback_task) {
         const uint64_t payload = capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4;
-        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return false;
+        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return failed();
+        payload_created = true;
         f.payload_address = fallback_buffer_address(f.payload);
     }
-    if (!f.records_address) return false;
+    if (!f.records_address || (p.fallback_task && !f.payload_address)) return failed();
     f.ok = true;
     out = &f;
     return true;
