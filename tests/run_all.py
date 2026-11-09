@@ -47,6 +47,7 @@ ARGS = {
     "tests/test_dlssg.py": ["--cxx", "clang++"],
     "tests/test_dlss_objmv.py": ["--cxx", "clang++"],
     "tests/test_dlss_objmv_gpu.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
+    "tests/test_imnmx_immediate.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_upscale_fallback.py": ["--cxx", "g++"],
     "tests/test_taau_env_lookup.py": ["--cxx", "g++"],
