@@ -5482,6 +5482,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total)) {
         if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
     };
     const auto worker = [&] {
+        ub_thread_off();   // (a background thread: see ub_thread_off)
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
@@ -5581,6 +5582,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     auto& next = pre->next;
     auto& done = pre->done;
     const auto worker = [pre, total] {
+        ub_thread_off();   // (a background thread: see ub_thread_off)
         auto& notes = pre->notes;
         auto& computes = pre->computes;
         for (;;) {
@@ -5665,6 +5667,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     for (const auto& kv : by_program) keys.push_back(kv.first);
     std::atomic<size_t> next{0}, done{0}, made{0};
     const auto worker = [&] {
+        ub_thread_off();   // (a background thread: see ub_thread_off)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's)
         driver_cache_only = true;
         for (;;) {

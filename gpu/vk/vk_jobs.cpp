@@ -9,6 +9,7 @@
 
 #include "vk_jobs.h"
 #include "vk_internal.h"
+#include "vk_draw.h"   // (ub_thread_off)
 
 namespace mkwvk {
 namespace {
@@ -22,6 +23,7 @@ bool started = false;
 void worker() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     SetThreadDescription(GetCurrentThread(), L"mkw_vk worker");
+    ub_thread_off();
     for (;;) {
         std::function<void()> fn;
         {
@@ -66,6 +68,7 @@ void jobs_push_serial(std::function<void()> fn) {
         std::thread([] {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             SetThreadDescription(GetCurrentThread(), L"mkw_vk serial builds");
+            ub_thread_off();
             for (;;) {
                 std::function<void()> fn;
                 {
