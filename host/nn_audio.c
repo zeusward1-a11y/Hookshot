@@ -1283,6 +1283,20 @@ HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_21BiquadF
     }
     au_unlock();
 }
+/* TBiquadFilterParameter<float>: bool @0, numerator[3] @4, additive-feedback denominator[2] @16. */
+HLE(_ZN2nn5audio29SetVoiceBiquadFilterParameterEPNS0_9VoiceTypeEiRKNS0_22TBiquadFilterParameterIfEE) {
+    au_lock();
+    Voice *v = voice_of(ARG(0));
+    const int f = (int)ARG(1);
+    if (v && f >= 0 && f < 2 && ARG(2)) {
+        const uint64_t p = ARG(2);
+        Cmd k = {.op = OP_VOICE_BIQUAD, .idx = (int)(v - voices), .i0 = f, .i1 = *(uint8_t *)GP(p) != 0};
+        memcpy(k.b, GP(p + 4), sizeof k.b);
+        memcpy(k.a, GP(p + 16), sizeof k.a);
+        submit(&k);
+    }
+    au_unlock();
+}
 /* SetVoicePlayState(VoiceType*, PlayState): Started 0, Stopped 1, Paused 2 */
 HLE(_ZN2nn5audio17SetVoicePlayStateEPNS0_9VoiceTypeENS1_9PlayStateE) {
     au_lock();
