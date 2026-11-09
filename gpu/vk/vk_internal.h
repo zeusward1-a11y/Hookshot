@@ -283,5 +283,24 @@ struct ProfScope {
     explicit ProfScope(int p) : phase(p), t0(prof_now()) {}
     ~ProfScope() { prof_ns[phase] += prof_now() - t0; }
 };
+// (hookshot) The per-draw phases run a few thousand times a frame, and each timer is two counter reads: ~25k reads a frame
+// were ~2% of the replay thread. One in eight of them is timed, picked at random per thread, and counted eight times, so the
+// frame line's per-phase totals stay unbiased estimates of the same sums. RX_VK_PROF_ALL=1: every one timed, as before.
+inline int prof_weight() {
+    static const bool all = getenv("RX_VK_PROF_ALL") != nullptr;
+    if (all) return 1;
+    static thread_local uint32_t s = 0x9E3779B9u ^ (uint32_t)(uintptr_t)&s;
+    s ^= s << 13, s ^= s >> 17, s ^= s << 5;
+    return (s & 7) ? 0 : 8;
+}
+struct ProfScopeHot {
+    int phase, k;
+    int64_t t0;
+    explicit ProfScopeHot(int p) : phase(p), k(prof_weight()), t0(k ? prof_now() : 0) {}
+    ~ProfScopeHot() {
+        if (k) prof_ns[phase] += (prof_now() - t0) * k;
+    }
+};
 } // namespace mkwvk
 #define PROF(phase) ::mkwvk::ProfScope prof_scope_##phase(::mkwvk::phase)
+#define PROF_HOT(phase) ::mkwvk::ProfScopeHot prof_scope_##phase(::mkwvk::phase)   // (the per-draw phases: sampled, above)

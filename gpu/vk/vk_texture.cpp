@@ -1796,7 +1796,7 @@ unsigned view_layer(const nvn_view* v) {
 }
 
 Texture* texture_get(const nvn_tex* t, bool for_sampling) {
-    PROF(PROF_TEXGET);
+    PROF_HOT(PROF_TEXGET);
     if (!t || !t->gpu || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return nullptr;
     const VkFormatInfo fi = vk_format(t->d.format);
     if (fi.format == VK_FORMAT_UNDEFINED) {
