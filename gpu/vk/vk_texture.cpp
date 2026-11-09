@@ -49,6 +49,7 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "keep_rendered.h"
+#include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -2999,11 +3000,26 @@ void texture_frame(uint64_t completed) {
     static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
     const bool sweep = total_bytes <= budget;
-    if (no_evict || (sweep && frame_no % 600)) return;
+    // (hookshot-amd) and every 60 presents for the render targets drawn over by one at another start (below): OoT makes a frame's
+    // transient targets (768 x 432 RGBA16F, 1536 x 864) in a scratch heap whose offsets shift with what came before them in the
+    // frame, so turning the camera made new ones each frame ~1.2 MB from the last, each a new image. Left for the 600-present
+    // sweep or the budget, ~200 dead ones (1.2 GB) filled an 8 GB card's VRAM in Hyrule Field, the driver paged it out and the
+    // GPU's frame went from 15 to 35 ms. RX_VK_DEAD_TARGETS=0: as before
+    static const bool dead_targets = !getenv("RX_VK_DEAD_TARGETS") || atoi(getenv("RX_VK_DEAD_TARGETS")) != 0;
+    if (no_evict || (sweep && frame_no % (dead_targets ? 60 : 600))) return;
     std::vector<std::pair<uint64_t, Texture*>> order;
     order.reserve(textures.size());
     for (auto& kv : textures) order.push_back({kv.second->last_frame, kv.second.get()});
     std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    // (the rendered textures by where their storage starts, for drawn_over_shifted)
+    std::vector<const Texture*> by_start;
+    if (dead_targets) {
+        for (auto& [last, tex] : order)
+            if (tex->gpu_written && tex->first_render_frame && tex->guest_size) by_start.push_back(tex);
+        std::sort(by_start.begin(), by_start.end(), [](const Texture* a, const Texture* b) { return a->gpu < b->gpu; });
+    }
+    uint64_t longest = 0;
+    for (const Texture* t : by_start) longest = std::max(longest, t->guest_size);
     std::vector<Texture*> gone;
     // (over the budget, what goes has gone unused for RX_VK_EVICT_MIN_UNUSED frames, 60 by default; it was 8. On an
     // 8 GB laptop card the VRAM sits at the driver's limit, the budget shrinks and this runs every 10 frames: with 8,
@@ -3024,6 +3040,26 @@ void texture_frame(uint64_t completed) {
             if (o->second != tex && o->second->last_written > tex->last_frame) return true;
         return false;
     };
+    // (hookshot-amd) a render target of one level and layer whose storage another render target drew over from another start
+    // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console too
+    const auto drawn_over_shifted = [&](const Texture* tex) {
+        if (!dead_targets || !tex->gpu_written || !tex->first_render_frame || !tex->guest_size || tex->levels != 1 ||
+            tex->layers != 1 || tex->depth > 1)
+            return false;
+        const uint64_t lo = tex->gpu, hi = tex->gpu + tex->guest_size;
+        auto it = std::lower_bound(by_start.begin(), by_start.end(), lo > longest ? lo - longest : 0,
+                                   [](const Texture* t, uint64_t g) { return t->gpu < g; });
+        for (; it != by_start.end() && (*it)->gpu < hi; ++it)
+            if (*it != tex && target_overlap::shifted_over(lo, hi, tex->last_frame, (*it)->gpu, (*it)->gpu + (*it)->guest_size,
+                                                           (*it)->last_written))
+                return true;
+        return false;
+    };
+    // (the transient targets: a frame's own, not sampled again, their storage drawn over by another since. 16 frames left
+    // ~500 MB of them in Hyrule Castle Town's market at 20 fps (59 768 x 432 RGBA16F, 135 384 x 384, 41 1536 x 864 at a
+    // time), VRAM at the driver's limit; the GPU's own use is checked below (last_value). RX_VK_DEAD_MIN_UNUSED=<frames>, 3)
+    static const uint64_t dead_min_unused =
+        getenv("RX_VK_DEAD_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_DEAD_MIN_UNUSED"))) : 3;
     // (hookshot) a small texture the GPU drew in one frame that the game has finalized, with nothing drawn over its storage
     // since: the game may make a texture over that storage again and sample it without drawing it. OoT's terrain does that with its
     // tiles' 260 x 260 RG8 normal maps: drawn when a chunk comes in, finalized when it goes out of range, made again and sampled as
@@ -3040,7 +3076,7 @@ void texture_frame(uint64_t completed) {
             return false;
         const auto g = gpu_owned.find(tex->gpu);   // (its storage's range still the one the GPU drew it in)
         if (g == gpu_owned.end() || g->second.first != tex->gpu + std::max<uint64_t>(tex->guest_size, 1)) return false;
-        return !drawn_over(tex);
+        return !drawn_over(tex) && !drawn_over_shifted(tex);
     };
     uint64_t finalized_kept = 0;
     size_t finalized_kept_n = 0;
@@ -3063,8 +3099,13 @@ void texture_frame(uint64_t completed) {
         logf("vk: finalized textures the GPU drew once, kept for being made again: %zu (%llu KB):%s", finalized_kept_n,
              (unsigned long long)(finalized_kept >> 10), n ? line : "");
     }
+    const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : min_unused;
+    const uint64_t need_dead = dead_targets ? std::min(need_unused, dead_min_unused) : need_unused;
+    static uint64_t n_dead, b_dead, dead_logged_at;
     for (auto& [last, tex] : order) {
-        if ((!sweep && total_bytes <= budget / 8 * 7) || frame_no - last < (sweep ? std::max<uint64_t>(120, min_unused) : min_unused)) break;
+        if ((!sweep && total_bytes <= budget / 8 * 7) || frame_no - last < need_dead) break;
+        const bool shifted = drawn_over_shifted(tex);
+        if (frame_no - last < need_unused && !shifted) continue;   // (younger: only a dead transient target goes)
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
@@ -3077,7 +3118,7 @@ void texture_frame(uint64_t completed) {
         // RX_VK_KEEP_RENDERED_OVER=1: only past what it allows, as before)
         static const bool keep_over_only = getenv("RX_VK_KEEP_RENDERED_OVER") != nullptr;
         const uint64_t keep_rendered = keep_rendered::presents(known, used, allowed, keep_over_only);
-        const bool overwritten = drawn_over(tex);   // (above)
+        const bool overwritten = shifted || drawn_over(tex);   // (above)
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
             if (finalized_kept <= keep_finalized_max) continue;
             finalized_kept -= tex->bytes;
@@ -3113,6 +3154,7 @@ void texture_frame(uint64_t completed) {
             static std::atomic<int64_t> flushed{0};
             if (++flushed % 50 == 1) logf("vk: textures the GPU drew, written back into their memory before eviction: %lld so far", (long long)flushed.load());
         }
+        if (shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
         if (remade_log_on()) {
             std::lock_guard lk(evicted_mu);
@@ -3132,6 +3174,11 @@ void texture_frame(uint64_t completed) {
         } else {
             ++it;
         }
+    }
+    if (n_dead && frame_no >= dead_logged_at + 600) {   // (the dead transient targets let go so far, every 600 presents)
+        dead_logged_at = frame_no;
+        logf("vk: render targets drawn over from another start, let go: %llu so far (%llu MB)", (unsigned long long)n_dead,
+             (unsigned long long)(b_dead >> 20));
     }
     const size_t n = order.size() - textures.size();
     if (n) logf("vk: %zu textures retired (%zu left, %llu MB)", n, textures.size(), (unsigned long long)(total_bytes >> 20));
