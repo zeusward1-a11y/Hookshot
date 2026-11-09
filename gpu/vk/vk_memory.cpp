@@ -2575,7 +2575,9 @@ void retired_imports_give_back() {   // (pools_mu held)
     // B390 lost the device entering Kokiri every time with it and 1 run in 5 without (issue 17, fuxau); the AMD device losses
     // on the Ally X (309) and RX 6600 (571) came right after retired pools went back. RX_VK_KEEP_RETIRED=0 or 1 chooses
 #ifdef _WIN32
-    static const bool keep = !getenv("RX_VK_KEEP_RETIRED") || getenv("RX_VK_KEEP_RETIRED")[0] != '0';
+    // (not on NVIDIA: kept there, ~20 areas of play left 6.8 GB of retired pools imported on an RTX 3070 (8 GB), and the next area
+    // lost the device, twice; given back, the same tour finished every area (issue 1057). The losses above were Intel's and AMD's)
+    static const bool keep = getenv("RX_VK_KEEP_RETIRED") ? getenv("RX_VK_KEEP_RETIRED")[0] != '0' : dev.props.vendorID != 0x10DE;
 #else
     static const bool keep = getenv("RX_VK_KEEP_RETIRED") && getenv("RX_VK_KEEP_RETIRED")[0] != '0';
 #endif
