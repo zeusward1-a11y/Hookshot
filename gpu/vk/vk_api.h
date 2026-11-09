@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 6
+#define MKWVK_API_VERSION 7
 enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 
 /* (hookshot) the controls' names (host/nn_hid.c, host/pad_sdl.c, the pad_ and key_ lines of hookshot_options.ini):
@@ -30,6 +30,17 @@ enum { HOS_BIND_PAD, HOS_BIND_KEY };
 /* keys only (HOS_BIND_KEY), after the Switch's buttons: the left stick's and the camera's directions */
 enum { HOS_KEY_MOVE_UP = HOS_SW_N, HOS_KEY_MOVE_DOWN, HOS_KEY_MOVE_LEFT, HOS_KEY_MOVE_RIGHT, HOS_KEY_CAM_UP,
        HOS_KEY_CAM_DOWN, HOS_KEY_CAM_LEFT, HOS_KEY_CAM_RIGHT, HOS_KEY_N };
+
+/* (hookshot) the mouse over the window while it is free (not captured): the Insert menu's (host/display.c,
+   host/posix/display_sdl.c). x and y: the cursor in the window's pixels, of a window width x height pixels (the
+   swapchain's, as a rule); held: the buttons down now, pressed: those pressed since the last read (1 left, 2 right,
+   4 middle); wheel: the wheel's notches since then, away from the player positive */
+enum { HOS_MOUSE_LEFT = 1, HOS_MOUSE_RIGHT = 2, HOS_MOUSE_MIDDLE = 4 };
+typedef struct MkwVkPointer {
+    int32_t x, y, width, height;
+    uint32_t held, pressed;
+    int32_t wheel;
+} MkwVkPointer;
 
 /* what the executable gives the back end */
 typedef struct MkwVkHost {
@@ -84,6 +95,10 @@ typedef struct MkwVkHost {
     /// The guest camera aspect explicitly applied at startup (0: its default aspect)
     float (*aspect_ratio)(void);
     int (*take_key_press)(int key);
+    /* (hookshot) the free mouse (MkwVkPointer), read and its presses and wheel cleared: 1 when the cursor is over the
+       window and the window has the focus. The Insert menu releases the mouse while it is open: WM_APP + 8 to the
+       window, wParam 1 open, 0 closed (the capture it had then comes back) */
+    int (*pointer)(MkwVkPointer *out);
 } MkwVkHost;
 
 /* what the back end gives the executable: the rx_* functions (gpu/render/rx_nvn.h, rx_core) */

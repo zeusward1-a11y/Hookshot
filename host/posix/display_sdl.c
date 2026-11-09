@@ -6,7 +6,9 @@
    The keyboard's state goes to hos_posix_keys (GetAsyncKeyState, for nn_hid.c and the Insert menu), the window's focus
    and the screen's size to hos_posix_window (GetForegroundWindow, GetSystemMetrics).
    HOS_HEADLESS=1: no window. HOS_WINDOW_SIZE=<w>x<h>: its size (default 1280x720). F11: fullscreen (HOS_FULLSCREEN=1 to
-   start so). Mouse: a click in the window captures it (relative motion, for nn_hid.c), Esc or leaving releases it. */
+   start so). Mouse: a click in the window captures it (relative motion, for nn_hid.c), Esc or leaving releases it.
+   While the Insert menu is open the mouse is free (the cursor shown, for the menu's clicks: hos_mouse_pointer) and
+   the game gets none of it; the capture it had comes back when the menu closes. */
 #include "../hos.h"
 #include "../hos_sdl.h"
 
@@ -38,6 +40,28 @@ void hos_mouse_give_back(int32_t dx, int32_t dy) {
     InterlockedExchangeAdd(&mouse_dx, dx);
     InterlockedExchangeAdd(&mouse_dy, dy);
 }
+
+/* ---- the free mouse, for the Insert menu (gpu/vk/vk_api.h MkwVkPointer): set on the main thread, read on the renderer's ---- */
+static volatile LONG ptr_x, ptr_y, ptr_in, ptr_held, ptr_pressed, ptr_wheel;   /* (x, y in window units; wheel in 1/120 notches) */
+static volatile int menu_open;   /* (WM_APP + 8: the menu's state, as the window last heard it) */
+static void *window;
+int hos_mouse_pointer(MkwVkPointer *out) {
+    memset(out, 0, sizeof *out);
+    if (!window || mouse_captured) return 0;
+    int ww = 0, wh = 0, pw = 0, ph = 0;
+    hos_sdl_window_size(window, &ww, &wh);   /* (SDL's position is in the window's units: scaled to its pixels) */
+    hos_sdl_pixel_size(window, &pw, &ph);
+    if (ww <= 0 || wh <= 0 || pw <= 0 || ph <= 0) return 0;
+    out->x = (int32_t)((int64_t)ptr_x * pw / ww), out->y = (int32_t)((int64_t)ptr_y * ph / wh);
+    out->width = pw, out->height = ph;
+    out->held = (uint32_t)ptr_held;
+    out->pressed = (uint32_t)InterlockedExchange(&ptr_pressed, 0);
+    const LONG wheel = InterlockedExchange(&ptr_wheel, 0);
+    out->wheel = wheel / 120;
+    if (wheel % 120) InterlockedExchangeAdd(&ptr_wheel, wheel % 120);   /* (a part of a notch: kept for the next) */
+    return ptr_in && hos_posix_window[0];
+}
+static uint32_t sdl_button_bit(int b) { return b == 1 ? HOS_MOUSE_LEFT : b == 3 ? HOS_MOUSE_RIGHT : b == 2 ? HOS_MOUSE_MIDDLE : 0; }
 
 /* ---- keys: SDL's scancodes (USB HID usages) as Windows' virtual keys ---- */
 static void keys_update(void) {
@@ -73,7 +97,6 @@ static void keys_update(void) {
 }
 
 /* ---- the window ---- */
-static void *window;
 static volatile int renderer;   /* the renderer presents into the window */
 static HANDLE renderer_up;   /* (set once rx_start has returned, ready or not: hos_renderer_wait) */
 static int fullscreen;
@@ -120,11 +143,28 @@ void hos_renderer_wait(void) {
 
 static volatile int start_asked;
 static volatile int fullscreen_asked = -1;   /* (the Insert menu's row, from the renderer's thread: applied on this one) */
+static volatile int menu_asked = -1;         /* (the Insert menu opened or closed, likewise) */
 
-/* PostMessageA to the window (host/posix/win32_posix.c): WM_APP + 7, the Insert menu's Fullscreen row (host/display.c's) */
+/* PostMessageA to the window (host/posix/win32_posix.c): WM_APP + 7, the Insert menu's Fullscreen row, WM_APP + 8 the
+   menu opened or closed (host/display.c's) */
 __attribute__((visibility("default"))) void hos_posix_post_message(uint32_t msg, uintptr_t wp, intptr_t lp) {
     (void)lp;
     if (msg == WM_APP + 7) __atomic_store_n(&fullscreen_asked, wp ? 1 : 0, __ATOMIC_RELEASE);
+    if (msg == WM_APP + 8) __atomic_store_n(&menu_asked, wp ? 1 : 0, __ATOMIC_RELEASE);
+}
+/* the menu opened: the mouse let go (its capture kept for later); closed: the capture back, if the window still has the focus */
+static int captured_before_menu;
+static void menu_mouse(int open) {
+    if (open == menu_open) return;
+    menu_open = open;
+    if (open) {
+        captured_before_menu = (int)mouse_captured;
+        mouse_capture(0);
+        InterlockedExchange(&ptr_pressed, 0), InterlockedExchange(&ptr_wheel, 0);
+    } else {
+        if (captured_before_menu && hos_posix_window[0]) mouse_capture(1);
+        captured_before_menu = 0;
+    }
 }
 static int sdl_ready;
 int hos_display_owns_sdl(void) { return sdl_ready; }   /* (controllers stay on this thread while it runs SDL) */
@@ -221,9 +261,14 @@ void hos_display_loop(void) {
                 case HOS_SDL_EV_FOCUS_LOST:
                     hos_posix_window[0] = 0;
                     mouse_capture(0);
+                    ptr_in = 0, ptr_held = 0;
                     break;
                 case HOS_SDL_EV_MOUSE_LEAVE:
                     mouse_capture(0);
+                    ptr_in = 0;
+                    break;
+                case HOS_SDL_EV_MOUSE_ENTER:
+                    ptr_in = 1;
                     break;
                 case HOS_SDL_EV_KEY_DOWN: {
                     const int scancode = e.scancode, mod = e.mod;
@@ -232,9 +277,20 @@ void hos_display_loop(void) {
                     break;
                 }
                 case HOS_SDL_EV_MOUSE_DOWN:
-                    if (renderer && !mouse_captured) mouse_capture(1);
+                    ptr_x = (LONG)e.x, ptr_y = (LONG)e.y, ptr_in = 1;
+                    InterlockedOr(&ptr_held, (LONG)sdl_button_bit(e.button));
+                    if (menu_open) InterlockedOr(&ptr_pressed, (LONG)sdl_button_bit(e.button));   /* (the menu's click) */
+                    else if (renderer && !mouse_captured) mouse_capture(1);
+                    break;
+                case HOS_SDL_EV_MOUSE_UP:
+                    ptr_x = (LONG)e.x, ptr_y = (LONG)e.y;
+                    InterlockedAnd(&ptr_held, ~(LONG)sdl_button_bit(e.button));
+                    break;
+                case HOS_SDL_EV_MOUSE_WHEEL:
+                    if (menu_open) InterlockedExchangeAdd(&ptr_wheel, (LONG)(e.wheel * 120));
                     break;
                 case HOS_SDL_EV_MOUSE_MOTION:
+                    if (!mouse_captured) ptr_x = (LONG)e.x, ptr_y = (LONG)e.y, ptr_in = 1;
                     if (mouse_captured) {   /* (SDL3's motion comes in fractions of a pixel: the remainders kept for the next) */
                         static float rx, ry;
                         rx += e.dx, ry += e.dy;
@@ -249,6 +305,8 @@ void hos_display_loop(void) {
         }
         const int asked = __atomic_exchange_n(&fullscreen_asked, -1, __ATOMIC_ACQ_REL);
         if (asked >= 0) set_fullscreen(asked);
+        const int menu = __atomic_exchange_n(&menu_asked, -1, __ATOMIC_ACQ_REL);
+        if (menu >= 0) menu_mouse(menu);
         keys_update();
     }
 }
