@@ -49,6 +49,7 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "memory_priority.h"
+#include "vram_room.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "bc_parts.h"
@@ -3162,6 +3163,13 @@ void texture_frame(uint64_t completed) {
         // Safety clamp: do not exceed 75% of driver-allowed memory on constrained VRAM (prevents VK_ERROR_DEVICE_LOST)
         budget = std::min(budget, (allowed / 4) * 3);
     }
+    // (hookshot: and no more than the room left under RX_VK_VRAM_TARGET (85%) of what the driver allows, after what else the
+    // process holds: DLSS-G and the D3D12 bridge, the pools' mirrors, render targets. 6 GB of textures beside ~4.4 GB of those
+    // passed the 10.4 GB allowed in the field and in Hyrule Castle (09/11): the squeeze below then evicted and made textures
+    // again in play, and the driver paged the rest out. vram_room.h)
+    static const int target_pct = vram_room::target_pct(getenv("RX_VK_VRAM_TARGET"));
+    const uint64_t room = known ? vram_room::room(used, allowed, block_free, total_bytes, target_pct) : UINT64_MAX;
+    budget = std::min(budget, room);
     // (near what the driver allows, the budget shrinks by the excess. The excess of what the process holds less the
     // free space in VMA's blocks, which new images take before VMA makes a block: measured by the blocks alone, the
     // textures evicted freed space inside them that the driver still counted, so 10 frames later the budget shrank
@@ -3182,9 +3190,11 @@ void texture_frame(uint64_t completed) {
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         logf("vk: VRAM: %llu MB used of %llu MB allowed (%llu MB of it free in the blocks); textures %llu MB (budget %llu "
-             "MB), %zu textures", (unsigned long long)(used >> 20), (unsigned long long)(allowed >> 20),
-             (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
-             (unsigned long long)(budget >> 20), textures.size());
+             "MB), %zu textures; the rest %llu MB, the textures' room %lld MB under %d%%", (unsigned long long)(used >> 20),
+             (unsigned long long)(allowed >> 20), (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
+             (unsigned long long)(budget >> 20), textures.size(),
+             (unsigned long long)(vram_room::others(used, total_bytes, block_free) >> 20),
+             room == UINT64_MAX ? -1ll : (long long)(room >> 20), target_pct);
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
         size_t baked_n = 0;
