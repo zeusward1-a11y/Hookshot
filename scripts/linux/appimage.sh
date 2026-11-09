@@ -47,7 +47,9 @@ printf '%s
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
 cp -a builder/linux "$T/builder/"
 cp -a gpu/render/*.h "$T/gpu/render/"
-cp -a gpu/vk/vk_api.h "$T/gpu/vk/"
+# (every gpu/vk header the host's sources include: v2.0.6 shipped without oot_cheat_items.h and no Linux build finished, issue 990.
+# tests/test_appimage_headers.py checks that this covers what host/ includes)
+for h in $(grep -rhoE 'gpu/vk/[A-Za-z0-9_]+[.]h' host | sort -u); do if [ -f "$h" ]; then cp -a "$h" "$T/gpu/vk/"; fi; done
 cp -a third_party/opus "$T/third_party/"
 mkdir -p "$T/third_party/zbic" "$T/third_party/a64-kit"
 cp -a third_party/zbic/zbic.so third_party/zbic/LICENSE third_party/zbic/PROVENANCE.md "$T/third_party/zbic/"
