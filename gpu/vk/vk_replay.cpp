@@ -1327,6 +1327,15 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
 }
 
 int64_t st_par_buffers, st_par_segments;
+/// The replay cannot go on: logged, written to stderr (the host's log is queued, and goes with the process) and the
+/// process ended, as the host's hos_fatal does (exit code 3). For a parallel replay's init command buffer that could not
+/// be ended: images already made and published lost their first layout change, and any later submission may use them
+[[noreturn]] void replay_fatal(const char* why) {
+    logf("vk: FATAL: %s", why);
+    std::fprintf(stderr, "vk: FATAL: %s\n", why);
+    std::fflush(stderr);
+    std::_Exit(3);
+}
 std::recursive_mutex par_mu;
 
 /// A command buffer of the submission from h (its start, or where it stopped at a wait): on the replay thread alone
@@ -1483,12 +1492,8 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
             std::unique_lock l(seg_mu);
             seg_cv.wait(l, [j] { return j->done.load(); });
         }
-        if (j->inits < 0 && !init_lost) {   // (its init command buffer could not be ended: new images' first changes lost.
-            init_lost = true;               // Only it and the segments after it can use those images: as a failed submit)
-            logf("vk: segment %llu: its init command buffer could not be ended: it and the segments after it are not submitted",
-                 (unsigned long long)j->r->value);
-        }
-        if (init_lost) continue;
+        if (j->inits < 0) init_lost = true;   // (its init command buffer could not be ended: the replay stops, below)
+        if (init_lost) continue;              // (nothing from it on is submitted)
         VkCommandBufferSubmitInfo cb[3]{{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}, {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO},
                                         {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO}};
         uint32_t n = 0;
@@ -1509,6 +1514,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         std::unique_lock lk(par_pool.mu);
         par_pool.done.wait(lk, [] { return par_pool.pending == 0; });
     }
+    if (init_lost)   // (every worker done: none is left with a job)
+        replay_fatal("a parallel replay segment's init command buffer could not be ended: new images lost their first layout "
+                     "change, and the work after it may use them");
     par_active = false;
     texture_segments_begin(nullptr, 0);
     seg_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_seg0).count();

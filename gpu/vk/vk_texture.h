@@ -122,7 +122,8 @@ void texture_segments_begin(const VkCommandBuffer* init_cmds, size_t n);
 /// This thread records segment `index` of them (-1: none, after it)
 void texture_segment_worker(int index);
 /// Segment `index` recorded: its init command buffer ended (no new image's change goes to it after). 1: something went
-/// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost)
+/// to it (submit it before the segment's uploads), 0: nothing, -1: something did and it could not be ended (lost: the
+/// replay stops)
 int texture_segment_end(int index);
 /// Changes with every submission (a texture touched in it is not checked again in it)
 uint32_t texture_epoch();

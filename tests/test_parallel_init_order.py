@@ -14,8 +14,9 @@ as before. Some cases run the segments' workers one after another in a set order
 earlier one uses it; the BC3 scratch and its second one); others run them at once, held at fixed points: a worker closes
 its segment while another records into that segment's init command buffer, a worker makes an image after an earlier
 segment was submitted. When a segment's init command buffer cannot be begun, no worker may start and the whole command
-buffer is recorded in order on the replay thread; when one cannot be ended, neither its segment nor any later one is
-submitted. The init pools' startup (init_pools_make) is run with each pool creation and allocation failing in turn.
+buffer is recorded in order on the replay thread. When one cannot be ended, the replay must stop for good (replay_fatal,
+exit code 3) once every worker is done, with nothing that uses the lost images submitted, and no later work may run. The
+init pools' startup (init_pools_make) is run with each pool creation and allocation failing in turn.
 
 python -I -B tests/test_parallel_init_order.py --cxx clang++ --headers path/to/Vulkan-Headers/include
 """
@@ -66,6 +67,8 @@ def main():
     if "// into GENERAL, and cleared" not in create or "Texture* p = tex.get();" not in create:
         raise SystemExit("create()'s initialization moved: update this test")
     jobs = cut(replay, "    struct Job {", "    seg_ms += std::chrono::duration")
+    have_seg_init = "std::mutex seg_init_mu;" in texture
+    exits = {"init_end_fail": 3} if have_seg_init else {}   # (replay_fatal ends the process)
     for step in ("record_segment(c, j->g);", "texture_begin_recording(j->r->upload, j->r->value);", "vkQueueSubmit2(",
                  "j->uploads = texture_uploads_recorded();", "par_pool.cv.notify_all();"):
         if step not in jobs:
@@ -89,6 +92,7 @@ def main():
         "init_recording.inc": block(replay, "struct Recording {") + ";",
         "init_jobs.inc": jobs,
         "init_pools.inc": "\n".join(block(replay, m) for m in ("void init_pools_destroy() {", "bool init_pools_make(")) if have_pools else "",
+        "init_fatal.inc": block(replay, "[[noreturn]] void replay_fatal(") if have_seg_init else "",
     }
     compiler = shutil.which(args.cxx)
     if not compiler:
@@ -100,7 +104,7 @@ def main():
             (folder / name).write_text(text + "\n", encoding="utf-8")
         binary = folder / "fixture.exe"
         command = [compiler, "-std=c++20", "-O1", "-w", "-I" + str(folder), "-I" + str(args.headers),
-                   "-DHAVE_SEG_INIT=%d" % ("std::mutex seg_init_mu;" in texture), "-DHAVE_INIT_POOLS=%d" % have_pools,
+                   "-DHAVE_SEG_INIT=%d" % have_seg_init, "-DHAVE_INIT_POOLS=%d" % have_pools,
                    str(ROOT / "tests" / "parallel_init_order_test.cpp"), "-o", str(binary)]
         command += [] if os.name == "nt" else ["-pthread"]
         r = subprocess.run(command, capture_output=True, text=True, timeout=180)
@@ -109,9 +113,9 @@ def main():
             raise SystemExit("the fixture did not build")
         for case in CASES:
             r = subprocess.run([str(binary), case], capture_output=True, text=True, timeout=60)
-            print(r.stdout, end="")
+            print(r.stdout, end="", flush=True)
             print(r.stderr, end="", file=sys.stderr)
-            if r.returncode:
+            if r.returncode != exits.get(case, 0) or "FAIL" in r.stdout:
                 failed.append(case)
     if failed:
         raise SystemExit("FAIL: new images' initialization order or the init pools' startup: " + ", ".join(failed))

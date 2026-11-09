@@ -151,15 +151,20 @@ void vkDestroyCommandPool(VkDevice, VkCommandPool p, const VkAllocationCallbacks
 namespace mkwvk {
 std::mutex log_mu;
 std::string log_text;
+std::function<void(const std::string&)> on_log;   // (init_end_fail: looks at the state when the replay stops)
 void logf(const char* f, ...) {
     char line[512];
     va_list a;
     va_start(a, f);
     std::vsnprintf(line, sizeof line, f, a);
     va_end(a);
-    std::lock_guard l(log_mu);
-    log_text += std::string(line) + "\n";
+    {
+        std::lock_guard l(log_mu);
+        log_text += std::string(line) + "\n";
+    }
+    if (on_log) on_log(line);
 }
+#include "init_fatal.inc"
 void full_barrier(VkCommandBuffer cmd, const char* = "") {
     record(cmd, 'F');
 }
@@ -221,7 +226,7 @@ void scratch_use(bool resized) {   // (an ASTC/BC3 upload: decoded into the scra
 #include "init_recording.inc"
 struct Segment {
     // t: the texture (made if new, uploaded, drawn with), s: the scratch, S: both scratches, -: nothing,
-    // x / z: wait for latch x (a worker inside the texture's initialization) / z (segment 0 submitted),
+    // x / z: wait for latch x (a worker inside the texture's initialization) / z (segment 0 submitted), d: 100 ms more,
     // L: the initialization holds the segments' init lock (seg_init_mu) while it records; then latch y lets it go on
     std::string script;
     const uint8_t* end = nullptr;   // (kStop: to the command buffer's end, every segment's commands in order)
@@ -236,6 +241,7 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
         if (a == 't') texture_use(), record(cmd, 'U', kTex);
         if (a == 's' || a == 'S') scratch_use(a == 'S');
         if (a == 'x' || a == 'z') latch[(int)a].wait();
+        if (a == 'd') std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (a == 'L') {
 #if HAVE_SEG_INIT
             if (seg_init_mu.try_lock()) {
@@ -261,6 +267,7 @@ std::atomic<bool> par_active{false};
 std::vector<int> run_order;   // (the order the workers run in, one after another; empty: all at once)
 std::vector<std::thread> workers;
 bool jobs_started;
+std::atomic<int> running{0};   // (workers still recording)
 struct RunJobs {
     void notify_all();
 };
@@ -279,15 +286,18 @@ void RunJobs::notify_all() {
         jobs.swap(par_pool.jobs);
     }
     if (run_order.empty()) {   // (at once, as par_worker_main runs them; the replay thread submits meanwhile)
-        for (auto& job : jobs)
+        for (auto& job : jobs) {
+            running++;
             workers.emplace_back([job] {
                 job();
+                running--;
                 {
                     std::lock_guard lk(par_pool.mu);
                     par_pool.pending--;
                 }
                 par_pool.done.notify_all();
             });
+        }
         return;
     }
     CHECK(jobs.size() == run_order.size());
@@ -463,18 +473,30 @@ int main(int argc, char** argv) {
 #else
         std::printf("init_begin_fail: no init command buffers in this code\n");
 #endif
-    } else if (c == "init_end_fail") {   // (segment 1's init command buffer, which holds the texture's initialization, cannot be
-                                         // ended: segment 0 is submitted, segments 1 and 2 (which use the texture) are not)
+    } else if (c == "init_end_fail") {   // (at once: segments 1 and 2 wait for segment 0's submit, then make and use the texture,
+                                         // whose initialization goes to init_1; init_1 cannot be ended. The replay must stop
+                                         // for good (replay_fatal ends the process, exit code 3) after segment 2's worker is done,
+                                         // with nothing that uses the texture submitted; later work using it must never run)
 #if HAVE_SEG_INIT
         fail_end = "init_1";
-        submit_segments({{"-"}, {"t"}, {"t"}}, {0, 2, 1});
-        std::printf("%s: queue%s\n", c.c_str(), queue_text().c_str());
-        if (queue.size() != 1 || queue[0]->name != "cmd_0") std::printf("  FAIL: want only cmd_0 submitted\n"), failures++;
-        for (auto* cb : queue)
-            for (const Op& o : cb->ops)
-                if (o.image == kTex)
-                    std::printf("  FAIL: %s, submitted, uses the texture whose initialization was lost\n", cb->name.c_str()), failures++;
-        if (log_text.find("could not be ended") == std::string::npos) std::printf("  FAIL: the failure was not logged\n"), failures++;
+        on_log = [](const std::string& line) {
+            if (line.find("FATAL") == std::string::npos) return;
+            std::printf("init_end_fail: stopped: queue%s\n", queue_text().c_str());
+            if (running) std::printf("  FAIL: the replay stopped with a worker still recording\n");
+            for (auto* cb : queue)
+                for (const Op& o : cb->ops)
+                    if (o.image == kTex) std::printf("  FAIL: %s, submitted, uses the texture whose initialization was lost\n", cb->name.c_str());
+            if (init_of(kTex) != "init_1") std::printf("  FAIL: the texture's initialization is in %s, not init_1\n", init_of(kTex).c_str());
+            std::fflush(stdout);
+        };
+        submit_segments({{"-"}, {"zt"}, {"ztd"}}, {});
+        // (the replay went on: the next recording (and frame) uses the texture again)
+        Recording& later = begin_recording(rec_cur_value);
+        texture_use();
+        record(later.cmd, 'U', kTex);
+        submit_post();
+        std::printf("%s: went on: queue%s\n", c.c_str(), queue_text().c_str());
+        std::printf("  FAIL: the replay went on after a new image's initialization was lost\n"), failures++;
 #else
         std::printf("init_end_fail: no init command buffers in this code\n");
 #endif
