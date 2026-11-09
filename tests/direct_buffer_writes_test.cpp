@@ -25,7 +25,7 @@ static std::mutex pools_mu;
 static std::atomic<uint64_t> pools_gen{1};
 static std::atomic<bool> par_active{false};
 static thread_local TlPool tl_pools[1024];
-static uint64_t mirror_epoch = 7, mem_rec_value = 21, mem_completed;
+[[maybe_unused]] static uint64_t mirror_epoch = 7, mem_rec_value = 21, mem_completed;   // (mem_completed: read by the write-back table before #1036)
 static bool mirrors = true, mirror_upload = true, have_pool = true, mapping_valid = true;
 static std::vector<Pool*> mirror_wanted;
 static std::vector<WriteBack> writebacks;

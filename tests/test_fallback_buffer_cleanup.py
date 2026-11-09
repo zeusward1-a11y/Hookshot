@@ -40,8 +40,15 @@ def main():
     if not cxx:
         raise SystemExit("C++ compiler not found: " + args.cxx)
     source = args.source.read_text(encoding="utf-8")
-    actual = "\n\n".join((block(source, "struct FallbackBuffers {", True),
-        next(line for line in source.splitlines() if line.startswith("thread_local std::unordered_map<const Program*, FallbackBuffers> fallback_buffers;")),
+    old = "thread_local std::unordered_map<const Program*, FallbackBuffers> fallback_buffers;"
+    if any(line.startswith(old) for line in source.splitlines()):
+        decl = old + "\nstd::unordered_map<const Program*, FallbackBuffers>& fallback_buffers_map() { return fallback_buffers; }"
+    else:   # (#1035: TLS_OBJECT(fallback_buffers, ...) makes fallback_buffers(), the calling thread's map)
+        next(line for line in source.splitlines() if line.startswith("TLS_OBJECT(fallback_buffers,"))
+        decl = ("std::unordered_map<const Program*, FallbackBuffers>& fallback_buffers() {\n"
+                "    static thread_local std::unordered_map<const Program*, FallbackBuffers> map;\n    return map;\n}\n"
+                "std::unordered_map<const Program*, FallbackBuffers>& fallback_buffers_map() { return fallback_buffers(); }")
+    actual = "\n\n".join((block(source, "struct FallbackBuffers {", True), decl,
         block(source, "uint64_t fallback_buffer_address("), block(source, "bool fallback_buffers_of(")))
     flags = subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS if os.name == "nt" else 0
     env = dict(os.environ)
