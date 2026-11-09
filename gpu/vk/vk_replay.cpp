@@ -2213,7 +2213,9 @@ VmaAllocation off_alloc = nullptr;
 VkBuffer shot_bufs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 VmaAllocation shot_allocs[2] = {nullptr, nullptr};
 void* shot_maps[2] = {nullptr, nullptr};
-constexpr uint32_t kShotW = 1280, kShotH = 720;
+// (RX_VK_SHOT_W / RX_VK_SHOT_H: another size, e.g. the game's output size for its own pixels)
+const uint32_t kShotW = getenv("RX_VK_SHOT_W") ? (uint32_t)atoi(getenv("RX_VK_SHOT_W")) : 1280,
+               kShotH = getenv("RX_VK_SHOT_H") ? (uint32_t)atoi(getenv("RX_VK_SHOT_H")) : 720;
 VkImage shot_image = VK_NULL_HANDLE;
 VkBuffer made_buf = VK_NULL_HANDLE;   // (RX_VK_SHOT_MADE: a made frame's readback)
 VmaAllocation made_buf_alloc = nullptr;
@@ -3539,8 +3541,8 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_present = present;
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
-    t.option = [](int id) -> int {
-        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? opts.resolution == 0 : id == 3 ? (opts.resolution == 1 ? 100 : opts.resolution == 2 ? 75 : opts.resolution == 3 ? 67 : opts.resolution == 4 ? 50 : 0) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
+    t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp)
+        return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() : id == 3 ? resolution_scale() : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : 0;
     };
     t.option_set = menu_option_set;
