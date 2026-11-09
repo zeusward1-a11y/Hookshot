@@ -1235,7 +1235,7 @@ bool guarded_copy(void* dst, const void* src, size_t n) {
     return true;
 }
 #endif
-// ---- a capture's copies: on the submitting thread and two helpers (RX_VK_CAPTURE_THREADS=<n>, 0-4): ~9 MB of the
+// ---- a capture's copies: on the submitting thread and two helpers, four from 12 CPU threads (RX_VK_CAPTURE_THREADS=<n>, 0-4): ~9 MB of the
 // game's dynamic data a submit, four submits a frame, ~1.4 ms on the game's thread each with one ----
 // (a page written and then unmapped before the submit faulted a plain copy: ReadProcessMemory fails on it instead.
 // VirtualQuery per page took ~1 ms each in this address space: 22 ms a submit for 18 pages) (runs of adjacent pages
@@ -1283,7 +1283,7 @@ void copy_helper_main() {
 void copy_pages(const uint32_t* pages, int64_t n, uint8_t* out, uint8_t* ok) {   // (one capture at a time: submit_order_mu)
     static const int helpers = getenv("RX_VK_CAPTURE_THREADS")
         ? std::clamp(atoi(getenv("RX_VK_CAPTURE_THREADS")), 0, 4)
-        : (getenv("RX_VK_LOW_SPEC") ? 0 : 2);
+        : (getenv("RX_VK_LOW_SPEC") ? 0 : std::thread::hardware_concurrency() >= 12 ? 4 : 2);   // (four where the threads are spare)
     if (!helpers || n < 128) return copy_part({pages, 0, n, out, ok});
     const int k = helpers + 1;
     {
