@@ -120,10 +120,16 @@ static int output_mode(void) {
 }
 uint32_t hos_output_size(int height) { return output_mode() == 2 ? (height ? 2160 : 3840) : (height ? 1440 : 2560); }
 /* (hookshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
-   the 4K output ran out of it. Scaled with the output's pixels; HOS_RT_POOL_MB=<MB> over it */
+   the 4K output ran out of it. Scaled with the output's pixels, or the widescreen picture's when it has more (host/hos_main.c:
+   hos_wide_out, the output's height at the screen's shape: 7680 x 2160 for a 32:9 screen at the 4K output, twice the pixels the pool
+   was scaled for, and the game crashed as Kokiri Forest loaded, a null pointer or "texture handle ids -1", issue 1031);
+   HOS_RT_POOL_MB=<MB> over it */
 uint64_t hos_rt_pool_size(uint64_t game) {
     const char *e = getenv("HOS_RT_POOL_MB");
-    const uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
+    extern volatile uint64_t hos_wide_out;
+    const uint64_t wide = hos_wide_out, wide_px = (wide >> 32) * (wide & 0xffffffffULL);
+    uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
+    if (wide_px > px) px = wide_px;
     const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
     static int logged;
     if (!logged++) hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
