@@ -110,7 +110,8 @@ def check_sources():
     need("dlss_evaluate(cmd, color, depth, motion, output, reset, dlss_frame_id(), view);" in draw,
          "DLSS's evaluation is not numbered by presents, or has no camera")
     need(re.search(r"dlss_image\(ds\.motion, ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R16G16_SFLOAT,\s*"
-                   r"VK_IMAGE_USAGE_STORAGE_BIT \| VK_IMAGE_USAGE_SAMPLED_BIT \| VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd\)", draw),
+                   r"VK_IMAGE_USAGE_STORAGE_BIT \| VK_IMAGE_USAGE_SAMPLED_BIT \| VK_IMAGE_USAGE_TRANSFER_SRC_BIT"
+                   r"(\s*\|\s*VK_IMAGE_USAGE_\w+)*, cmd\)", draw),   # (more uses may follow: the actor pass draws into it)
          "the motion image cannot be copied by Streamline (no TRANSFER_SRC)")
 
     main = read("gpu/vk/vk_main.cpp")

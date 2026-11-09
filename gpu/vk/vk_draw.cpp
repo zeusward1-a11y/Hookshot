@@ -48,11 +48,15 @@
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shaders/dlss_motion_comp_spv.h"
 #include "shaders/dlss_color_comp_spv.h"
+#include "shaders/dlss_actor_vert_spv.h"
+#include "shaders/dlss_actor_frag_spv.h"
 #include "shaders/dlss_output_comp_spv.h"
 #include "shaders/dlss_debug_comp_spv.h"
 #include "vk_dlss.h"
 #include "dlss_objmv.h"
 #include "dlss_jitter.h"
+#include "dlss_actor.h"
+#include "dlss_actor_plan.h"
 #include "vk_menu.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -4999,6 +5003,7 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
     last_ib = {b, (uint64_t)offset, (uint32_t)type, true};
 }
 void dlss_note_camera(const NvnState& s, const Targets& at);   // (below, with the DLSS frame code)
+void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);   // (below: DLSS's actor motion)
 bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p);
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
@@ -5119,6 +5124,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
     cur_program = &p;
+    dlss_skin_check(s, p, d, at);   // (hookshot: a skinned draw of the scene, for DLSS's actor motion)
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is
@@ -5997,6 +6003,17 @@ struct DlssCamera {
     uint32_t w = 0, h = 0;
     Mat cur{}, prev{};
 };
+/// (actor motion, after #841's 8b925b6) A skinned draw into a scene-sized target (dlss_skin_check finds them by their vertex
+/// layout): what the actor pass needs to draw it again with this frame's bones and the frame before's. Its vertex layout and
+/// indices (dlss_actor::Layout) are what dlss_actor_plan.h works the push constants out from
+struct DlssSkin : dlss_actor::Layout {
+    const Texture* depth = nullptr;   // (its depth target: only the scene's are taken)
+    uint64_t vbuf = 0;                // (vertex stream 0; its size: Layout::vsize)
+    uint64_t ibuf = 0;
+    uint64_t bones = 0, bones_size = 0;   // (the palette: 3 x 4 row-major matrices, model space to the camera's world)
+    uint64_t object = 0, object_size = 0; // (the object's buffer: its origin at 0x40)
+    uint64_t program = 0;
+};
 // (jitter, RX_DLSS_JITTER) The scene camera's draws take a sub-pixel viewport offset, Halton(2,3), as a jittered projection moves
 // what it rasterises: DLSS then gets a new sample of each pixel every frame and rebuilds the detail the render size loses (with no
 // jitter it can only smooth an upscale: the soft picture in motion, 09/11). Which draws: those whose vertex constant buffer 3 is
@@ -6052,10 +6069,44 @@ struct DlssState {
     uint64_t repeats = 0;
     bool ready = false, made = false;
     DlssJitter jit;
+    // (actor motion, dlss_actor_plan.h: the skinned draws of this frame's scene so far; the poses last copied, by draw, in one of
+    // two buffers that take turns (each frame's go to the other one: Poses::here, there); the bones each model's vertices use)
+    struct Skin {
+        DlssSkin k;
+        uint64_t key = 0;
+        uint32_t nbones = 0;
+    };
+    dlss_actor::Noted<Skin> skins;
+    dlss_actor::Poses poses;
+    struct ModelBones {
+        uint32_t bones = 0;    // (the bones its vertices use; 0: its buffers could not be read)
+        uint64_t frame = 0;    // (when it was read: an unreadable one is read again 600 frames on)
+    };
+    std::unordered_map<uint64_t, ModelBones> model_bones;
+    struct PoseBuffer {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VmaAllocation memory = nullptr;
+        uint64_t address = 0;
+    } pose_buffers[2];
+    VkPipelineLayout actor_layout = VK_NULL_HANDLE;
+    VkPipeline actor = VK_NULL_HANDLE;
+    bool actor_tried = false;
+    uint64_t actor_draws = 0, actor_frames = 0, actor_skipped = 0, actor_noted = 0, actor_not_lists = 0;
+    int64_t actor_ns = 0;       // (the CPU's time in it, since the last 600-frame log)
 };
 DlssState ds;   // ponytail: one set of images, no lock: the replay records one frame at a time (RX_VK_PARALLEL would need ParLock here)
 
 bool dlss_on() { return opts.dlss && dlss_available(); }
+/// RX_DLSS_ACTORS=0: the camera's motion alone for what has bones (actor motion off). RX_DLSS_ACTOR_TOL=<steps>: how many float
+/// steps of depth from the scene's a pixel of a skinned draw drawn again may be to take its motion (64)
+bool actors_on() {
+    static const bool v = !(getenv("RX_DLSS_ACTORS") && atoi(getenv("RX_DLSS_ACTORS")) == 0);
+    return v;
+}
+uint32_t actor_tolerance() {
+    static const uint32_t v = dlss_actor::tolerance_of(getenv("RX_DLSS_ACTOR_TOL"));   // (64 unset or out of range, as #841)
+    return v;
+}
 /// RX_DLSS_JITTER: 0 none (the default, as before), 1 on, -1 on with the offset given to DLSS negated (a test of the sign
 /// convention: the viewport moves the same way, only DLSS is told the opposite)
 int jitter_mode() {
@@ -6317,6 +6368,222 @@ void objmv_log() {
          ds.objmv_frames ? (double)checked / ds.objmv_frames : 0.0, checked ? 100.0 * held / checked : 0.0);
     ds.objmv_frames = 0;
 }
+// ---- actor motion (after #841's 8b925b6, hckrman101): the skinned draws drawn again into the motion, each pixel they show moved
+// by its own bones. OoT has no velocity buffer: the motion was the camera's alone, and what moves by itself (Link, the other
+// characters, the animals) trailed in DLSS's history and doubled in generated frames. The skinned draws of the scene
+// (dlss_skin_check) are drawn again at the upscale, each vertex skinned with this frame's bones and the frame before's, read where
+// the game has them by their device addresses (shaders/dlss_actor.vert); a pixel takes the draw's motion where its depth is the
+// scene's (shaders/dlss_actor.frag). The poses are copied on the GPU into two buffers that take turns, so nothing is read back.
+// Here the camera is unjittered and the scene was drawn with a viewport offset (dlss_jitter_of): the pass is drawn with the same
+// offset, so its depth meets the scene's, and the fragment takes it off. What moves without bones (particles, water, the grass the
+// wind moves in its vertex shader) keeps the camera's motion. RX_DLSS_ACTORS=0: off ----
+
+using ActorPush = dlss_actor::Push;
+
+/// Its pipeline, once (false: none, the motion stays the camera's)
+bool make_actor_pipeline() {
+    if (ds.actor) return true;
+    if (ds.actor_tried) return false;
+    ds.actor_tried = true;
+    // (its shaders read the game's buffers by their device addresses, with 64-bit integers: the features the device was made
+    // with, create_device's)
+    if (!dev.vk12.bufferDeviceAddress || !dev.features.shaderInt64) {
+        logf("vk: dlss: actor motion: no buffer device addresses or 64-bit integers in shaders: the camera's motion alone");
+        return false;
+    }
+    VkDescriptorSetLayoutBinding b[2]{};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    li.bindingCount = 2, li.pBindings = b;
+    VkDescriptorSetLayout set{};
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ActorPush)};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &ds.actor_layout) != VK_SUCCESS) return false;
+    VkShaderModule m[2]{};
+    const uint32_t* code[2] = {DLSS_ACTOR_VERT_SPV, DLSS_ACTOR_FRAG_SPV};
+    const size_t size[2] = {sizeof DLSS_ACTOR_VERT_SPV, sizeof DLSS_ACTOR_FRAG_SPV};
+    for (int i = 0; i < 2; i++) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = size[i], mi.pCode = code[i];
+        if (vkCreateShaderModule(dev.device, &mi, nullptr, &m[i]) != VK_SUCCESS) {
+            for (VkShaderModule x : m)
+                if (x) vkDestroyShaderModule(dev.device, x, nullptr);
+            return false;
+        }
+    }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    for (int i = 0; i < 2; i++) {
+        stages[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        stages[i].module = m[i], stages[i].pName = "main";
+    }
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1, cb.pAttachments = &ba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dsi.dynamicStateCount = 2, dsi.pDynamicStates = dyn;
+    const VkFormat format = VK_FORMAT_R16G16_SFLOAT;   // (ds.motion)
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &format;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri;
+    gi.stageCount = 2, gi.pStages = stages;
+    gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia, gi.pViewportState = &vp, gi.pRasterizationState = &rs;
+    gi.pMultisampleState = &ms, gi.pColorBlendState = &cb, gi.pDynamicState = &dsi, gi.layout = ds.actor_layout;
+    const bool ok = vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &gi, nullptr, &ds.actor) == VK_SUCCESS;
+    for (VkShaderModule x : m) vkDestroyShaderModule(dev.device, x, nullptr);
+    if (!ok) ds.actor = VK_NULL_HANDLE, logf("vk: dlss: actor motion: its pipeline was not made: the camera's motion alone");
+    return ok;
+}
+
+/// A range of guest memory as this recording binds it, by its device address (the pools and their mirrors have them)
+uint64_t device_address(const BufferRef& r) {
+    if (!r) return 0;
+    VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    da.buffer = r.buffer;
+    const VkDeviceAddress base = vkGetBufferDeviceAddress(dev.device, &da);
+    return base ? base + r.offset : 0;
+}
+
+/// The skinned draws of the scene (DLSS's depth) with a pose of the frame before, drawn into the motion over the camera's motion.
+/// Each one's bones and origin are copied on the GPU, from where the game has them, into this frame's pose buffer, for this frame
+/// and the next (dlss_actor_plan.h Poses). history: DLSS made the frame before. Returns the draws drawn
+int dlss_actor_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint64_t now, bool history) {
+    struct Timed {
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { ds.actor_ns += (std::chrono::steady_clock::now() - t0).count(); }
+    } timed;
+    const std::vector<DlssState::Skin> skins = ds.skins.take(now);   // (this frame's: a frame DLSS did not make left none here)
+    ds.poses.begin();
+    if (!actors_on() || skins.empty() || !make_actor_pipeline()) return 0;
+    for (auto& b : ds.pose_buffers)
+        if (!b.buffer) {
+            if (!create_device_buffer(dlss_actor::kPoseBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                      b.buffer, b.memory))
+                return b = {}, 0;
+            b.address = device_address({b.buffer, 0, dlss_actor::kPoseBytes, 0});
+        }
+    const DlssState::PoseBuffer& here = ds.pose_buffers[ds.poses.here()];
+    const DlssState::PoseBuffer& there = ds.pose_buffers[ds.poses.there()];
+    const uint32_t tolerance = actor_tolerance();
+    std::vector<ActorPush> draws;
+    std::vector<uint32_t> counts;
+    for (const auto& sk : skins) {
+        const DlssSkin& k = sk.k;
+        if (k.depth != ds.used.depth) continue;   // (another camera's, or another target's)
+        // (this frame's pose, from where the game has it: its bones, then its origin at the object's 0x40)
+        const BufferRef bones = gpu_buffer_bind(k.bones, (uint64_t)sk.nbones * 48, false);
+        const BufferRef origin = gpu_buffer_bind(k.object + 0x40, 12, false);
+        if (!bones || !origin) {
+            ds.actor_skipped++;
+            continue;
+        }
+        uint32_t mine = 0;
+        if (!ds.poses.place(sk.key, sk.nbones, now, &mine)) break;   // (the pose buffer is full)
+        const VkBufferCopy c0{origin.offset, mine, 12}, c1{bones.offset, mine + 16, (uint64_t)sk.nbones * 48};
+        vkCmdCopyBuffer(cmd, origin.buffer, here.buffer, 1, &c0);
+        vkCmdCopyBuffer(cmd, bones.buffer, here.buffer, 1, &c1);
+        const dlss_actor::Pose* before = ds.poses.before_of(sk.key, sk.nbones, now, history);
+        // (the vertices and indices where the game has them: its buffers as this recording binds them)
+        const uint64_t va = before ? device_address(gpu_buffer_bind(k.vbuf, k.vsize, false)) : 0;
+        const uint64_t ia = before && k.count > 0 && k.itype >= 0 && k.itype <= 2
+                                ? device_address(gpu_buffer_bind(k.ibuf, (uint64_t)k.count << k.itype, false)) : 0;
+        ActorPush a{};
+        if (!before || !dlss_actor::make_push(k, va, ia, here.address, mine, there.address, before->at, sk.nbones, tolerance, &a)) {
+            ds.actor_skipped++;
+            continue;
+        }
+        draws.push_back(a);
+        counts.push_back((uint32_t)k.count);
+    }
+    ds.poses.end();
+    if (draws.empty()) return 0;
+    // (the cameras, dlss_actor_plan.h head: this frame's and the frame before's, unjittered (dlss_note_camera's), this frame's
+    // jitter, the render size. In the recording's stream: the slot's fence keeps it until the GPU has read it)
+    const uint64_t salign = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
+    const uint64_t head_at = stream_alloc(dlss_actor::kHeadWords * 4, salign);
+    if (head_at == UINT64_MAX) return 0;
+    const bool jittered = ds.jit.used_frame == now;
+    const float ux = jittered ? ds.jit.ux : 0.0f, uy = jittered ? ds.jit.uy : 0.0f;
+    dlss_actor::head(ds.used.cur.data(), ds.used.prev.data(), ux, uy, rw, rh, (float*)(cur->mapped + head_at));
+    const VkDescriptorBufferInfo bi{cur->stream, head_at, dlss_actor::kHeadWords * 4};
+    full_barrier(cmd);   // (the poses copied)
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = ds.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {rw, rh}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds.actor);
+    // (drawn as the scene was: with its jitter's viewport offset, so the depths meet; the shader flips y itself)
+    const VkViewport viewport{ux, uy, (float)rw, (float)rh, 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {rw, rh}};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    const VkDescriptorImageInfo ii{ds.nearest, ds.used.depth_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w[0].pBufferInfo = &bi;
+    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[1].pImageInfo = &ii;
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ds.actor_layout, 0, 2, w);
+    for (size_t i = 0; i < draws.size(); i++) {   // (vertex i of a draw is its i-th index)
+        vkCmdPushConstants(cmd, ds.actor_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof draws[i], &draws[i]);
+        vkCmdDraw(cmd, counts[i], 1, 0, 0);
+    }
+    vkCmdEndRendering(cmd);
+    // (its own pipeline, viewport, scissor and descriptors: the next draw of the game sets all of its again)
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    ds.actor_draws += draws.size(), ds.actor_frames++;
+    return (int)draws.size();
+}
+
+/// The bones a skinned draw's vertices use (the largest joint with a weight, plus one), read once a model; 0 when its buffers
+/// cannot be read
+uint32_t bones_used(const DlssSkin& k) {
+    if (k.count <= 0 || k.count > (1 << 20) || k.itype < 0 || k.itype > 2 || !k.stride) return 0;
+    std::vector<uint8_t> idx((size_t)k.count << k.itype);
+    if (!memory_read_as_submitted(k.ibuf, idx.data(), idx.size())) return 0;
+    uint32_t lo = UINT32_MAX, hi = 0;
+    for (int i = 0; i < k.count; i++) {
+        uint32_t v = 0;
+        std::memcpy(&v, idx.data() + ((size_t)i << k.itype), (size_t)1 << k.itype);
+        lo = std::min(lo, v), hi = std::max(hi, v);
+    }
+    const int64_t first = (int64_t)k.base_vertex + lo, n = (int64_t)hi - lo + 1;
+    if (first < 0 || n > (1 << 20) || (uint64_t)(first + n) * k.stride > k.vsize) return 0;
+    std::vector<uint8_t> v((size_t)n * k.stride);
+    if (!memory_read_as_submitted(k.vbuf + (uint64_t)first * k.stride, v.data(), v.size())) return 0;
+    uint32_t most = 0;
+    for (int64_t i = 0; i < n; i++) {
+        const uint8_t* q = v.data() + (size_t)i * k.stride;
+        for (int set = 0; set < k.sets; set++)
+            for (int j = 0; j < 4; j++) {
+                if (!q[k.weights[set] + j]) continue;
+                uint32_t joint = 0;
+                if (k.formats & (dlss_actor::kByteJoints << set)) joint = q[k.joints[set] + j];
+                else std::memcpy(&joint, q + k.joints[set] + 2 * j, 2);
+                most = std::max(most, joint + 1);
+            }
+    }
+    return most;
+}
+
 /// RX_DLSS_DEBUG: its view into the network's target (out), then this frame's colour kept as the next one's previous
 bool dlss_debug_pass(VkCommandBuffer cmd, VkImageView out, uint32_t w, uint32_t h, const DlssCamera& cam) {
     if (!ds.debug_pipe || !dlss_image(ds.prev, ds.color.w, ds.color.h, VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -6362,6 +6629,62 @@ void dlss_note_camera(const NvnState& s, const Targets& at) {
     ds.cam.frame = now, ds.cam.depth = at.depth, ds.cam.depth_view = depth, ds.cam.w = at.width, ds.cam.h = at.height;
     std::copy_n(c + 0x30 / 4, 16, ds.cam.cur.begin());
     std::copy_n(c + 0x180 / 4, 16, ds.cam.prev.begin());
+}
+
+/// (hookshot) From draw(): a skinned draw into the scene, for DLSS's actor motion (dlss_actor_pass). OoT's characters and what
+/// moves by its bones are indexed draws of one vertex stream: the position at attribute 0 (RGB32F or RGBA16F), the weights at 4
+/// (and 5, RGBA8), the joints at 6 (and 7, RGBA16UI or RGBA8UI), the bone palette in the vertex stage's uniform buffer 6 (NVN's
+/// binding 3: 3 x 4 matrices, a whole number of them) and the object's origin in its buffer 4 (binding 1, at 0x40). After #841
+void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
+    if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth || at.width < 640 ||
+        at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !actors_on() || !dlss_on() || parallel_replay() ||
+        (ds.actor_tried && !ds.actor))   // (no pipeline on this device: nothing to note)
+        return;
+    const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
+    const nvn_va_st pos = attr(0);
+    if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0) return;
+    const nvn_p_bind_buf& bones = s.ubo[0][3];
+    if (!bones.addr || bones.size < 48 || bones.size % 48) return;
+    DlssSkin k;
+    k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
+    for (int set = 0; set < 2 && 6 + set < s.nvattr; set++) {
+        const nvn_va_st w = attr(4 + set), j = attr(6 + set);
+        if (w.fmt != NVN_FORMAT_RGBA8 || (j.fmt != NVN_FORMAT_RGBA16UI && j.fmt != NVN_FORMAT_RGBA8UI) || w.stream || j.stream ||
+            w.offset % 4 || j.offset % 4)
+            break;
+        if (j.fmt == NVN_FORMAT_RGBA8UI) k.formats |= dlss_actor::kByteJoints << set;
+        k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
+    }
+    const uint32_t stride = s.vstream[0].stride;
+    k.depth = at.depth, k.vbuf = s.vbuf[0].address, k.vsize = s.vbuf[0].size, k.stride = stride, k.pos = pos.offset;
+    if (!k.sets || !dlss_actor::fits(k) || !k.vbuf) return;   // (every attribute inside a vertex: the shader reads by address)
+    if (d.prim != NVN_DRAW_PRIMITIVE_TRIANGLES) {   // (the pass draws a triangle list: a strip or quads would come out wrong)
+        ds.actor_not_lists++;
+        return;
+    }
+    k.ibuf = d.ibuf, k.itype = d.itype, k.count = d.count, k.base_vertex = d.base_vertex;
+    k.bones = bones.addr, k.bones_size = bones.size, k.object = s.ubo[0][1].addr, k.object_size = s.ubo[0][1].size;
+    k.program = p.key;
+    if (!k.object || k.object_size < 0x4c) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t now = texture_frame_no();
+    DlssState::Skin sk;
+    sk.k = k;
+    const uint64_t model = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, 0);
+    // (only the bones its vertices use are taken: a palette holds up to 280, a model uses a few dozen. One whose buffers could
+    // not be read is read again later, not left at none)
+    auto mb = ds.model_bones.find(model);
+    if (mb == ds.model_bones.end() || (!mb->second.bones && now - mb->second.frame >= 600)) {
+        if (mb == ds.model_bones.end() && ds.model_bones.size() > 4096) ds.model_bones.clear();
+        mb = ds.model_bones.insert_or_assign(model, DlssState::ModelBones{bones_used(k), now}).first;
+    }
+    sk.nbones = (uint32_t)std::min<uint64_t>(mb->second.bones, std::min<uint64_t>(k.bones_size / 48, 280));
+    // (the same model drawn twice in a frame: the n-th draw of it is the n-th the frame before; this frame's list, dlss_actor_plan.h)
+    if (sk.nbones && ds.skins.next_key(model, now, &sk.key)) {
+        ds.skins.draws.push_back(std::move(sk));
+        ds.actor_noted++;
+    }
+    ds.actor_ns += (std::chrono::steady_clock::now() - t0).count();
 }
 
 /// From dynamic_state, every draw: the viewport offset of DLSS's jitter (DlssJitter) when this draw is the scene camera's. False:
@@ -6416,7 +6739,8 @@ bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
     if (!dlss_image(ds.color, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd) ||
         // (TRANSFER_SRC: DLSS Frame Generation's tag of it is copied by Streamline when it is made, vk_dlss.cpp)
         !dlss_image(ds.motion, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd) ||
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, cmd) ||   // (COLOR_ATTACHMENT: the actor pass draws into it)
         // (own motion's view distances, this and last frame's: made with RX_DLSS_OBJMV=0 too, the motion pass binds them always)
         !dlss_image(ds.dist[0], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd) ||
         !dlss_image(ds.dist[1], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd) ||
@@ -6488,6 +6812,9 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
         for (int i = 0; i < 16; i++) same_camera = same_camera && std::abs(ds.used.prev[i] - ds.last_vp[i]) < 0.001f;
         dlss_motion_pass(cmd, rw, rh, clip, now, !same_camera);   // (own motion: dlss_objmv.h)
         full_barrier(cmd);
+        // (actor motion: the skinned draws of the scene drawn again over that motion, each with its own; DLSS's history needs
+        // the frame before, whose poses the pass kept)
+        if (dlss_actor_pass(cmd, rw, rh, now, ds.last_frame != ~0ull && ds.last_frame + 1 == now)) full_barrier(cmd);
         const bool reset = ds.last_frame == ~0ull || now != ds.last_frame + 1 || !same_camera;
         ds.resets += reset, ds.cuts += reset && !same_camera;
         if (dlss_debug() && ds.evals >= 1500 && ds.evals < 1512) {   // (the camera of 12 frames: a jitter would move [0][3]/[1][3] by ~1/w)
@@ -6499,6 +6826,12 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
             logf("vk: dlss: the last 600 frames: %u history resets, %u of them camera cuts; jitter: %llu draws, %llu holds in all", ds.resets,
                  ds.cuts, (unsigned long long)ds.jit.draws, (unsigned long long)ds.jit.hold.holds);
             ds.jit.draws = 0;
+            if (actors_on())
+                logf("vk: dlss: actor motion: %llu draws in %llu frames (%llu noted, %llu not triangle lists), %llu without a pose before, "
+                     "%.3f ms of CPU a frame",
+                     (unsigned long long)ds.actor_draws, (unsigned long long)ds.actor_frames, (unsigned long long)ds.actor_noted,
+                     (unsigned long long)ds.actor_not_lists, (unsigned long long)ds.actor_skipped, ds.actor_ns / 1e6 / 600);
+            ds.actor_ns = 0;
             ds.resets = ds.cuts = 0;
             objmv_log();
         }
@@ -6506,7 +6839,8 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
         const DlssImage depth{ds.used.depth->image, ds.used.depth_view, VK_FORMAT_D32_SFLOAT, rw, rh, VK_IMAGE_ASPECT_DEPTH_BIT,
                               ds.used.depth->usage};
         const DlssImage motion{ds.motion.image, ds.motion.view, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT,
-                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};   // (as made: the actor pass draws into it)
         const DlssImage output{ds.out.image, ds.out.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT};
         // (the frame's camera for the constants DLSS and DLSS Frame Generation share; the frame numbered by the game's presents)
         DlssView view;
