@@ -31,7 +31,7 @@ the console's system software is reimplemented, and the Switch 2 graphics are re
 <br>
 
 > [!WARNING]
-> Some users report the file in releaes to be a Trojan - it is not. Feel free to run it through any antivirus software
+> Some users report the file in releases to be a Trojan - it is not. Feel free to run it through any antivirus software
 
 
 Discord: https://discord.gg/DVQQJphbBf
