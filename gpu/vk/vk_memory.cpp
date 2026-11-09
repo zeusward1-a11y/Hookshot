@@ -1961,6 +1961,22 @@ void transfer_barrier(VkCommandBuffer cmd) {
     full_barrier(cmd, "barrier (write-back or sync)");   // (the same barrier; one right after another is left out)
 }
 
+// Captured pages in a run are copied from one buffer to one mirror. Combining only contiguous source and
+// destination bytes leaves gaps, overlaps and the order of the remaining regions unchanged.
+void append_capture_copy(std::vector<VkBufferCopy>& runs, const VkBufferCopy& next) {
+    if (!runs.empty()) {
+        VkBufferCopy& last = runs.back();
+        if (last.size && next.size && last.size <= UINT64_MAX - last.srcOffset &&
+            last.size <= UINT64_MAX - last.dstOffset && next.size <= UINT64_MAX - last.size &&
+            next.size <= UINT64_MAX - next.srcOffset && next.size <= UINT64_MAX - next.dstOffset &&
+            last.srcOffset + last.size == next.srcOffset && last.dstOffset + last.size == next.dstOffset) {
+            last.size += next.size;
+            return;
+        }
+    }
+    runs.push_back(next);
+}
+
 /// The pages of the pool the CPU wrote since its mirror's sync, copied in (the upload command buffer)
 void mirror_sync(Pool& p) {
     p.synced_epoch = mirror_epoch;
@@ -1998,7 +2014,7 @@ void mirror_sync(Pool& p) {
                 auto b = cap_bufs.find(e.gen);
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
-                    cap_runs[b->second.buffer].push_back(
+                    append_capture_copy(cap_runs[b->second.buffer],
                         {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
                     b->second.last_use = std::max(b->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
