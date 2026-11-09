@@ -938,7 +938,8 @@ bool capture_on() {
 std::atomic<bool> captures_seen{false};
 std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
 void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
-double st_tk_all, st_tk_stamp, st_tk_copy;   // (memory_take_capture's parts, ms)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
+double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_lock;   // (memory_take_capture's parts, ms)
+int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
 // ---- texture storage in the capture ----
 // The textures' storage the replay uploads from joins the capture, and what the capture took of it is kept (the
@@ -1503,13 +1504,22 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     // write-back landed, the exposure flash at a load that RX_VK_CAPTURE_WAIT=1 (the game's thread waiting) never had
     if (c->late_value && !c->map) vk_timeline_wait(c->late_value);
     if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
+        // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
+        // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
+        // 35-45 fps instead of 55, issue 995)
+        const auto tw = std::chrono::steady_clock::now();
         vk_timeline_wait(c->late_value);
+        st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
+        st_tk_late_n++;
         uint8_t* const base = (uint8_t*)host->guest_base();
         for (uint32_t i : c->late)
             guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
         flush_mapped(c->alloc, c->nbytes);
     }
+    const auto tl = std::chrono::steady_clock::now();
     std::lock_guard lk(pools_mu);
+    const auto tk_locked = std::chrono::steady_clock::now();
+    st_tk_lock += std::chrono::duration<double, std::milli>(tk_locked - tl).count();
     cur_cap_value = value;
     cur_cap_gen = 0;
     // (captures past the last kKeep, or past the byte budget, retired once the work that read them is done)
@@ -1588,14 +1598,15 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     {   // (every 600 takes: where a take's time went)
         const auto tk2 = std::chrono::steady_clock::now();
         static int64_t n;
-        st_tk_stamp += std::chrono::duration<double, std::milli>(tk1 - tk0).count();
+        st_tk_stamp += std::chrono::duration<double, std::milli>(tk1 - tk_locked).count();
         st_tk_all += std::chrono::duration<double, std::milli>(tk2 - tk0).count();
         if (++n % 600 == 0) {
-            logf("vk: a capture taken (ms): all %.3f; retires and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu "
-                 "spare buffers, %zu texture pages copied (%llu MB)", st_tk_all / 600, st_tk_stamp / 600, st_tk_copy / 600, cap_bufs.size(),
-                 (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
+            logf("vk: a capture taken (ms): all %.3f; GPU wait for late pages %.3f (%lld of 600 takes), pools lock %.3f, retires "
+                 "and stamps %.3f, bytes copied %.3f; %zu kept (%llu MB), %zu spare buffers, %zu texture pages copied (%llu MB)",
+                 st_tk_all / 600, st_tk_late / 600, (long long)st_tk_late_n, st_tk_lock / 600, st_tk_stamp / 600, st_tk_copy / 600,
+                 cap_bufs.size(), (unsigned long long)(cap_bytes >> 20), cap_free.size(), shadow_n.load(std::memory_order_relaxed),
                  (unsigned long long)(shadow_n.load(std::memory_order_relaxed) >> 8));
-            st_tk_all = st_tk_stamp = st_tk_copy = 0;
+            st_tk_all = st_tk_stamp = st_tk_copy = st_tk_late = st_tk_lock = 0, st_tk_late_n = 0;
         }
     }
     return true;
