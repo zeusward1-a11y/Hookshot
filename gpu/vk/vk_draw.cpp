@@ -22,6 +22,8 @@
 #include <map>
 #include <vector>
 #include <thread>
+#include <setjmp.h>
+#include <signal.h>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 
@@ -738,12 +740,64 @@ __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkCom
     }
 }
 #else
-// (linux: no structured exceptions; the driver is called as it is)
+// (linux: no structured exceptions, so the fault arrives as a signal on the compiling thread: an armed window covers the driver
+// call alone, and a fault in it is reported as the call's failure, as the Windows guard above reports an access violation. A fault
+// outside it goes to whoever had the signal before, so the game's own crash report is unchanged)
+static thread_local sigjmp_buf fault_jmp;
+static thread_local volatile sig_atomic_t fault_armed;
+static struct sigaction fault_previous[2];
+static const int fault_signals[2] = {SIGSEGV, SIGBUS};
+
+static void on_driver_fault(int sig, siginfo_t* si, void* ctx) {
+    if (fault_armed) {
+        fault_armed = 0;
+        siglongjmp(fault_jmp, 1);
+    }
+    const struct sigaction* p = &fault_previous[sig == SIGSEGV ? 0 : 1];
+    if ((p->sa_flags & SA_SIGINFO) && p->sa_sigaction) {
+        p->sa_sigaction(sig, si, ctx);
+    } else if (p->sa_handler && p->sa_handler != SIG_IGN && p->sa_handler != SIG_DFL) {
+        p->sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+    }
+}
+
+static void install_driver_fault_guard() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (int i = 0; i < 2; i++) {
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_driver_fault;
+            sa.sa_flags = SA_SIGINFO;
+            sigemptyset(&sa.sa_mask);
+            sigaction(fault_signals[i], &sa, &fault_previous[i]);
+        }
+    });
+}
+
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
-    return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
+    install_driver_fault_guard();
+    if (sigsetjmp(fault_jmp, 1) != 0) {
+        logf("vk: the driver faulted compiling a graphics pipeline: that one is left out");
+        return VK_ERROR_UNKNOWN;
+    }
+    fault_armed = 1;
+    const VkResult r = vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
+    fault_armed = 0;
+    return r;
 }
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
-    return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
+    install_driver_fault_guard();
+    if (sigsetjmp(fault_jmp, 1) != 0) {
+        logf("vk: the driver faulted compiling a compute pipeline: that one is left out");
+        return (VkResult)-77;
+    }
+    fault_armed = 1;
+    const VkResult r = vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
+    fault_armed = 0;
+    return r;
 }
 #endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
