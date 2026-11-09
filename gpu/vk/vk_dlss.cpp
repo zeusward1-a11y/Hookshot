@@ -623,6 +623,13 @@ bool dlss_start() {
     pref.numPathsToPlugins = st.model_dir.empty() ? 1 : 2;
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking |
                  sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins;
+    // Separate the game's Vulkan plugins from OptiScaler's D3D12 runtime. Sharing
+    // an OTA PCL/common DLL lets the second slInit overwrite the first's state.
+    if (env_int("RX_DLSS_NO_OTA", 0)) {
+        pref.flags &= ~sl::PreferenceFlags::eAllowOTA;
+        pref.flags &= ~sl::PreferenceFlags::eLoadDownloadedPlugins;
+        logf("vk: dlss: OTA plugins disabled (RX_DLSS_NO_OTA), using local plugins");
+    }
     if (st.fg_asked) pref.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     st.fg_init = st.fg_asked;
     pref.featuresToLoad = features;

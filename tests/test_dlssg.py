@@ -57,6 +57,15 @@ def check_sources():
          "slInit does not load DLSS, DLSS-G, Reflex and PCL")
     need("pref.numFeaturesToLoad = st.fg_asked ? 4 : 1;" in start, "DLSS-G's features are not loaded only when asked for")
     need("eUseFrameBasedResourceTagging" in start, "no frame-based resource tagging (slSetTagForFrame needs it)")
+    # RX_DLSS_NO_OTA=1 (OptiScaler's D3D12 Streamline beside this one: the shared OTA plugins crashed the start) keeps this
+    # Streamline to the plugins next to it; the OTA ones stay allowed when it is not set
+    cstart = code(start)
+    no_ota = cstart.find('env_int("RX_DLSS_NO_OTA", 0)')
+    need(no_ota > cstart.find("pref.flags = ") >= 0 and
+         "pref.flags &= ~sl::PreferenceFlags::eAllowOTA;" in cstart[no_ota:] and
+         "pref.flags &= ~sl::PreferenceFlags::eLoadDownloadedPlugins;" in cstart[no_ota:],
+         "RX_DLSS_NO_OTA does not keep Streamline to its local plugins")
+    need("eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins" in cstart, "the OTA plugins are not allowed by default")
     need("DLSS wants extra queues" not in dlss, "extra queues are still refused")
     need("st.extra_graphics += req.vkNumGraphicsQueuesRequired" in start and
          "st.extra_compute += req.vkNumComputeQueuesRequired" in start and
