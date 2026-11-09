@@ -204,6 +204,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         u32 nrenamed = 0;
         std::array<bool, 256> marker_taken{};
         std::array<bool, 256> native_occupied{};
+        // (RX_VK_MARKERS_V205=1: markers avoid only the native high registers, as in v2.0.5: an A/B for the AMD stripes report)
+        static const bool markers_v205 = std::getenv("RX_VK_MARKERS_V205") != nullptr;
         {
             const u32 renameable = RenameableFields(opcode);
             constexpr u32 bits[4]{16, 24, 32, 64};
@@ -242,7 +244,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     for (u32 m = 216; m + span <= 246 && marker == 255; m += span) {
                         bool ok = true;
                         for (u32 k = 0; k < span && ok; ++k)
-                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_occupied[m + k];
+                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] &&
+                                 !(markers_v205 ? native_high[m + k] : native_occupied[m + k]);
                         if (ok) marker = m;
                     }
                     if (marker != 255 && nrenamed < 8) {

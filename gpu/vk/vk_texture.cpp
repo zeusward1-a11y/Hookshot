@@ -3130,6 +3130,20 @@ void texture_frame(uint64_t completed) {
         }
         if (!overwritten && tex->gpu_written && !tex->released && !evict_rendered && frame_no - last < keep_rendered) continue;
         if (sweep && !overwritten) continue;
+        // (hookshot) nor a live texture the GPU drew whose texels cannot be written back into its memory (ASTC kept as BC3, sparse,
+        // past the write-back's size, ...): its image is the only copy, and one made again over that storage is not uploaded (the
+        // memory counts as the GPU's), so it showed whatever its new memory held: the rainbow/garbled textures that spread over play
+        // time on 4-8 GB cards (issue 993)? Up to 256 MB of such textures each stay; bigger ones (a whole area left behind) go as
+        // before. OPT-IN (RX_VK_KEEP_UNFLUSHABLE=1) until a tester confirms it helps: a forced-eviction test here could not show it
+        // (the texture that came back empty there was one the game had finalized), and keeping them costs VRAM on small cards.
+        static const bool evict_unflushable = getenv("RX_VK_KEEP_UNFLUSHABLE") == nullptr;
+        if (!overwritten && tex->gpu_written && !tex->released && !evict_unflushable && tex->bytes < (256ull << 20) && !flushable(*tex)) {
+            static std::atomic<int> kept_logged{0};
+            if (kept_logged.fetch_add(1) < 40)
+                logf("vk: texture #%u %#llx %ux%u x%u NVN %#x the GPU drew kept, not evicted: its texels cannot be written back",
+                     tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers, tex->nvn_format);
+            continue;
+        }
         // (and a small one never: its texels exist nowhere else, and it is made once and kept by the game. The sky's
         // 256 x 256 lookup table, unused while a menu was up, went and came back from memory as garbage: the rainbow
         // sky. The big ones that may go are a course left behind)
