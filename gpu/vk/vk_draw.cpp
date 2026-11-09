@@ -2134,7 +2134,11 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // the translation falls back to the first constant word on its path, c0[0x520], the light buffer's address.
                 // Its low bits named an unrelated texture that changed with the double-buffered buffer: the water flickered
                 // every other frame. No texture there now. RX_VK_HANDLE_POINTER=1: the old handle
-                const uint32_t handle = handle_is_storage_pointer(info, d, k) ? 0u : handle_of(s, st, d, k);
+                // (fragment stages only, the water's case: in other stages (the foliage culling's) the textures went missing and
+                // the foliage was culled whenever Link swung his sword. RX_VK_HANDLE_POINTER_ALL=1: every stage, as before)
+                static const bool all_stages = getenv("RX_VK_HANDLE_POINTER_ALL") != nullptr;
+                const uint32_t handle = ((all_stages || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) && handle_is_storage_pointer(info, d, k))
+                                            ? 0u : handle_of(s, st, d, k);
                 Texture* tex = nullptr;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
