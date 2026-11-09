@@ -759,6 +759,8 @@ struct Capture {
     void* map = nullptr;
     uint64_t bsize = 0;
     size_t nbytes = 0;
+    std::vector<uint32_t> late;      // (indices into pages: copied again by the replay once late_value is done)
+    uint64_t late_value = 0;
 };
 std::mutex cap_mu;
 std::deque<std::unique_ptr<Capture>> captures;
@@ -1318,7 +1320,7 @@ std::unique_ptr<Capture> capture_make() {
         if (!spare.empty()) c = std::move(spare.back()), spare.pop_back();
     }
     if (!c) c = std::make_unique<Capture>();
-    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0;
+    c->pages.clear(), c->copied.clear(), c->slots.clear(), c->nbytes = 0, c->late.clear(), c->late_value = 0;
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     // (only the pools mirrored in VRAM, the ones the mirrors are filled from, and only their part of the write marks:
     // every written page was taken at first (hundreds of MB a submit where the game streams its world), and the whole
@@ -1357,9 +1359,11 @@ std::unique_ptr<Capture> capture_make() {
     // 0 and fills in the rest. The CPU runs a frame ahead, and a copy taken before the write-back had landed had the GPU's
     // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
     // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
-    // last submission writing them back: not every frame's present. RX_VK_CAPTURE_WAIT=0: off
+    // last submission writing them back: not every frame's present. That wait held the game's thread (~8% of its time at a
+// ~2150-draw scene), so those pages are copied again by the replay, before it uses this capture, once the submission is
+// done: the replay waits instead, while the game goes on. RX_VK_CAPTURE_WAIT=1: the game's thread waits, 0: no wait
     if (n > 0) {
-        static const bool cap_wait = !getenv("RX_VK_CAPTURE_WAIT") || atoi(getenv("RX_VK_CAPTURE_WAIT")) != 0;
+        static const int cap_wait = getenv("RX_VK_CAPTURE_WAIT") ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 2;
         uint64_t v = 0;
         if (cap_wait) {
             const uint64_t done = vk_timeline_completed();
@@ -1367,10 +1371,14 @@ std::unique_ptr<Capture> capture_make() {
             if (!wb_pages.empty())
                 for (int64_t i = 0; i < n; i++) {
                     auto it = wb_pages.find(pages[i]);
-                    if (it != wb_pages.end() && it->second > done) v = std::max(v, it->second);
+                    if (it != wb_pages.end() && it->second > done) {
+                        v = std::max(v, it->second);
+                        if (cap_wait == 2) c->late.push_back((uint32_t)i);
+                    }
                 }
         }
-        if (v) vk_timeline_wait(v);
+        if (v && cap_wait == 2) c->late_value = v;
+        else if (v) vk_timeline_wait(v);
     }
     if (n > 0) {
         c->pages.assign(pages, pages + n);
@@ -1425,6 +1433,13 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 }
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
+    if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
+        vk_timeline_wait(c->late_value);
+        uint8_t* const base = (uint8_t*)host->guest_base();
+        for (uint32_t i : c->late)
+            guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+        flush_mapped(c->alloc, c->nbytes);
+    }
     std::lock_guard lk(pools_mu);
     cur_cap_value = value;
     cur_cap_gen = 0;
