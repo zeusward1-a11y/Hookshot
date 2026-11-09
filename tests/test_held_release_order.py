@@ -84,7 +84,8 @@ def check_capture_wait(memory):
     head = body[:first]
     if not re.search(r"if \(c->late_value && !c->map\) vk_timeline_wait\(c->late_value\);", head):
         raise SystemExit("take_capture: a capture with late pages and no copy does not wait for their write-back")
-    if not re.search(r"if \(c->late_value && c->map\) \{\s*vk_timeline_wait\(c->late_value\);", head):
+    # (the wait, then the copy, in the same block: #1243 times the wait apart, a clock read before it)
+    if not re.search(r"if \(c->late_value && c->map\) \{[^{}]*?vk_timeline_wait\(c->late_value\);[^{}]*?guarded_copy\(", head):
         raise SystemExit("take_capture: the copied late pages are not copied again after their write-back")
 
 
