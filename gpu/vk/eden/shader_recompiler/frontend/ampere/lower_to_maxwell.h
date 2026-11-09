@@ -219,6 +219,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (reg >= 255 || reg + 3 < reserved_base) continue;   // (a quad below may reach up)
                 if (register_field && reg >= reserved_base) any_high = true;
             }
+            // (hookshot) every high number the instruction's fields name, whichever field comes first: a marker must be none of
+            // them. Only the fields already seen were avoided, so a destination renamed before its own source could take that
+            // source's number as its marker (FMUL R252, R216: R216 -> 252 and R216 -> 216 in one prefix); the later run won,
+            // the result went to the source's register and its own stayed undefined. OoT's flower beds and hanging baskets
+            // in Castle Town lit up: their colour pass's vertices broke where the depth pre-pass's did not
+            std::array<bool, 256> named{};
+            for (u32 f = 0; f < 4 && any_high; ++f) {
+                const u32 reg = insn.Bits(bits[f], 8);
+                if (reg >= 255 || reg + 3 < reserved_base) continue;
+                const u32 exact = FieldSpan(opcode, f);
+                const u32 span = exact ? exact : span_of(reg);
+                for (u32 k = 0; k < span && reg + k < 255; ++k)
+                    if (reg + k >= reserved_base) named[reg + k] = true;
+            }
             for (u32 f = 0; f < 4 && any_high; ++f) {
                 const u32 bit = bits[f], reg = insn.Bits(bit, 8);
                 if (reg >= 255 || reg + 3 < reserved_base) continue;
@@ -234,7 +248,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     for (u32 m = 216; m + span <= 246 && marker == 255; m += span) {
                         bool ok = true;
                         for (u32 k = 0; k < span && ok; ++k)
-                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k];
+                            ok = m + k != 239 && !avoid[m + k] && !marker_taken[m + k] && !native_high[m + k] && !named[m + k];
                         if (ok) marker = m;
                     }
                     if (marker != 255 && nrenamed < 8) {
