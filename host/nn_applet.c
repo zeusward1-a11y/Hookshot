@@ -123,14 +123,17 @@ uint32_t hos_output_size(int height) { return output_mode() == 2 ? (height ? 216
    the 4K output ran out of it. Scaled with the output's pixels, or the widescreen picture's when it has more (host/hos_main.c:
    hos_wide_out, the output's height at the screen's shape: 7680 x 2160 for a 32:9 screen at the 4K output, twice the pixels the pool
    was scaled for, and the game crashed as Kokiri Forest loaded, a null pointer or "texture handle ids -1", issue 1031);
-   HOS_RT_POOL_MB=<MB> over it */
+   Castle Town's guard-house conversation/camera test crashed with 305 MB at 2560 x 1440 and passed with 512 MB.
+   Keep at least 512 MB by default; larger scaled pools and an explicit HOS_RT_POOL_MB=<MB> still win. */
 uint64_t hos_rt_pool_size(uint64_t game) {
     const char *e = getenv("HOS_RT_POOL_MB");
     extern volatile uint64_t hos_wide_out;
     const uint64_t wide = hos_wide_out, wide_px = (wide >> 32) * (wide & 0xffffffffULL);
     uint64_t px = (uint64_t)hos_output_size(0) * hos_output_size(1);
     if (wide_px > px) px = wide_px;
-    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    const uint64_t scaled = px > 2560 * 1440 ? (game * px / (2560 * 1440) + 0xfffff) & ~0xfffffULL : game;
+    const uint64_t minimum = 512ULL << 20;
+    const uint64_t v = e ? strtoull(e, NULL, 0) << 20 : scaled < minimum ? minimum : scaled;
     static int logged;
     if (!logged++) hos_log("applet: render target pool %llu MB (the game's %llu MB)", (unsigned long long)(v >> 20), (unsigned long long)(game >> 20));
     return v;
