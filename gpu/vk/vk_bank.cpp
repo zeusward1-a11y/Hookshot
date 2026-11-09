@@ -104,6 +104,18 @@ uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout
     return l.ssbo_at();
 }
 
+/// (hookshot, #940) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
+/// the address word of an entry of the uniform or storage buffer table its control section lays out. Nothing is bound before the
+/// game, so the storage buffer pass's port (EDEN_NX2_GM_LEGACY=0), which binds an access to a pointer only when that pointer is
+/// mapped (Env::IsCbufStorageBufferPointer), found none and left every access to the run-time search, under the key play then used
+/// the program by. Answered from the layout, the prepared program comes out as play translates it
+bool seed_cs_buffer_word(uint32_t offset) {
+    if (!seed_cs_control || (offset & 15)) return false;
+    const CsLayout l = cs_layout_of(seed_cs_control + 0x58);
+    const auto in = [offset](uint32_t at, uint32_t n) { return offset >= at && offset < at + 16 * std::min(n, 16u); };
+    return in(l.ubo_at(), l.ubo) || in(l.ssbo_at(), l.ssbo);
+}
+
 const void* descriptor_ok(const void* p, size_t n) {
     if (!p) return nullptr;
     const uintptr_t q = (uintptr_t)p, base = (uintptr_t)host->guest_base();

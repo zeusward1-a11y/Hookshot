@@ -45,6 +45,10 @@ bool menu_is_open();
 bool resolution_auto();       // (the game's dynamic resolution: Resolution Auto)
 int resolution_scale();       // (the fixed path's scale in 1/10000: the Resolution row's, as a twelfth of the output)
 void menu_option_set(int id, int value);   // (from the game's side: 7 the mouse's sensitivity, the - and = keys)
+int menu_heart_protection();
+int menu_player_flight();
+int menu_free_camera();
+int menu_take_cheat_action();
 void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
 /// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);

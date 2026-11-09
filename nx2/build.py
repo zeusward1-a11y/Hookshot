@@ -555,7 +555,8 @@ def compile_one(job):
             GATE.leave(src)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
-        return src, time.time() - t, r.stderr[-4000:]
+        failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
+        return src, time.time() - t, failure[-4000:]
     open(stamp, "w").write(key)
     cache_put(obj, key)
     return src, time.time() - t, None
