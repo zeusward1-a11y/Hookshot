@@ -3732,10 +3732,10 @@ void exposure_log_dump(const char* why) {
     logf("%s", line);
 }
 
-// ---- (EvilOOT) RX_VK_DRAW_STATS=<dir>: what each program's draws produce on the GPU, for one frame. When <dir>\draw_stats.now
+// ---- (EvilOOT) RX_VK_DRAW_STATS=<dir>: what each program's draws produce on the GPU, for one frame. When <dir>/draw_stats.now
 // appears (checked every half second; the file is removed), every draw of the next frame runs inside a pipeline statistics
 // query: vertex / task / mesh shader invocations, primitives into and out of clipping, fragment shader invocations. Eight
-// frames later the results are read and written to <dir>\draw_stats_<frame>.txt, one line per program, the programs whose
+// frames later the results are read and written to <dir>/draw_stats_<frame>.txt, one line per program, the programs whose
 // draws run but output nothing first (a draw whose mesh threads run and whose primitives never reach the clipper is one that
 // made no triangles: NaN positions, culled lists, empty records). ----
 namespace {
@@ -3881,7 +3881,7 @@ void stats_tick() {
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         if (now < next_check.load(std::memory_order_relaxed)) return;
         next_check.store(now + 500, std::memory_order_relaxed);
-        const std::string trigger = std::string(dir) + "\\draw_stats.now";
+        const std::string trigger = std::string(dir) + "/draw_stats.now";   // ('/': both systems take it; '\\' made a file beside the folder on Linux)
         FILE* f = fopen(trigger.c_str(), "rb");
         if (!f) return;
         fclose(f);
@@ -3975,7 +3975,7 @@ void stats_tick() {
         return !ran ? 2 : !x.clip_in ? 0 : !x.fs ? 1 : 3;
     };
     std::stable_sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) { return rank(a.second) < rank(b.second); });
-    const std::string path = std::string(dir) + "\\draw_stats_" + std::to_string(at) + ".txt";
+    const std::string path = std::string(dir) + "/draw_stats_" + std::to_string(at) + ".txt";
     if (FILE* f = fopen(path.c_str(), "wb")) {
         fprintf(f, "# frame %lld: %u draws, %zu programs (query result %d). kind prog draws | vs task mesh | clip_in clip_out | fs | note\n",
                 (long long)at, n, rows.size(), (int)res);
