@@ -715,7 +715,12 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.native_tiling = 1;
             for (size_t k0 = 0; k0 < layers.size();) {
                 size_t k1 = k0 + 1;
-                while (k1 < layers.size() && k1 - k0 < kBcLayers && layers[k1] == layers[k1 - 1] + 1) k1++;
+                // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
+                // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
+                // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
+                // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
+                static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+                while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
                 const uint32_t n = (uint32_t)(k1 - k0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
                 const uint64_t from = k0 * tail + off;
