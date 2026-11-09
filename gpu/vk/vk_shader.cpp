@@ -71,6 +71,7 @@ extern thread_local bool g_all_global_this;
 namespace mkwvk {
 struct NvnState;
 uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end);   // (vk_bank.cpp)
+bool seed_cs_buffer_word(uint32_t offset);   // (vk_bank.cpp)
 }
 namespace {
 bool ptr_diag_on() {
@@ -441,6 +442,8 @@ public:
     /// anything in c1, the program's own constants. Answered once per word (the pass asks per access).
     bool IsCbufStorageBufferPointer(u32 index, u32 offset) override {
         if (index == 1) return false;
+        // (#940: the seed's compute programs, before anything is bound: c0's buffer tables, as play has them)
+        if (seed_cs_control && stage == Shader::Stage::Compute) return index == 0 && seed_cs_buffer_word(offset);
         const uint64_t key = (uint64_t)index << 32 | offset;
         if (const auto it = pointer_answers.find(key); it != pointer_answers.end()) return it->second;
         const uint64_t v = ReadCbufValue(index, offset) | (uint64_t)ReadCbufValue(index, offset + 4) << 32;
