@@ -98,7 +98,7 @@ def killed_reason():
     total = None
     try:
         with open("/proc/meminfo") as f:
-            total = next((int(l.split()[1]) >> 20 for l in f if l.startswith("MemTotal:")), None)
+            total = next((round(int(l.split()[1]) / (1 << 20)) for l in f if l.startswith("MemTotal:")), None)   # (kB, to the nearest GB)
     except (OSError, ValueError, IndexError):
         pass
     return ("the system stopped it, most likely because the PC ran out of memory%s. Close other programs and build again"
