@@ -62,8 +62,8 @@ def main():
 
     draw = read("gpu/vk/vk_draw.cpp")
     dispatch = code(block(draw, "bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {"))
-    need(dispatch.index("dlss_motion_pass(cmd, rw, rh, clip, now, !same_camera);") < dispatch.index("dlss_evaluate(cmd"),
-         "the motion pass does not run before DLSS's evaluation, or without the camera cut")
+    call = dispatch.find("dlss_motion_pass(cmd, rw, rh, clip, now, !same_camera);")
+    need(0 <= call < dispatch.find("dlss_evaluate(cmd"), "the motion pass does not run before DLSS's evaluation, or without the camera cut")
     need("objmv_log();" in dispatch, "no own-motion line in the 600-frame log")
     passc = code(block(draw, "void dlss_motion_pass("))
     need("objmv::depth_terms(ds.used.cur.data(), a, b)" in passc and "objmv_on()" in passc, "the pass has no depth terms or no switch")

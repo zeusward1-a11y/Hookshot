@@ -140,6 +140,26 @@ static void still_world() {
         }
     std::printf("still world: %u of %u pixels changed, %u moved, %u held\n", changed, interior, r.counts.moved, r.counts.held);
     CHECK(changed * 200 <= interior);   // (at most 0.5%: silhouettes revealed by the turn)
+    // (and little taken for motion at all, which the log counts: the 3x3 keeps silhouettes reprojected a pixel off out, 1x1 had 4x)
+    CHECK(r.counts.moved * 1000 <= r.counts.checked * 3);
+}
+
+/// Something moves across the screen by itself, not followed (an NPC walking past): it moved, but did not keep its place on screen,
+/// so it keeps the camera's motion, as the wall it uncovered does; only pixels held still may differ from the camera's motion
+static void crossing() {
+    Scene s0, s1;
+    s0.has_box = s1.has_box = true;
+    s0.box = {{-1.5, 0.0, -3.0}, {-0.5, 1.8, -2.0}};
+    s1.box = {{0.0, 0.0, -3.0}, {1.0, 1.8, -2.0}};   // (1.5 to the right)
+    const Cam c0{{0, 1.0, 8.0}, {0, 1.0, -20}}, c1{{0.1, 1.0, 8.0}, {0.1, 1.0, -20}};
+    const Run r = two_frames(s0, c0, s1, c1);
+    uint32_t differ = 0, differ_not_still = 0;
+    for (int i = 0; i < W * H; i++)
+        if (r.mv[i * 2] != r.cam_mv[i * 2] || r.mv[i * 2 + 1] != r.cam_mv[i * 2 + 1]) differ++, differ_not_still += len(r.mv, i) != 0.0f;
+    std::printf("crossing: moved %u, held %u, %u pixels differ from the camera's motion\n", r.counts.moved, r.counts.held, differ);
+    CHECK(r.counts.moved > 200);                    // (the walker and what it uncovered: found, 400 here)
+    CHECK(r.counts.held * 10 < r.counts.moved);     // (but not made still: it did not keep its place on screen)
+    CHECK(differ == r.counts.held && differ_not_still == 0);
 }
 
 /// The check off (RX_DLSS_OBJMV=0), or no last frame: the camera's motion exactly, nothing counted
@@ -163,6 +183,7 @@ int main() {
     runner();
     strafe();
     still_world();
+    crossing();
     off_and_first();
     failures += scene_failures;
     std::printf("dlss own motion: %d failures\n", failures);
