@@ -98,6 +98,7 @@ enum Off : int {
     OFF_USER,          // (the row is Off)
     OFF_WINDOW,        // (the window is minimized)
     OFF_SWAPCHAIN,     // (a swapchain is made again, or was just now)
+    OFF_TOO_SMALL,     // (the window's image under DLSS-G's minWidthOrHeight, or eFailResolutionTooLow at this size)
     OFF_STATUS,        // (DLSS-G said its status was not ok: off for a while, then tried again)
     OFF_MENU,          // (the Insert menu is open: it is drawn into the window's image)
     OFF_NO_IMAGE,      // (the game presented nothing: a black frame)
@@ -105,8 +106,8 @@ enum Off : int {
     OFF_COUNT
 };
 inline const char* off_name(int r) {
-    static const char* const names[OFF_COUNT] = {"on", "unavailable", "user", "minimized", "swapchain", "status", "menu", "no image",
-                                                 "no DLSS frame"};
+    static const char* const names[OFF_COUNT] = {"on", "unavailable", "user", "minimized", "swapchain", "too small", "status", "menu",
+                                                 "no image", "no DLSS frame"};
     return r >= 0 && r < OFF_COUNT ? names[r] : "?";
 }
 
@@ -115,6 +116,7 @@ struct PresentState {
     int multiplier = 0;       // (the row: 0 off, 2 to 4)
     bool minimized = false;
     int swapchain_hold = 0;   // (presents left before generation after a swapchain change)
+    bool too_small = false;   // (SizeGate: the window's image is too small for DLSS-G)
     int status_hold = 0;      // (presents left after a status that was not ok)
     bool menu_open = false;
     bool image = false;       // (the game handed a picture)
@@ -126,6 +128,7 @@ inline int decide(const PresentState& p) {
     if (p.multiplier < 2) return OFF_USER;
     if (p.minimized) return OFF_WINDOW;
     if (p.swapchain_hold > 0) return OFF_SWAPCHAIN;
+    if (p.too_small) return OFF_TOO_SMALL;
     if (p.status_hold > 0) return OFF_STATUS;
     if (p.menu_open) return OFF_MENU;
     if (!p.image) return OFF_NO_IMAGE;
@@ -150,6 +153,20 @@ inline Mode mode_for(int off, int multiplier, uint32_t max_generate) {
     return m;
 }
 inline bool same_mode(const Mode& a, const Mode& b) { return a.on == b.on && a.frames == b.frames && a.retain == b.retain; }
+
+/// The player's Off (or the built-in interpolation taking over): an eOff without eRetainResourcesWhenOff must go out, so that
+/// DLSS-G's ~500 MB are freed (the guide's section 18), also when the last options sent were "off, kept" (the menu was open)
+inline bool frees(bool sent, const Mode& last) { return sent && (last.on || last.retain); }
+
+/// Off at once, before anything else of the present (an eOff that keeps the resources): a swapchain about to be made again (every
+/// create_swapchain, the out-of-date acquire and present included: the guide's section 17, DLSS-G off before any window change) or a
+/// minimized window (also when the acquire then fails and no present follows). ON: nothing to do (generation was not on)
+inline int early_off(bool generating, bool minimized, bool swapchain_change) {
+    if (!generating) return ON;
+    if (swapchain_change) return OFF_SWAPCHAIN;
+    if (minimized) return OFF_WINDOW;
+    return ON;
+}
 
 /// A swapchain made again (a resize, fullscreen): DLSS-G must be off for it (the guide: off before any window change, or the
 /// present can deadlock). With generation on, the change waits for one present that carries the off; then it is made, and generation
@@ -180,10 +197,55 @@ struct StatusGate {
         if (!generating) return false;
         const bool changed = status != last;
         last = status;
-        if (status) hold = retry;
+        if (status & ~kResolutionTooLow) hold = retry;   // (too small: SizeGate keeps it off until the size changes, no retries)
         return changed;
     }
+    static constexpr uint32_t kResolutionTooLow = 1u << 0;   // (sl::DLSSGStatus::eFailResolutionTooLow)
 };
+
+/// The window's image too small for DLSS-G: under DLSSGState::minWidthOrHeight (the guide: DLSS-G must be off then), or a size at
+/// which DLSS-G said eFailResolutionTooLow. Off until the size changes, said once a size, never retried at the same size
+struct SizeGate {
+    uint32_t min = 0, failed_w = 0, failed_h = 0, told_w = 0, told_h = 0;
+    bool too_small(uint32_t w, uint32_t h) const {
+        return (min && (w < min || h < min)) || (failed_w && failed_w == w && failed_h == h);
+    }
+    void failed(uint32_t w, uint32_t h) { failed_w = w, failed_h = h; }
+    /// True once for each size found too small (for the log)
+    bool tell(uint32_t w, uint32_t h) {
+        if (!too_small(w, h) || (told_w == w && told_h == h)) return false;
+        told_w = w, told_h = h;
+        return true;
+    }
+};
+
+// ---- the present mode and the frame limit ----
+
+enum PresentMode : int { PRESENT_FIFO = 0, PRESENT_MAILBOX, PRESENT_IMMEDIATE };
+/// The swapchain's mode, as vk_main.cpp create_swapchain chose it (mailbox when the driver has it; on Windows, with no mailbox or
+/// RX_VK_IMMEDIATE, immediate; RX_VK_FIFO: FIFO), except that RX_VK_FIFO is not taken while DLSS-G runs: VSync with frame generation
+/// is D3D12's only (the DLSS-G guide, 22.5), so mailbox, else immediate (G-SYNC through the driver, held under the refresh by
+/// Reflex's frame limit: frame_limit_us). fifo_ignored: RX_VK_FIFO was asked for and not taken
+inline int pick_present_mode(bool fifo_asked, bool immediate_asked, bool dlssg, bool has_mailbox, bool has_immediate, bool windows,
+                             bool* fifo_ignored = nullptr) {
+    if (fifo_ignored) *fifo_ignored = false;
+    if (fifo_asked && !dlssg) return PRESENT_FIFO;
+    if (fifo_asked) {
+        if (fifo_ignored) *fifo_ignored = has_mailbox || has_immediate;
+        return has_mailbox ? PRESENT_MAILBOX : has_immediate ? PRESENT_IMMEDIATE : PRESENT_FIFO;
+    }
+    int mode = has_mailbox ? PRESENT_MAILBOX : PRESENT_FIFO;
+    if (has_immediate && (immediate_asked || (windows && mode == PRESENT_FIFO))) mode = PRESENT_IMMEDIATE;
+    return mode;
+}
+
+/// Reflex's frameLimitUs that holds the game's frames times the multiplier at or under fraction of the monitor's refresh (rounded up,
+/// so the frames shown never pass it): 164 Hz at 2x, 0.97: 12573 us, 79.5 game frames, 159.1 shown. 0 (no limit): refresh unknown
+inline uint32_t frame_limit_us(uint32_t refresh_hz, int multiplier, double fraction) {
+    if (refresh_hz < 2 || fraction <= 0.0) return 0;
+    const int m = multiplier < 1 ? 1 : multiplier;
+    return (uint32_t)std::ceil(1e6 * (double)m / (fraction * (double)refresh_hz));
+}
 
 // ---- the log ----
 
@@ -202,17 +264,18 @@ struct Stats {
     }
     void clear() { *this = Stats{}; }
     /// The log line, e.g. "vk: dlssg: 600 presents: 2.00 frames shown per game frame (1200 shown), generating 600 at 2x, status ok;
-    /// off: user 0, menu 0, no DLSS frame 0, no image 0, swapchain 0, minimized 0, status 0, unavailable 0"
+    /// off: user 0, menu 0, no DLSS frame 0, no image 0, swapchain 0, minimized 0, too small 0, status 0, unavailable 0"
     int line(char* out, size_t n, int multiplier) const {
         char st[24];
         if (status) snprintf(st, sizeof st, "%#x", (unsigned)status);
         else snprintf(st, sizeof st, "ok");
         return snprintf(out, n,
                         "vk: dlssg: %llu presents: %.2f frames shown per game frame (%llu shown), generating %llu at %dx, status %s; "
-                        "off: user %u, menu %u, no DLSS frame %u, no image %u, swapchain %u, minimized %u, status %u, unavailable %u",
+                        "off: user %u, menu %u, no DLSS frame %u, no image %u, swapchain %u, minimized %u, too small %u, status %u, "
+                        "unavailable %u",
                         (unsigned long long)presents, presents ? (double)shown / (double)presents : 0.0, (unsigned long long)shown,
                         (unsigned long long)on, multiplier, st, off[OFF_USER], off[OFF_MENU], off[OFF_NO_DLSS], off[OFF_NO_IMAGE],
-                        off[OFF_SWAPCHAIN], off[OFF_WINDOW], off[OFF_STATUS], off[OFF_UNAVAILABLE]);
+                        off[OFF_SWAPCHAIN], off[OFF_WINDOW], off[OFF_TOO_SMALL], off[OFF_STATUS], off[OFF_UNAVAILABLE]);
     }
 };
 

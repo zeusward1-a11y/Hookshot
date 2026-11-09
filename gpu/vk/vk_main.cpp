@@ -17,6 +17,7 @@
 #include "vk_draw.h"
 #include "vk_internal.h"
 #include "vk_dlss.h"
+#include "dlssg_logic.h"
 #include "gpu_choice.h"
 #include "vk_menu.h"
 
@@ -409,6 +410,7 @@ bool create_device() {
 } // namespace
 
 bool create_swapchain(uint32_t width, uint32_t height) {
+    dlss_swapchain_changing();   // (hookshot: DLSS-G off before any swapchain is made or destroyed: its guide's section 17)
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
     if (result != VK_SUCCESS) {
@@ -446,23 +448,25 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     }
     if (result != VK_SUCCESS || modes.empty())
         logf("vk: querying present modes failed (VkResult %d, count %u); trying mandatory FIFO mode", (int)result, n);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
     const bool force_fifo = getenv("RX_VK_FIFO") != nullptr;   // (as on a card or driver with vsync forced)
-    if (!force_fifo) {
-        for (auto m : modes)
-            if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;
-        // (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
-        //  Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other
-        //  monitor and other programs tear. RX_VK_IMMEDIATE=1 still asks for it.)
-        const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    // mailbox when the driver has it. (Windows, no mailbox: AMD's driver has none, and FIFO held anything under 60 fps at 30.
+    // Linux: immediate on NVIDIA's X11 path turns vblank off for every output, so the other monitor and other programs tear.
+    // RX_VK_IMMEDIATE=1 still asks for it.) (hookshot) With DLSS Frame Generation on, RX_VK_FIFO is not taken: VSync with frame
+    // generation is D3D12's only; mailbox, else immediate, and Reflex's frame limit under the refresh (dlssg_logic.h pick_present_mode)
+    const bool want_immediate = getenv("RX_VK_IMMEDIATE") != nullptr;
+    const bool has_mailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+    const bool has_immediate = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
 #ifdef _WIN32
-        if (want_immediate || mode == VK_PRESENT_MODE_FIFO_KHR)
+    constexpr bool windows = true;
 #else
-        if (want_immediate)
+    constexpr bool windows = false;
 #endif
-            for (auto m : modes)
-                if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
-    }
+    bool fifo_ignored = false;
+    const int pick = dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available(), has_mailbox, has_immediate, windows,
+                                              &fifo_ignored);
+    const VkPresentModeKHR mode = pick == dlssg::PRESENT_MAILBOX ? VK_PRESENT_MODE_MAILBOX_KHR :
+                                  pick == dlssg::PRESENT_IMMEDIATE ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    if (fifo_ignored) dlssg_fifo_ignored();
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)

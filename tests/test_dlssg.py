@@ -39,6 +39,11 @@ def block(text, marker):
     return text[start:end]
 
 
+def code(text):
+    """text with its // comments left out: a call commented away is no call"""
+    return re.sub(r"//[^\n]*", "", text)
+
+
 def check_sources():
     failures = []
 
@@ -114,6 +119,27 @@ def check_sources():
     # (the shader caches' stamp hashes vk_api.h, nx2/build.py: no new renderer table entry, the caches stay valid)
     api = read("gpu/vk/vk_api.h")
     need("frame_start" not in api and "#define MKWVK_API_VERSION 4" in api, "vk_api.h changed: the shader caches would be thrown away")
+
+    # (the review's follow-ups)
+    swap = code(block(main, "bool create_swapchain("))
+    need("dlss_swapchain_changing();" in swap and
+         swap.index("dlss_swapchain_changing();") < swap.index("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
+         "DLSS-G is not turned off before the swapchain changes")
+    need("dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available()" in swap and "dlssg_fifo_ignored();" in swap,
+         "RX_VK_FIFO is not set aside while DLSS-G runs")
+    need("RX_VK_FIFO ignored while DLSS-G is on (G-SYNC through the driver; VSync with frame generation is D3D12-only)" in dlss,
+         "no log line for RX_VK_FIFO set aside")
+    need("o.frameLimitUs = limit;" in block(dlss, "void apply_reflex(") and "dlssg::frame_limit_us(st.refresh_hz, mult, 0.97)" in dlss,
+         "no Reflex frame limit under the refresh")
+    need("EnumDisplaySettingsW(" in block(dlss, "uint32_t monitor_refresh()"), "the monitor's refresh is not read")
+    pic = code(pi)
+    need("dlssg_window_check();" in pic and pic.index("dlssg_window_check();") < pic.index("vkAcquireNextImageKHR("),
+         "a minimized window is not checked before the acquire")
+    need("dlssg::frees(fr.applied_valid, fr.applied)" in begin, "the built-in interpolation's present does not free DLSS-G after off-kept")
+    need("p.too_small = fr.size.too_small(sw, sh);" in begin and "fr.size.failed(" in end, "too small is not kept off")
+    need("st.reflex_applied > 0" not in fstart, "Reflex's sleep is skipped while Reflex is off")
+    need("RX_DLSSG_TAGS" not in dlss and "eValidUntilPresent, &render_area" not in dlss, "the valid-until-present tag path is back")
+    need("static_assert(n12 == 47 && n13 == 15" in dlss, "the feature counts read past the structs' last field")
 
     menu = read("gpu/vk/vk_menu.cpp")
     need('"DLSS Frame Generation", &opts.dlssg, 0, 4, 1, tx_dlssg' in menu, "no DLSS Frame Generation row")

@@ -2958,6 +2958,7 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 std::mutex present_image_mu;
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, uint32_t game_frame) {
     std::lock_guard lk(present_image_mu);
+    dlssg_window_check();   // (DLSS-G off at once when the window is minimized, even if the acquire below fails)
     // (the window was resized: main's resize. With DLSS Frame Generation on, this present turns it off first and the swapchain is
     // made at the next one: the guide wants DLSS-G off for any window change, vk_dlss.cpp dlss_defer_swapchain)
     if (dev.swap_resize.load(std::memory_order_acquire) && !(game_frame && dlss_defer_swapchain()))

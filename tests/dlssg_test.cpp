@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 #include "dlssg_logic.h"
 
@@ -205,7 +206,7 @@ static void logs() {
     char line[400];
     st.line(line, sizeof line, 2);
     const char* want = "vk: dlssg: 600 presents: 1.98 frames shown per game frame (1190 shown), generating 590 at 2x, status ok; off: user 0, "
-                       "menu 6, no DLSS frame 4, no image 0, swapchain 0, minimized 0, status 0, unavailable 0";
+                       "menu 6, no DLSS frame 4, no image 0, swapchain 0, minimized 0, too small 0, status 0, unavailable 0";
     if (strcmp(line, want)) std::printf("FAIL log line:\n  got  %s\n  want %s\n", line, want), ++failures;
     st.add(OFF_STATUS, 1, 0x2);
     st.line(line, sizeof line, 3);
@@ -394,7 +395,86 @@ static void clip_conversion() {
     CHECK(!invert4(sing, back));
 }
 
+// ---- the follow-up decisions: resources freed, generation off at once, too small, FIFO, the frame limit ----
+static void follow_up() {
+    // (3) the player's Off frees DLSS-G's memory, also after "off, kept"
+    CHECK(!frees(false, mode_for(ON, 2, 3)));          // (nothing sent yet: nothing to free)
+    CHECK(frees(true, mode_for(ON, 2, 3)));            // (on)
+    CHECK(frees(true, mode_for(OFF_MENU, 2, 3)));      // (off, kept: the menu was open)
+    CHECK(!frees(true, mode_for(OFF_USER, 0, 3)));     // (freed already)
+
+    // (2) off at once before a swapchain change and when minimized, only when generating
+    CHECK(early_off(true, false, true) == OFF_SWAPCHAIN);
+    CHECK(early_off(true, true, false) == OFF_WINDOW);
+    CHECK(early_off(true, true, true) == OFF_SWAPCHAIN);
+    CHECK(early_off(true, false, false) == ON);
+    CHECK(early_off(false, true, true) == ON);         // (already off: nothing sent)
+    CHECK(early_off(false, false, true) == ON);        // (a swapchain change while off)
+    CHECK(early_off(false, true, false) == ON);        // (minimized while off)
+
+    // (4) too small: off until the size changes, no retry every 300 presents
+    SizeGate z;
+    CHECK(!z.too_small(2560, 1440));
+    z.min = 360;   // (DLSSGState::minWidthOrHeight)
+    CHECK(z.too_small(640, 320));
+    CHECK(z.too_small(300, 1000));
+    CHECK(!z.too_small(640, 360));
+    CHECK(z.tell(640, 320));
+    CHECK(!z.tell(640, 320));                          // (said once a size)
+    CHECK(z.tell(300, 1000));
+    CHECK(!z.tell(2560, 1440));                        // (big enough: nothing to say)
+    z.failed(1280, 720);                               // (eFailResolutionTooLow at a size the minimum allowed)
+    CHECK(z.too_small(1280, 720));
+    CHECK(!z.too_small(1281, 720));                    // (another size: tried again)
+    PresentState p;
+    p.available = true, p.multiplier = 2, p.image = true, p.tagged = true, p.too_small = true;
+    CHECK(decide(p) == OFF_TOO_SMALL);
+    p.swapchain_hold = 1;
+    CHECK(decide(p) == OFF_SWAPCHAIN);
+    CHECK(!strcmp(off_name(OFF_TOO_SMALL), "too small"));
+    StatusGate s;
+    s.update(true, StatusGate::kResolutionTooLow, 300);
+    CHECK(s.hold == 0);                                // (resolution too low: the size gate's, no 300-present retry)
+    s.update(true, StatusGate::kResolutionTooLow | 0x2, 300);
+    CHECK(s.hold == 300);                              // (another reason with it: held)
+
+    // (1) the present mode: without DLSS-G exactly as create_swapchain chose it before
+    for (int bits = 0; bits < 32; bits++) {
+        const bool fifo = bits & 1, imm = bits & 2, mb = bits & 4, im = bits & 8, win = bits & 16;
+        int old = PRESENT_FIFO;   // (create_swapchain before this change)
+        if (!fifo) {
+            if (mb) old = PRESENT_MAILBOX;
+            if ((win ? (imm || old == PRESENT_FIFO) : imm) && im) old = PRESENT_IMMEDIATE;
+        }
+        bool ignored = true;
+        CHECK(pick_present_mode(fifo, imm, false, mb, im, win, &ignored) == old);
+        CHECK(!ignored);
+        if (!fifo) CHECK(pick_present_mode(fifo, imm, true, mb, im, win) == old);   // (no RX_VK_FIFO: DLSS-G changes nothing)
+    }
+    bool ignored = false;
+    CHECK(pick_present_mode(true, false, true, true, true, true, &ignored) == PRESENT_MAILBOX && ignored);
+    CHECK(pick_present_mode(true, false, true, false, true, true, &ignored) == PRESENT_IMMEDIATE && ignored);
+    CHECK(pick_present_mode(true, false, true, false, false, true, &ignored) == PRESENT_FIFO && !ignored);   // (FIFO is all there is)
+    CHECK(pick_present_mode(true, false, false, true, true, true, &ignored) == PRESENT_FIFO && !ignored);    // (DLSS-G off: FIFO)
+
+    // (1) the frame limit: game frames times the multiplier at most 97% of the refresh
+    CHECK(frame_limit_us(164, 2, 0.97) == 12573);   // (79.5 game, 159.1 shown, under 164)
+    CHECK(frame_limit_us(164, 3, 0.97) == 18859);
+    CHECK(frame_limit_us(164, 4, 0.97) == 25145);
+    CHECK(frame_limit_us(60, 2, 0.97) == 34365);
+    CHECK(frame_limit_us(164, 1, 0.97) == 6287);    // (the row Off: the game's frames alone)
+    CHECK(frame_limit_us(164, 0, 0.97) == 6287);
+    CHECK(frame_limit_us(0, 2, 0.97) == 0);         // (refresh unknown: no limit)
+    for (uint32_t hz : {60u, 120u, 144u, 164u, 165u, 240u})
+        for (int m = 1; m <= 4; m++) {
+            const uint32_t us = frame_limit_us(hz, m, 0.97);
+            CHECK(1e6 / us * m <= 0.97 * hz + 1e-9);   // (never over 97%)
+            CHECK(1e6 / (us - 1) * m > 0.97 * hz);     // (and as close as whole microseconds allow)
+        }
+}
+
 int main() {
+    follow_up();
     multiplier();
     frames();
     decisions();

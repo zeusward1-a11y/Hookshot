@@ -81,6 +81,11 @@ void dlssg_frame_start();        // (the game's thread at its window acquire, th
 /// A swapchain is waiting to be made again (a resize): true while it must wait for this present, which turns generation off first
 bool dlss_defer_swapchain();
 void dlss_swapchain_created();   // (create_swapchain: Reflex's mode is the swapchain's; generation waits a few presents)
+void dlss_swapchain_changing();  // (create_swapchain, first: generation off at once, before any swapchain is made or destroyed)
+void dlssg_window_check();       // (present_image, first: a minimized window turns generation off, even when no present follows)
+/// create_swapchain: RX_VK_FIFO was not taken because DLSS-G runs (VSync with frame generation is D3D12's only): Reflex's frame
+/// limit holds the shown frames at 97% of the monitor's refresh instead
+void dlssg_fifo_ignored();
 /// A game frame's present, after its submit and before vkQueuePresentKHR (on the presenting thread): generation on or off for it,
 /// null tags and neutral constants when DLSS did not draw it, the game's part of the window image when there are bars, and the
 /// render-submit-end and present-start markers. image: the game handed a picture; x, y, w, h: where it is in the sw x sh image

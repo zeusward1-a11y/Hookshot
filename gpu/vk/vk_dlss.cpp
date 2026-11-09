@@ -108,7 +108,9 @@ struct State {
     std::vector<std::vector<float>> priorities;
     DlssQueues queues;
     int reflex_asked = 1, reflex_applied = -1;
-    sl::ResourceLifecycle tag_life = sl::ResourceLifecycle::eOnlyValidNow;
+    uint32_t limit_applied = ~0u;   // (Reflex's frameLimitUs last sent)
+    bool fifo_cap = false;          // (RX_VK_FIFO was not taken: Reflex's frame limit holds the frames under the refresh)
+    uint32_t refresh_hz = 0;        // (the window's monitor, at the last swapchain)
 };
 State st;
 
@@ -126,6 +128,8 @@ struct Frames {
     int last_off = dlssg::OFF_UNAVAILABLE;
     dlssg::SwapchainGate gate;
     dlssg::StatusGate status;
+    dlssg::SizeGate size;
+    uint32_t last_sw = 0, last_sh = 0;   // (the window's image at the last present)
     dlssg::Stats stats;
     uint32_t changes_logged = 0;
 };
@@ -431,13 +435,36 @@ const char* support_text(sl::Result r) {
 
 /// Reflex's mode, set again after every swapchain (Streamline applies it to the swapchain it knows, VK_NV_low_latency2) and when the
 /// row turns generation on or off. RX_REFLEX=0|1|2 (default 1); 0 is 1 while generating (dlssg_logic.h reflex_mode)
+/// The multiplier generation runs at: the row's, within the GPU's maximum (1: the row is Off)
+int multiplier_now() {
+    return opts.dlssg >= 2 && dlssg_available() ? (int)dlssg::frames_to_generate(opts.dlssg, st.fg_max) + 1 : 1;
+}
+/// The refresh rate of the monitor the window is on (EnumDisplaySettings of its device), 0 when not known
+uint32_t monitor_refresh() {
+    const HWND w = app_window();
+    HMONITOR mon = w ? MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof mi;
+    if (!mon || !GetMonitorInfoW(mon, &mi)) return 0;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    return EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1 ? dm.dmDisplayFrequency : 0;
+}
 void apply_reflex(bool force) {
     if (!st.fg_ok || !st.reflex_options) return;
     const int mode = dlssg::reflex_mode(st.reflex_asked, dlssg_engaged());
-    if (!force && mode == st.reflex_applied) return;
+    // (RX_VK_FIFO not taken: the game's frames times the multiplier at most 97% of the refresh, where G-SYNC holds the picture)
+    const int mult = multiplier_now();
+    const uint32_t limit = st.fifo_cap ? dlssg::frame_limit_us(st.refresh_hz, mult, 0.97) : 0;
+    if (!force && mode == st.reflex_applied && limit == st.limit_applied) return;
     sl::ReflexOptions o{};
     o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode == 1 ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
+    o.frameLimitUs = limit;
     const sl::Result r = st.reflex_options(o);
+    if (limit != st.limit_applied && st.fifo_cap)
+        logf("vk: dlssg: monitor %u Hz: Reflex frame limit %u us (%.1f game frames a second at %dx, %.1f shown; result %d)", st.refresh_hz,
+             limit, limit ? 1e6 / limit : 0.0, mult, limit ? 1e6 * mult / limit : 0.0, (int)r);
+    st.limit_applied = limit;
     static int logged;
     if (mode != st.reflex_applied || logged < 4) {
         logged++;
@@ -501,8 +528,7 @@ void fg_attach(VkPhysicalDevice physical) {
     if (fg_state(s)) st.fg_max = s.numFramesToGenerateMax;
     sl::FeatureVersion v{};
     st.get_feature_version(sl::kFeatureDLSS_G, v);
-    logf("vk: dlssg: DLSS-G %s on Streamline %s; tags %s%s", v.versionNGX.toStr().c_str(), v.versionSL.toStr().c_str(),
-         st.tag_life == sl::ResourceLifecycle::eOnlyValidNow ? "copied when tagged" : "valid until the present",
+    logf("vk: dlssg: DLSS-G %s on Streamline %s; tags copied when tagged%s", v.versionNGX.toStr().c_str(), v.versionSL.toStr().c_str(),
          st.fg_max ? "" : " (its most frames are known at the first swapchain)");
     announce();
 }
@@ -659,7 +685,6 @@ bool dlss_start() {
     for (const std::string& s : st.inst_names) st.inst.push_back(s.c_str());
     for (const std::string& s : st.dev_names) st.devx.push_back(s.c_str());
     st.reflex_asked = dlssg::parse_reflex(getenv("RX_REFLEX"), 1);
-    if (const char* t = getenv("RX_DLSSG_TAGS"); t && !strcmp(t, "present")) st.tag_life = sl::ResourceLifecycle::eValidUntilPresent;
     sl::FeatureVersion version{};
     st.get_feature_version(sl::kFeatureDLSS, version);
     const Version mv = read_version(used).value_or(Version{});
@@ -744,10 +769,12 @@ void dlss_check_features(const VkPhysicalDeviceVulkan12Features& f12, const VkPh
             else if (!ok) logf("vk: dlss: the GPU lacks Vulkan %s feature %s, which Streamline asked for", which, name);
         }
     };
-    const size_t n12 = (sizeof(VkPhysicalDeviceVulkan12Features) - offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge)) /
-                       sizeof(VkBool32);
-    const size_t n13 = (sizeof(VkPhysicalDeviceVulkan13Features) - offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess)) /
-                       sizeof(VkBool32);
+    // (first to last field: the structs end in padding, sizeof would read one VkBool32 past the last)
+    constexpr size_t n12 = (offsetof(VkPhysicalDeviceVulkan12Features, subgroupBroadcastDynamicId) -
+                            offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge)) / sizeof(VkBool32) + 1;
+    constexpr size_t n13 = (offsetof(VkPhysicalDeviceVulkan13Features, maintenance4) -
+                            offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess)) / sizeof(VkBool32) + 1;
+    static_assert(n12 == 47 && n13 == 15, "Vulkan 1.2 has 47 features, 1.3 has 15");
     check(st.feat12, f12, sl::getVkPhysicalDeviceVulkan12Features, &f12.samplerMirrorClampToEdge, n12, "1.2");
     check(st.feat13, f13, sl::getVkPhysicalDeviceVulkan13Features, &f13.robustImageAccess, n13, "1.3");
 }
@@ -932,16 +959,17 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
         barriers(cmd, {barrier(color, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(depth, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
                        barrier(motion, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(output, dlss_out, any, G, G)});
         // (DLSS-G) the same depth and motion for frame generation at the present, in GENERAL here. Copied by Streamline as they are
-        // now (eOnlyValidNow): the game's depth target is drawn into again before the present, and next frame's motion pass
-        // rewrites ours. RX_DLSSG_TAGS=present: tagged valid until the present instead (no copies)
+        // now (eOnlyValidNow): the game's depth target is drawn into again before the present (and may be freed), and next frame's
+        // motion pass rewrites ours
         if (!stage && fg_on) {
             constexpr VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
             constexpr VkImageUsageFlags motion_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             sl::Resource gd = resource(depth, G, depth.usage ? depth.usage : depth_usage),
                          gm = resource(motion, G, motion.usage ? motion.usage : motion_usage);
-            const sl::ResourceTag tags[] = {sl::ResourceTag{&gd, sl::kBufferTypeDepth, st.tag_life, &render_area},
-                                            sl::ResourceTag{&gm, sl::kBufferTypeMotionVectors, st.tag_life, &render_area}};
+            const sl::ResourceTag tags[] = {sl::ResourceTag{&gd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &render_area},
+                                            sl::ResourceTag{&gm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow,
+                                                            &render_area}};
             sl::FrameToken* ft = token(frame);
             const sl::Result tr = ft ? st.set_tag(*ft, viewport, tags, 2, reinterpret_cast<sl::CommandBuffer*>(cmd))
                                      : sl::Result::eErrorInvalidParameter;
@@ -982,11 +1010,45 @@ void dlssg_frame_start() {
     // CPU work ends about when the GPU is free for it (NX2navi: without this sleep DLSS-G halved the game's frame rate). The game's
     // simulation and its recording are one span here (its threads cannot be told apart): its markers at the start, the render submit
     // until the present sends the frame's work (dlssg_present_begin)
-    if (st.reflex_sleep && st.reflex_applied > 0 && dlssg::hold(now_ns(), fr.last_present_ns.load(), kHoldIdleNs))
+    // (in every frame, Reflex on or off: the Reflex guide wants slReflexSleep and the markers always)
+    if (st.reflex_sleep && dlssg::hold(now_ns(), fr.last_present_ns.load(), kHoldIdleNs))
         if (sl::FrameToken* t = token(f)) st.reflex_sleep(*t);
     mark(sl::PCLMarker::eSimulationStart, f);
     mark(sl::PCLMarker::eSimulationEnd, f);
     mark(sl::PCLMarker::eRenderSubmitStart, f);
+}
+
+namespace {
+/// eOff that keeps the resources, at once (dlssg_logic.h early_off): a swapchain about to change, a minimized window
+void off_now(int why, const char* what) {
+    if (dlssg::early_off(fr.generating.load(), why == dlssg::OFF_WINDOW, why == dlssg::OFF_SWAPCHAIN) == dlssg::ON) return;
+    const dlssg::Mode m = dlssg::mode_for(why, opts.dlssg, st.fg_max);
+    sl::DLSSGOptions o{};
+    o.mode = sl::DLSSGMode::eOff;
+    o.numFramesToGenerate = m.frames;
+    o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+    const sl::Result r = st.fg_options(sl::ViewportHandle{0u}, o);
+    if (r == sl::Result::eOk) fr.applied = m, fr.applied_valid = true, fr.generating = false;
+    static int told;
+    if (told++ < 20) logf("vk: dlssg: generation off at once: %s (result %d)", what, (int)r);
+}
+} // namespace
+
+void dlss_swapchain_changing() {
+    if (!st.fg_ok || !st.fg_options) return;
+    off_now(dlssg::OFF_SWAPCHAIN, "the swapchain is made again");
+    fr.gate.changed(kSettle);
+}
+
+void dlssg_window_check() {
+    if (!st.fg_ok || !st.fg_options) return;
+    if (app_window() && IsIconic(app_window())) off_now(dlssg::OFF_WINDOW, "the window is minimized");
+}
+
+void dlssg_fifo_ignored() {
+    if (!st.fg_ok || st.fifo_cap) return;
+    st.fifo_cap = true;
+    logf("vk: dlssg: RX_VK_FIFO ignored while DLSS-G is on (G-SYNC through the driver; VSync with frame generation is D3D12-only)");
 }
 
 bool dlss_defer_swapchain() {
@@ -1000,6 +1062,7 @@ bool dlss_defer_swapchain() {
 void dlss_swapchain_created() {
     if (!st.fg_ok) return;
     fr.gate.changed(kSettle);
+    st.refresh_hz = monitor_refresh();   // (the window may have gone to another monitor)
     apply_reflex(true);
     sl::DLSSGState s{};
     if (!st.fg_max && fg_state(s) && s.numFramesToGenerateMax) st.fg_max = s.numFramesToGenerateMax;
@@ -1010,7 +1073,7 @@ void dlssg_present_begin(uint32_t frame, bool image, int x, int y, uint32_t w, u
     if (!st.fg_ok) return;
     const sl::ViewportHandle viewport{0u};
     if (!frame) {   // (the built-in interpolation presents: the row was turned Off at run time, so DLSS-G goes off, its memory freed)
-        if (fr.applied_valid && fr.applied.on) {
+        if (dlssg::frees(fr.applied_valid, fr.applied)) {   // (also after "off, kept": the menu was open when the row went Off)
             const dlssg::Mode m = dlssg::mode_for(dlssg::OFF_USER, opts.dlssg, st.fg_max);
             sl::DLSSGOptions o{};
             o.mode = sl::DLSSGMode::eOff;
@@ -1028,6 +1091,11 @@ void dlssg_present_begin(uint32_t frame, bool image, int x, int y, uint32_t w, u
     p.minimized = app_window() && IsIconic(app_window());
     p.swapchain_hold = fr.gate.hold;
     p.status_hold = fr.status.hold;
+    p.too_small = fr.size.too_small(sw, sh);
+    fr.last_sw = sw, fr.last_sh = sh;
+    if (fr.size.tell(sw, sh))
+        logf("vk: dlssg: the window's %ux%u is under DLSS-G's minimum (%u, or it said too small at this size): generation off until "
+             "the window's size changes", sw, sh, fr.size.min);
     p.menu_open = menu_is_open();
     p.image = image;
     p.tagged = fr.tagged_frame.load() == frame;
@@ -1082,6 +1150,9 @@ void dlssg_present_end(uint32_t frame) {
         st.fg_max = s.numFramesToGenerateMax;
         announce();
     }
+    if (have && s.minWidthOrHeight) fr.size.min = s.minWidthOrHeight;
+    if (have && fr.generating.load() && (s.status & sl::DLSSGStatus::eFailResolutionTooLow))
+        fr.size.failed(fr.last_sw, fr.last_sh);   // (off at this size until it changes: no retry every 300 presents)
     if (fr.status.update(fr.generating.load(), have ? (uint32_t)s.status : 0u, kStatusRetry))
         logf("vk: dlssg: frame %u: status %#x%s", frame, (unsigned)s.status,
              (uint32_t)s.status ? ": generation off for 300 presents, then tried again (the reason is in Streamline's lines above)" : ": ok");
@@ -1134,6 +1205,9 @@ void dlssg_game_present() {}
 void dlssg_frame_start() {}
 bool dlss_defer_swapchain() { return false; }
 void dlss_swapchain_created() {}
+void dlss_swapchain_changing() {}
+void dlssg_window_check() {}
+void dlssg_fifo_ignored() {}
 void dlssg_present_begin(uint32_t, bool, int, int, uint32_t, uint32_t, uint32_t, uint32_t) {}
 void dlssg_present_end(uint32_t) {}
 } // namespace mkwvk
