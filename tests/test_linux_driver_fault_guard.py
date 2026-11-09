@@ -37,6 +37,8 @@ struct { uintptr_t device = 0x1234; } dev;
 static int mode;        /* (0: compile, 1 and 2: the driver faults) */
 static int calls;
 static constexpr VkResult DRIVER_FAULT = -77;
+static int logged;
+void logf(const char *, ...) { ++logged; }
 static void fault_now() { *(volatile int *)0x40 = 1; }
 VkResult vkCreateComputePipelines(uintptr_t device, VkPipelineCache cache, unsigned count,
                                   const VkComputePipelineCreateInfo *ci, const void *allocator, VkPipeline *out) {
