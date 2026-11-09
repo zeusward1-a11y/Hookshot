@@ -12,6 +12,7 @@
 <h4 align="center">The Legend of Zelda: Ocarina of Time (Nintendo Switch 2) running natively on Windows & Linux, with no emulator.
 </h4>
 
+
 <p align="center">
   <a href="#project-status">Status</a> |
   <a href="#install-and-play">Install and play</a> |
@@ -28,6 +29,10 @@ Hookshot is a static recompilation. The game's code is translated to C and compi
 the console's system software is reimplemented, and the Switch 2 graphics are rebuilt on Vulkan. All of this happens
 **on your PC, from your own copy of the game**.
 <br>
+
+> [!WARNING]
+> Some users report the file in releases to be a Trojan - it is not. Feel free to run it through any antivirus software
+
 
 Discord: https://discord.gg/DVQQJphbBf
 <br>
