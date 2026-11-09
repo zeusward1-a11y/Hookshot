@@ -125,12 +125,22 @@ def check_sources():
     need("dlss_swapchain_changing();" in swap and
          swap.index("dlss_swapchain_changing();") < swap.index("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
          "DLSS-G is not turned off before the swapchain changes")
-    need("dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available()" in swap and "dlssg_fifo_ignored();" in swap,
+    need("dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available()" in swap and "dlssg_fifo_state(fifo_ignored);" in swap,
          "RX_VK_FIFO is not set aside while DLSS-G runs")
     need("RX_VK_FIFO ignored while DLSS-G is on (G-SYNC through the driver; VSync with frame generation is D3D12-only)" in dlss,
          "no log line for RX_VK_FIFO set aside")
-    need("o.frameLimitUs = limit;" in block(dlss, "void apply_reflex(") and "dlssg::frame_limit_us(st.refresh_hz, mult, 0.97)" in dlss,
-         "no Reflex frame limit under the refresh")
+    reflex = code(block(dlss, "void apply_reflex("))
+    need("o.frameLimitUs = limit;" in reflex and
+         re.search(r"const bool generating = fr\.applied_valid && fr\.applied\.on;.*dlssg::reflex_limit_us\(st\.limit_basis, st\.fifo\.on, "
+                   r"dlssg_engaged\(\), generating, fr\.applied\.frames,", reflex, re.S),
+         "Reflex's frame limit does not come from reflex_limit_us with the options last sent")
+    need("st.fifo.update(ignored," in code(block(dlss, "void dlssg_fifo_state(")), "the frame limit's cap does not follow each swapchain's choice")
+    bcode = code(begin)
+    need(bcode.rfind("apply_reflex(false);") > bcode.index("fr.generating = fr.applied_valid && fr.applied.on;"),
+         "Reflex's frame limit is set before this present's decision")
+    need("dlssg_fifo_state(fifo_ignored);" in code(block(main, "bool create_swapchain(")), "the frame limit's cap does not follow each swapchain")
+    need("dlssg::parse_limit(getenv(\"RX_DLSSG_LIMIT\"))" in dlss, "RX_DLSSG_LIMIT is not read")
+    need("st.free_resources(sl::kFeatureDLSS_G" in code(block(dlss, "void dlssg_present_end(")), "no slFreeResources after the Off")
     need("EnumDisplaySettingsW(" in block(dlss, "uint32_t monitor_refresh()"), "the monitor's refresh is not read")
     pic = code(pi)
     need("dlssg_window_check();" in pic and pic.index("dlssg_window_check();") < pic.index("vkAcquireNextImageKHR("),

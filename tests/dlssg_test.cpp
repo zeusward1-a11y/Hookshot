@@ -473,7 +473,62 @@ static void follow_up() {
         }
 }
 
+// ---- the second review: the limit follows what DLSS-G does, the cap clears, the basis, the free, the status words ----
+static void second_review() {
+    const uint32_t R = 60;
+    // (B1) not generating (menu, a frame DLSS did not draw, a hold, DLSS off): no limit on the game basis, whatever the row
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, false, 3, R) == 0);    // (a 4x row in the menu: was 0.97*60/4 = 14.5 fps)
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 3, R) == frame_limit_us(R, 4, 0.97));
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 1, 164) == 12573);
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 0, R) == 0);     // (on with nothing generated: 1x)
+    // (N1) the cap only while RX_VK_FIFO is set aside and DLSS-G can run
+    CHECK(reflex_limit_us(LIMIT_GAME, false, true, true, 1, R) == 0);    // (FIFO taken again: no limit)
+    CHECK(reflex_limit_us(LIMIT_GAME, true, false, true, 1, R) == 0);    // (DLSS failed, the row Off: no limit)
+    CHECK(reflex_limit_us(LIMIT_PRESENT, true, false, false, 1, R) == 0);
+    // (N2) the basis
+    CHECK(reflex_limit_us(LIMIT_PRESENT, true, true, true, 3, 164) == frame_limit_us(164, 1, 0.97));   // (every present: 97%)
+    CHECK(reflex_limit_us(LIMIT_PRESENT, true, true, false, 3, 164) == frame_limit_us(164, 1, 0.97));
+    CHECK(reflex_limit_us(LIMIT_NONE, true, true, true, 3, 164) == 0);
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 3, 0) == 0);     // (refresh unknown)
+    CHECK(parse_limit(nullptr) == LIMIT_GAME);
+    CHECK(parse_limit("") == LIMIT_GAME);
+    CHECK(parse_limit("game") == LIMIT_GAME);
+    CHECK(parse_limit("present") == LIMIT_PRESENT);
+    CHECK(parse_limit("0") == LIMIT_NONE);
+    CHECK(parse_limit("none") == LIMIT_NONE);
+    CHECK(parse_limit("bogus") == LIMIT_GAME);
+    CHECK(!strcmp(limit_name(LIMIT_GAME), "game") && !strcmp(limit_name(LIMIT_PRESENT), "present") && !strcmp(limit_name(LIMIT_NONE), "0"));
+    // the limit along a session: on at 4x, the menu opens (no limit), closes (back), the row goes Off (none)
+    struct Step { bool usable, generating; uint32_t generated, want; } steps[] = {
+        {true, true, 3, frame_limit_us(R, 4, 0.97)}, {true, false, 3, 0}, {true, true, 3, frame_limit_us(R, 4, 0.97)}, {false, false, 3, 0}};
+    for (const Step& s : steps) CHECK(reflex_limit_us(LIMIT_GAME, true, s.usable, s.generating, s.generated, R) == s.want);
+    // (N1) the cap follows each swapchain: on while FIFO is set aside and DLSS-G can run, off when a swapchain takes FIFO again
+    FifoCap cap;
+    CHECK(cap.update(true, true) == 1 && cap.on);
+    CHECK(cap.update(true, true) == 0 && cap.on);
+    CHECK(cap.update(false, true) == -1 && !cap.on);   // (DLSS failed: the next swapchain took FIFO)
+    CHECK(cap.update(true, true) == 1);
+    CHECK(cap.update(true, false) == -1 && !cap.on);   // (FIFO set aside, but DLSS-G cannot run)
+    CHECK(cap.update(false, false) == 0 && !cap.on);
+    // (N3) slFreeResources two presents after the Off, not when generation came back meanwhile
+    FreeLater f;
+    CHECK(!f.presented(false));
+    f.ask(2);
+    CHECK(!f.presented(false));
+    CHECK(f.presented(false));
+    CHECK(!f.presented(false));                        // (once)
+    f.ask(2);
+    CHECK(!f.presented(true));                         // (on again: cancelled)
+    CHECK(!f.presented(false) && !f.presented(false));
+    // (N5) the status words
+    CHECK(!strcmp(StatusGate::text(0), ": ok"));
+    CHECK(strstr(StatusGate::text(StatusGate::kResolutionTooLow), "too small") && !strstr(StatusGate::text(StatusGate::kResolutionTooLow), "300"));
+    CHECK(strstr(StatusGate::text(0x2), "300"));
+    CHECK(strstr(StatusGate::text(StatusGate::kResolutionTooLow | 0x2), "300"));
+}
+
 int main() {
+    second_review();
     follow_up();
     multiplier();
     frames();

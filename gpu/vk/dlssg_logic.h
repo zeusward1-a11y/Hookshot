@@ -201,6 +201,12 @@ struct StatusGate {
         return changed;
     }
     static constexpr uint32_t kResolutionTooLow = 1u << 0;   // (sl::DLSSGStatus::eFailResolutionTooLow)
+    /// The log's words for a new status: too small alone is the size gate's (no retry), anything else the 300-present hold's
+    static const char* text(uint32_t status) {
+        if (!status) return ": ok";
+        if (!(status & ~kResolutionTooLow)) return ": the window is too small for DLSS-G: generation off until its size changes";
+        return ": generation off for 300 presents, then tried again (the reason is in Streamline's lines above)";
+    }
 };
 
 /// The window's image too small for DLSS-G: under DLSSGState::minWidthOrHeight (the guide: DLSS-G must be off then), or a size at
@@ -246,6 +252,55 @@ inline uint32_t frame_limit_us(uint32_t refresh_hz, int multiplier, double fract
     const int m = multiplier < 1 ? 1 : multiplier;
     return (uint32_t)std::ceil(1e6 * (double)m / (fraction * (double)refresh_hz));
 }
+
+/// What Reflex's frame limit counts (RX_DLSSG_LIMIT): Streamline hands frameLimitUs to VK_NV_low_latency2's minimumIntervalUs, which
+/// may count the game's presents or every present DLSS-G makes. game (the default): the game's frames, the limit times the frames
+/// shown per game frame; present: every present, 97% of the refresh whatever the multiplier; 0: no limit
+enum LimitBasis : int { LIMIT_NONE = 0, LIMIT_GAME, LIMIT_PRESENT };
+inline int parse_limit(const char* v) {
+    if (!v || !*v) return LIMIT_GAME;
+    if (!strcmp(v, "present")) return LIMIT_PRESENT;
+    if (!strcmp(v, "0") || !strcmp(v, "none") || !strcmp(v, "off")) return LIMIT_NONE;
+    return LIMIT_GAME;
+}
+inline const char* limit_name(int basis) {
+    return basis == LIMIT_PRESENT ? "present" : basis == LIMIT_NONE ? "0" : "game";
+}
+/// Reflex's frameLimitUs for a present, from what DLSS-G actually does then (the options last sent), not the row: generating with
+/// `generated` frames per game frame, the game's frames times (generated + 1) at 97% of the refresh; not generating (the menu, a frame
+/// DLSS did not draw, a hold, DLSS off), no limit on the game basis (a 4x row in a menu held a 60 Hz game at 14.5 fps). 0 too while
+/// RX_VK_FIFO was not set aside (fifo_cap) or DLSS-G cannot run (usable: available, the row at 2x and up)
+inline uint32_t reflex_limit_us(int basis, bool fifo_cap, bool usable, bool generating, uint32_t generated, uint32_t refresh_hz) {
+    if (!fifo_cap || !usable || basis == LIMIT_NONE) return 0;
+    if (basis == LIMIT_PRESENT) return frame_limit_us(refresh_hz, 1, 0.97);
+    const int shown = generating ? (int)generated + 1 : 1;
+    return shown > 1 ? frame_limit_us(refresh_hz, shown, 0.97) : 0;
+}
+
+/// The frame limit's cap, swapchain by swapchain: on while RX_VK_FIFO is set aside for DLSS-G, off again as soon as a swapchain takes
+/// FIFO (DLSS failed or DLSS-G went off) or DLSS-G cannot run. +1: turned on, -1: turned off, 0: as it was
+struct FifoCap {
+    bool on = false;
+    int update(bool fifo_ignored, bool usable) {
+        const bool want = fifo_ignored && usable;
+        if (want == on) return 0;
+        on = want;
+        return want ? 1 : -1;
+    }
+};
+
+/// The player's Off freed DLSS-G's memory (eOff without eRetainResourcesWhenOff); slFreeResources follows, as the guide's 6.4 asks after
+/// the flag was used, `after` presents later (the present that carried the off has gone through DLSS-G's own presenting by then);
+/// cancelled when generation came back on meanwhile
+struct FreeLater {
+    int left = 0;
+    void ask(int after) { left = after; }
+    /// After a present: true when it is time to free
+    bool presented(bool on) {
+        if (on) return left = 0, false;
+        return left > 0 && --left == 0;
+    }
+};
 
 // ---- the log ----
 

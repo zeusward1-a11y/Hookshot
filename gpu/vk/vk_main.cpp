@@ -466,7 +466,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
                                               &fifo_ignored);
     const VkPresentModeKHR mode = pick == dlssg::PRESENT_MAILBOX ? VK_PRESENT_MODE_MAILBOX_KHR :
                                   pick == dlssg::PRESENT_IMMEDIATE ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
-    if (fifo_ignored) dlssg_fifo_ignored();
+    dlssg_fifo_state(fifo_ignored);   // (each swapchain: the frame limit only while RX_VK_FIFO is set aside)
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)
