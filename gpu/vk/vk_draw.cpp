@@ -5393,7 +5393,6 @@ static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageVi
     return true;
 }
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
-    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     if (!taau_key(p.key) || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
     const Stage& st = p.stages[0];
     if (st.info.texture_descriptors.empty() || st.info.image_descriptors.empty()) return false;
@@ -5407,6 +5406,7 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (!handle) return false;
     texture_view_of(handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     if (!out || out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return false;
+    const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     return typed_upscale(cmd, dw.imgs[0].imageView, dw.imgs[ntex].imageView, out, level, p.key, keys, true);
 }
 
