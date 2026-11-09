@@ -461,12 +461,12 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 #else
     constexpr bool windows = false;
 #endif
-    bool fifo_ignored = false;
+    bool fifo_ignored = false, capped = false;
     const int pick = dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available(), has_mailbox, has_immediate, windows,
-                                              &fifo_ignored);
+                                              &fifo_ignored, &capped, dlssg_mailbox_asked());
     const VkPresentModeKHR mode = pick == dlssg::PRESENT_MAILBOX ? VK_PRESENT_MODE_MAILBOX_KHR :
                                   pick == dlssg::PRESENT_IMMEDIATE ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
-    dlssg_fifo_state(fifo_ignored);   // (each swapchain: the frame limit only while RX_VK_FIFO is set aside)
+    dlssg_present_mode(capped, fifo_ignored, pick == dlssg::PRESENT_IMMEDIATE);   // (each swapchain: the frame limit only while DLSS-G chose)
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
     ci.minImageCount = std::max(caps.minImageCount, 4u);   // (hookshot: mailbox with frame interpolation: an image always free)

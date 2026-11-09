@@ -206,11 +206,16 @@ static void logs() {
     char line[400];
     st.line(line, sizeof line, 2);
     const char* want = "vk: dlssg: 600 presents: 1.98 frames shown per game frame (1190 shown), generating 590 at 2x, status ok; off: user 0, "
-                       "menu 6, no DLSS frame 4, no image 0, swapchain 0, minimized 0, too small 0, status 0, unavailable 0";
+                       "menu 6, no DLSS frame 4, no image 0, swapchain 0, minimized 0, too small 0, status 0, unavailable 0; DLSS-G within "
+                       "the VRAM budget; options sent 0 (0 repeated, not logged)";
     if (strcmp(line, want)) std::printf("FAIL log line:\n  got  %s\n  want %s\n", line, want), ++failures;
     st.add(OFF_STATUS, 1, 0x2);
     st.line(line, sizeof line, 3);
     CHECK(strstr(line, "status 0x2;") != nullptr);
+    // (the VRAM over budget at that moment, and the options' repeats: the cause of "1.06 frames shown" visible in the log)
+    st.warned(11900, 11250), st.warned(11950, 11250), st.sent = 3, st.repeats = 2;
+    st.line(line, sizeof line, 2);
+    CHECK(strstr(line, "; DLSS-G over the VRAM budget in 2 (11950 of 11250 MB used then); options sent 3 (2 repeated, not logged)") != nullptr);
     st.clear();
     CHECK(st.presents == 0 && st.shown == 0 && st.off[OFF_MENU] == 0 && st.status == 0);
 
@@ -446,16 +451,21 @@ static void follow_up() {
             if (mb) old = PRESENT_MAILBOX;
             if ((win ? (imm || old == PRESENT_FIFO) : imm) && im) old = PRESENT_IMMEDIATE;
         }
-        bool ignored = true;
-        CHECK(pick_present_mode(fifo, imm, false, mb, im, win, &ignored) == old);
-        CHECK(!ignored);
-        if (!fifo) CHECK(pick_present_mode(fifo, imm, true, mb, im, win) == old);   // (no RX_VK_FIFO: DLSS-G changes nothing)
+        bool ignored = true, capped = true;
+        CHECK(pick_present_mode(fifo, imm, false, mb, im, win, &ignored, &capped) == old);
+        CHECK(!ignored && !capped);
+        // (DLSS-G on: immediate first (it wants vsync off; mailbox dropped made frames), else mailbox, whatever was asked; capped)
+        const int want = im ? PRESENT_IMMEDIATE : mb ? PRESENT_MAILBOX : PRESENT_FIFO;
+        CHECK(pick_present_mode(fifo, imm, true, mb, im, win, &ignored, &capped) == want);
+        CHECK(capped == (want != PRESENT_FIFO) && ignored == (fifo && want != PRESENT_FIFO));
+        CHECK(pick_present_mode(fifo, imm, true, mb, im, win, nullptr, nullptr, true) == (mb ? PRESENT_MAILBOX : want));   // (RX_DLSSG_MAILBOX)
     }
-    bool ignored = false;
-    CHECK(pick_present_mode(true, false, true, true, true, true, &ignored) == PRESENT_MAILBOX && ignored);
-    CHECK(pick_present_mode(true, false, true, false, true, true, &ignored) == PRESENT_IMMEDIATE && ignored);
-    CHECK(pick_present_mode(true, false, true, false, false, true, &ignored) == PRESENT_FIFO && !ignored);   // (FIFO is all there is)
-    CHECK(pick_present_mode(true, false, false, true, true, true, &ignored) == PRESENT_FIFO && !ignored);    // (DLSS-G off: FIFO)
+    bool ignored = false, capped = false;
+    CHECK(pick_present_mode(true, false, true, true, true, true, &ignored, &capped) == PRESENT_IMMEDIATE && ignored && capped);
+    CHECK(pick_present_mode(true, false, true, true, false, true, &ignored, &capped) == PRESENT_MAILBOX && ignored && capped);
+    CHECK(pick_present_mode(true, false, true, false, false, true, &ignored, &capped) == PRESENT_FIFO && !ignored && !capped);   // (FIFO only)
+    CHECK(pick_present_mode(true, false, false, true, true, true, &ignored, &capped) == PRESENT_FIFO && !ignored && !capped);    // (DLSS-G off)
+    CHECK(pick_present_mode(false, false, true, true, true, true, &ignored, &capped) == PRESENT_IMMEDIATE && !ignored && capped);
 
     // (1) the frame limit: game frames times the multiplier at most 97% of the refresh
     CHECK(frame_limit_us(164, 2, 0.97) == 12573);   // (79.5 game, 159.1 shown, under 164)
@@ -477,10 +487,10 @@ static void follow_up() {
 static void second_review() {
     const uint32_t R = 60;
     // (B1) not generating (menu, a frame DLSS did not draw, a hold, DLSS off): no limit on the game basis, whatever the row
-    CHECK(reflex_limit_us(LIMIT_GAME, true, true, false, 3, R) == 0);    // (a 4x row in the menu: was 0.97*60/4 = 14.5 fps)
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, false, 3, R) == frame_limit_us(R, 1, 0.97));   // (the menu at 4x: was 14.5 fps)
     CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 3, R) == frame_limit_us(R, 4, 0.97));
     CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 1, 164) == 12573);
-    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 0, R) == 0);     // (on with nothing generated: 1x)
+    CHECK(reflex_limit_us(LIMIT_GAME, true, true, true, 0, R) == frame_limit_us(R, 1, 0.97));   // (on with nothing generated: 1x)
     // (N1) the cap only while RX_VK_FIFO is set aside and DLSS-G can run
     CHECK(reflex_limit_us(LIMIT_GAME, false, true, true, 1, R) == 0);    // (FIFO taken again: no limit)
     CHECK(reflex_limit_us(LIMIT_GAME, true, false, true, 1, R) == 0);    // (DLSS failed, the row Off: no limit)
@@ -500,7 +510,8 @@ static void second_review() {
     CHECK(!strcmp(limit_name(LIMIT_GAME), "game") && !strcmp(limit_name(LIMIT_PRESENT), "present") && !strcmp(limit_name(LIMIT_NONE), "0"));
     // the limit along a session: on at 4x, the menu opens (no limit), closes (back), the row goes Off (none)
     struct Step { bool usable, generating; uint32_t generated, want; } steps[] = {
-        {true, true, 3, frame_limit_us(R, 4, 0.97)}, {true, false, 3, 0}, {true, true, 3, frame_limit_us(R, 4, 0.97)}, {false, false, 3, 0}};
+        {true, true, 3, frame_limit_us(R, 4, 0.97)}, {true, false, 3, frame_limit_us(R, 1, 0.97)}, {true, true, 3, frame_limit_us(R, 4, 0.97)},
+        {false, false, 3, 0}};
     for (const Step& s : steps) CHECK(reflex_limit_us(LIMIT_GAME, true, s.usable, s.generating, s.generated, R) == s.want);
     // (N1) the cap follows each swapchain: on while FIFO is set aside and DLSS-G can run, off when a swapchain takes FIFO again
     FifoCap cap;
@@ -527,7 +538,47 @@ static void second_review() {
     CHECK(strstr(StatusGate::text(StatusGate::kResolutionTooLow | 0x2), "300"));
 }
 
+// ---- the third review: the session (the options sent, the cap, the free, the limit) as vk_dlss.cpp runs it, the frame lines ----
+static void session() {
+    const uint32_t R = 164;
+    Session s;
+    CHECK(s.limit(LIMIT_GAME, true, R) == 0);                          // (no swapchain yet: no cap)
+    CHECK(s.swapchain(true, true) == 1);                               // (DLSS-G chose immediate)
+    CHECK(s.limit(LIMIT_GAME, true, R) == frame_limit_us(R, 1, 0.97)); // (nothing sent yet: the game's frames under the refresh)
+    // (eWarnOutOfVRAM is a sent option: taken, as an eOk; anything else is not)
+    CHECK(s.sent_options(mode_for(ON, 2, 3), Session::kWarnOutOfVRAM) && s.generating());
+    CHECK(s.limit(LIMIT_GAME, true, R) == frame_limit_us(R, 2, 0.97));
+    CHECK(!s.sent_options(mode_for(OFF_MENU, 2, 3), 5) && s.generating());   // (an error: what DLSS-G does is unchanged)
+    CHECK(s.sent_options(mode_for(OFF_MENU, 2, 3), Session::kOk) && !s.generating());
+    CHECK(s.limit(LIMIT_GAME, true, R) == frame_limit_us(R, 1, 0.97));
+    CHECK(!s.after_present() && !s.after_present() && !s.after_present());   // (kept: no free)
+    CHECK(s.needs_free_off());                                         // (off, kept: the built-in interpolation must free it)
+    // (the player's Off: freed two presents later; turned on before that, nothing freed)
+    CHECK(s.sent_options(mode_for(OFF_USER, 0, 3), Session::kOk));
+    CHECK(!s.needs_free_off());
+    CHECK(!s.after_present());
+    CHECK(s.after_present());
+    CHECK(!s.after_present());
+    CHECK(s.sent_options(mode_for(OFF_USER, 0, 3), Session::kOk));
+    CHECK(s.sent_options(mode_for(ON, 3, 3), Session::kOk));
+    CHECK(!s.after_present() && !s.after_present() && !s.after_present());   // (cancelled)
+    CHECK(s.limit(LIMIT_GAME, true, R) == frame_limit_us(R, 3, 0.97));
+    CHECK(s.limit(LIMIT_GAME, false, R) == 0);                         // (DLSS-G cannot run: no limit)
+    CHECK(s.swapchain(false, true) == -1);                             // (a swapchain DLSS-G did not choose: FIFO again)
+    CHECK(s.limit(LIMIT_GAME, true, R) == 0);
+    CHECK(s.swapchain(true, false) == 0 && s.limit(LIMIT_PRESENT, true, R) == 0);   // (DLSS failed: never capped)
+
+    LineGate g;
+    CHECK(g.changed(ON, mode_for(ON, 2, 3), Session::kWarnOutOfVRAM));
+    for (int i = 0; i < 100; i++) CHECK(!g.changed(ON, mode_for(ON, 2, 3), Session::kWarnOutOfVRAM));   // (Castle Town: once)
+    CHECK(g.repeats == 100);
+    CHECK(g.changed(ON, mode_for(ON, 2, 3), Session::kOk));            // (the answer changed)
+    CHECK(g.changed(OFF_MENU, mode_for(OFF_MENU, 2, 3), Session::kOk)); // (the state changed)
+    CHECK(g.changed(ON, mode_for(ON, 3, 3), Session::kOk));
+}
+
 int main() {
+    session();
     second_review();
     follow_up();
     multiplier();

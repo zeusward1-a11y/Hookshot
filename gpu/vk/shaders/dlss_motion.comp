@@ -1,33 +1,90 @@
 #version 450
-// (hookshot) ported from Lichii (Eden lineage; Duck912's Eglantine work), GPL-3.0-or-later: vk_dlss.cpp
+// (hookshot) ported from Lichii (Eden lineage; Duck912's Eglantine work), GPL-3.0-or-later: vk_dlss.cpp. The depth check for what
+// moves by itself after NX2navi's d9fb0fe (its dlaa_mv.comp); gpu/vk/dlss_objmv.h is this pass on the CPU, line for line, and what
+// tests/test_dlss_objmv.py checks. Built with glslangValidator -V --target-env vulkan1.3 --vn DLSS_MOTION_COMP_SPV.
+//
+// The camera's motion of each pixel from its depth. Then, with the check on (params.depth.z), each pixel's view distance is kept for
+// the next frame (dist_out) and the camera's vector is checked against last frame's (dist_prev): where last frame's distance at the
+// place the vector points to disagrees with the one it predicts, the surface moved by itself; when last frame's distance at the same
+// pixel agrees, it kept its place on screen (the character the camera follows) and its vector is zero.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D scene_depth;
 layout(binding = 1, rg16f) uniform writeonly image2D motion;
+layout(binding = 2, r32f) uniform readonly image2D dist_prev;
+layout(binding = 3, r32f) uniform writeonly image2D dist_out;
+layout(binding = 4, std430) buffer Counts { uint moved; uint held; uint checked; uint frames; } counts;
 
 layout(push_constant, row_major) uniform Parameters {
     mat4 clip_to_previous_clip;
+    vec4 depth;   // x, y: view distance = y / (z_ndc + x); z > 0: the check on; w > 0.5: dist_prev holds last frame's
 } params;
 
+const float TOLERANCE = 0.04;   // (dlss_objmv.h kTolerance)
+shared uint s_moved, s_held, s_checked;
+
+float view_distance(float zn) {
+    float den = zn + params.depth.x;
+    if (abs(den) < 1e-12) return 0.0;
+    float w = params.depth.y / den;
+    return w > 0.0 && w < 1e7 ? w : 0.0;
+}
+
+// How far last frame's distance near window position w is from the one expected there, relative: the closest of 3x3 pixels, so a
+// reprojection that lands a pixel across a silhouette is not taken for motion. 0 off screen, 1e9 where last frame had none
+float miss(vec2 w, float expect, ivec2 extent) {
+    ivec2 q = ivec2(floor(w)), hi = extent - 1;
+    if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, hi))) return 0.0;
+    float best = 1e9;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            float was = imageLoad(dist_prev, clamp(q + ivec2(dx, dy), ivec2(0), hi)).r;
+            if (was > 0.0) best = min(best, abs(was - expect) / expect);
+        }
+    return best;
+}
+
 void main() {
+    if (gl_LocalInvocationIndex == 0) s_moved = 0, s_held = 0, s_checked = 0;
+    barrier();
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 extent = imageSize(motion);
-    if (any(greaterThanEqual(pixel, extent))) {
-        return;
-    }
-
-    vec2 size = vec2(extent);
-    float depth = texelFetch(scene_depth, pixel, 0).r;
-    vec2 screen = (vec2(pixel) + 0.5) / size;
-    // The captured Zelda path is unjittered, with [-1, 1] clip depth and negative viewport height.
-    vec4 clip = vec4(screen * vec2(2, -2) + vec2(-1, 1), depth * 2 - 1, 1);
-    vec4 previous = params.clip_to_previous_clip * clip;
-    vec2 pixels = vec2(0);
-    if (depth >= 0 && depth <= 1 && previous.w > 1e-6) {
-        vec2 displacement = (previous.xy / previous.w - clip.xy) * vec2(0.5, -0.5) * size;
-        if (all(lessThanEqual(abs(displacement), vec2(65504)))) {
-            pixels = displacement;
+    if (all(lessThan(pixel, extent))) {   // (no return before the barriers below)
+        vec2 size = vec2(extent);
+        float depth = texelFetch(scene_depth, pixel, 0).r;
+        vec2 screen = (vec2(pixel) + 0.5) / size;
+        // The captured Zelda path is unjittered, with [-1, 1] clip depth and negative viewport height.
+        vec4 clip = vec4(screen * vec2(2, -2) + vec2(-1, 1), depth * 2 - 1, 1);
+        vec4 previous = params.clip_to_previous_clip * clip;
+        vec2 pixels = vec2(0);
+        bool valid = depth >= 0 && depth <= 1 && previous.w > 1e-6;
+        if (valid) {
+            vec2 displacement = (previous.xy / previous.w - clip.xy) * vec2(0.5, -0.5) * size;
+            if (all(lessThanEqual(abs(displacement), vec2(65504)))) {
+                pixels = displacement;
+            }
         }
+        bool on = params.depth.z > 0.0;
+        float here = on ? view_distance(clip.z) : 0.0;
+        if (on) imageStore(dist_out, pixel, vec4(here));
+        if (on && params.depth.w > 0.5 && here > 0.0 && valid) {
+            float there = previous.w * here;   // (last frame's distance the camera's motion predicts)
+            atomicAdd(s_checked, 1u);
+            vec2 win = vec2(pixel) + 0.5;
+            if (miss(win + pixels, there, extent) > TOLERANCE) {
+                atomicAdd(s_moved, 1u);
+                if (miss(win, here, extent) < TOLERANCE) {   // (it kept its place on screen: the followed character)
+                    pixels = vec2(0);
+                    atomicAdd(s_held, 1u);
+                }
+            }
+        }
+        imageStore(motion, pixel, vec4(pixels, 0, 0));
     }
-    imageStore(motion, pixel, vec4(pixels, 0, 0));
+    barrier();
+    if (gl_LocalInvocationIndex == 0 && s_checked > 0u) {   // (one atomic a workgroup: the 600-frame log's counts)
+        atomicAdd(counts.moved, s_moved);
+        atomicAdd(counts.held, s_held);
+        atomicAdd(counts.checked, s_checked);
+    }
 }

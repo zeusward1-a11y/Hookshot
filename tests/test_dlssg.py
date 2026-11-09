@@ -100,7 +100,8 @@ def check_sources():
     draw = read("gpu/vk/vk_draw.cpp")
     need("dlss_evaluate(cmd, color, depth, motion, output, reset, dlss_frame_id(), view);" in draw,
          "DLSS's evaluation is not numbered by presents, or has no camera")
-    need("VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd))" in draw,
+    need(re.search(r"dlss_image\(ds\.motion, ds\.cam\.w, ds\.cam\.h, VK_FORMAT_R16G16_SFLOAT,\s*"
+                   r"VK_IMAGE_USAGE_STORAGE_BIT \| VK_IMAGE_USAGE_SAMPLED_BIT \| VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd\)", draw),
          "the motion image cannot be copied by Streamline (no TRANSFER_SRC)")
 
     main = read("gpu/vk/vk_main.cpp")
@@ -125,27 +126,30 @@ def check_sources():
     need("dlss_swapchain_changing();" in swap and
          swap.index("dlss_swapchain_changing();") < swap.index("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
          "DLSS-G is not turned off before the swapchain changes")
-    need("dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available()" in swap and "dlssg_fifo_state(fifo_ignored);" in swap,
+    need("dlssg::pick_present_mode(force_fifo, want_immediate, dlssg_available()" in swap and "dlssg_present_mode(capped, fifo_ignored" in swap,
          "RX_VK_FIFO is not set aside while DLSS-G runs")
     need("RX_VK_FIFO ignored while DLSS-G is on (G-SYNC through the driver; VSync with frame generation is D3D12-only)" in dlss,
          "no log line for RX_VK_FIFO set aside")
     reflex = code(block(dlss, "void apply_reflex("))
-    need("o.frameLimitUs = limit;" in reflex and
-         re.search(r"const bool generating = fr\.applied_valid && fr\.applied\.on;.*dlssg::reflex_limit_us\(st\.limit_basis, st\.fifo\.on, "
-                   r"dlssg_engaged\(\), generating, fr\.applied\.frames,", reflex, re.S),
-         "Reflex's frame limit does not come from reflex_limit_us with the options last sent")
-    need("st.fifo.update(ignored," in code(block(dlss, "void dlssg_fifo_state(")), "the frame limit's cap does not follow each swapchain's choice")
+    # (the session's rules are tested by behaviour, tests/dlssg_test.cpp session(): here only that vk_dlss.cpp goes through it)
+    need("o.frameLimitUs = limit;" in reflex and "fr.session.limit(st.limit_basis, dlssg_engaged(), st.refresh_hz)" in reflex,
+         "Reflex's frame limit does not come from the session")
+    need("fr.session.swapchain(capped," in code(block(dlss, "void dlssg_present_mode(")), "the frame limit's cap does not follow each swapchain")
     bcode = code(begin)
-    need(bcode.rfind("apply_reflex(false);") > bcode.index("fr.generating = fr.applied_valid && fr.applied.on;"),
+    need(bcode.rfind("apply_reflex(false);") > bcode.index("fr.generating = fr.session.generating();") and
+         bcode.index("fr.session.sent_options(m, (int)r);") < bcode.index("fr.generating = fr.session.generating();"),
          "Reflex's frame limit is set before this present's decision")
-    need("dlssg_fifo_state(fifo_ignored);" in code(block(main, "bool create_swapchain(")), "the frame limit's cap does not follow each swapchain")
+    need("dlssg_present_mode(capped, fifo_ignored," in code(block(main, "bool create_swapchain(")), "the frame limit's cap does not follow each swapchain")
+    need("return dlss_drawn(r);" in block(dlss, "bool fg_state(") and "fr.lines.changed(why, m, (int)r)" in bcode,
+         "DLSS-G's eWarnOutOfVRAM is still a failure, or every frame logs its line")
+    need("fr.session.after_present()" in code(block(dlss, "void dlssg_present_end(")), "the free after the Off is not the session's")
     need("dlssg::parse_limit(getenv(\"RX_DLSSG_LIMIT\"))" in dlss, "RX_DLSSG_LIMIT is not read")
     need("st.free_resources(sl::kFeatureDLSS_G" in code(block(dlss, "void dlssg_present_end(")), "no slFreeResources after the Off")
     need("EnumDisplaySettingsW(" in block(dlss, "uint32_t monitor_refresh()"), "the monitor's refresh is not read")
     pic = code(pi)
     need("dlssg_window_check();" in pic and pic.index("dlssg_window_check();") < pic.index("vkAcquireNextImageKHR("),
          "a minimized window is not checked before the acquire")
-    need("dlssg::frees(fr.applied_valid, fr.applied)" in begin, "the built-in interpolation's present does not free DLSS-G after off-kept")
+    need("fr.session.needs_free_off()" in begin, "the built-in interpolation's present does not free DLSS-G after off-kept")
     need("p.too_small = fr.size.too_small(sw, sh);" in begin and "fr.size.failed(" in end, "too small is not kept off")
     need("st.reflex_applied > 0" not in fstart, "Reflex's sleep is skipped while Reflex is off")
     need("RX_DLSSG_TAGS" not in dlss and "eValidUntilPresent, &render_area" not in dlss, "the valid-until-present tag path is back")

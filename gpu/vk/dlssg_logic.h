@@ -228,17 +228,23 @@ struct SizeGate {
 // ---- the present mode and the frame limit ----
 
 enum PresentMode : int { PRESENT_FIFO = 0, PRESENT_MAILBOX, PRESENT_IMMEDIATE };
-/// The swapchain's mode, as vk_main.cpp create_swapchain chose it (mailbox when the driver has it; on Windows, with no mailbox or
-/// RX_VK_IMMEDIATE, immediate; RX_VK_FIFO: FIFO), except that RX_VK_FIFO is not taken while DLSS-G runs: VSync with frame generation
-/// is D3D12's only (the DLSS-G guide, 22.5), so mailbox, else immediate (G-SYNC through the driver, held under the refresh by
-/// Reflex's frame limit: frame_limit_us). fifo_ignored: RX_VK_FIFO was asked for and not taken
+/// The swapchain's mode. Without DLSS-G as vk_main.cpp create_swapchain chose it (mailbox when the driver has it; on Windows, with no
+/// mailbox or RX_VK_IMMEDIATE, immediate; RX_VK_FIFO: FIFO). While DLSS-G runs: immediate, else mailbox, never RX_VK_FIFO's FIFO
+/// (VSync with frame generation is D3D12's only, the DLSS-G guide's 22.5, and DLSS-G asks for vsync off; at 2x mailbox showed 1.68
+/// frames per game frame, dropping made ones), with Reflex's frame limit under the refresh where G-SYNC holds the picture
+/// (frame_limit_us); mailbox_asked (RX_DLSSG_MAILBOX=1): mailbox first. fifo_ignored: RX_VK_FIFO was asked for and not taken;
+/// capped: DLSS-G chose the mode, so the frame limit applies
 inline int pick_present_mode(bool fifo_asked, bool immediate_asked, bool dlssg, bool has_mailbox, bool has_immediate, bool windows,
-                             bool* fifo_ignored = nullptr) {
+                             bool* fifo_ignored = nullptr, bool* capped = nullptr, bool mailbox_asked = false) {
     if (fifo_ignored) *fifo_ignored = false;
+    if (capped) *capped = false;
     if (fifo_asked && !dlssg) return PRESENT_FIFO;
-    if (fifo_asked) {
-        if (fifo_ignored) *fifo_ignored = has_mailbox || has_immediate;
-        return has_mailbox ? PRESENT_MAILBOX : has_immediate ? PRESENT_IMMEDIATE : PRESENT_FIFO;
+    if (dlssg) {
+        const int mode = mailbox_asked && has_mailbox ? PRESENT_MAILBOX : has_immediate ? PRESENT_IMMEDIATE :
+                         has_mailbox ? PRESENT_MAILBOX : PRESENT_FIFO;
+        if (fifo_ignored) *fifo_ignored = fifo_asked && mode != PRESENT_FIFO;
+        if (capped) *capped = mode != PRESENT_FIFO;
+        return mode;
     }
     int mode = has_mailbox ? PRESENT_MAILBOX : PRESENT_FIFO;
     if (has_immediate && (immediate_asked || (windows && mode == PRESENT_FIFO))) mode = PRESENT_IMMEDIATE;
@@ -268,13 +274,13 @@ inline const char* limit_name(int basis) {
 }
 /// Reflex's frameLimitUs for a present, from what DLSS-G actually does then (the options last sent), not the row: generating with
 /// `generated` frames per game frame, the game's frames times (generated + 1) at 97% of the refresh; not generating (the menu, a frame
-/// DLSS did not draw, a hold, DLSS off), no limit on the game basis (a 4x row in a menu held a 60 Hz game at 14.5 fps). 0 too while
-/// RX_VK_FIFO was not set aside (fifo_cap) or DLSS-G cannot run (usable: available, the row at 2x and up)
-inline uint32_t reflex_limit_us(int basis, bool fifo_cap, bool usable, bool generating, uint32_t generated, uint32_t refresh_hz) {
-    if (!fifo_cap || !usable || basis == LIMIT_NONE) return 0;
+/// DLSS did not draw, a hold), the game's frames alone at 97% (a 4x row in a menu had held a 60 Hz game at 14.5 fps; with no limit at
+/// all, immediate or mailbox ran past the G-SYNC range). 0 while DLSS-G did not choose the present mode (capped) or cannot run
+/// (usable: available, the row at 2x and up)
+inline uint32_t reflex_limit_us(int basis, bool capped, bool usable, bool generating, uint32_t generated, uint32_t refresh_hz) {
+    if (!capped || !usable || basis == LIMIT_NONE) return 0;
     if (basis == LIMIT_PRESENT) return frame_limit_us(refresh_hz, 1, 0.97);
-    const int shown = generating ? (int)generated + 1 : 1;
-    return shown > 1 ? frame_limit_us(refresh_hz, shown, 0.97) : 0;
+    return frame_limit_us(refresh_hz, generating ? (int)generated + 1 : 1, 0.97);
 }
 
 /// The frame limit's cap, swapchain by swapchain: on while RX_VK_FIFO is set aside for DLSS-G, off again as soon as a swapchain takes
@@ -302,12 +308,54 @@ struct FreeLater {
     }
 };
 
+/// What vk_dlss.cpp keeps of DLSS-G between presents, as one piece so that its rules are tested together (tests/dlssg_test.cpp): the
+/// options last sent (DLSS-G's eWarnOutOfVRAM is a sent option too: a warning, as dlss_result.h has it for DLSS), the frame limit's cap
+/// swapchain by swapchain, slFreeResources after the player's Off, and the limit for a present
+struct Session {
+    Mode applied{};
+    bool sent = false;
+    FifoCap cap;
+    FreeLater free_later;
+    static constexpr int kOk = 0, kWarnOutOfVRAM = 39;   // (sl::Result)
+    static bool accepted(int result) { return result == kOk || result == kWarnOutOfVRAM; }
+    /// slDLSSGSetOptions returned result for m: kept when DLSS-G took it (the player's Off asks for the free)
+    bool sent_options(const Mode& m, int result) {
+        if (!accepted(result)) return false;
+        applied = m, sent = true;
+        if (!m.on && !m.retain) free_later.ask(2);
+        return true;
+    }
+    bool generating() const { return sent && applied.on; }
+    bool needs_free_off() const { return frees(sent, applied); }   // (the built-in interpolation took over: an eOff that frees)
+    int swapchain(bool capped, bool usable) { return cap.update(capped, usable); }
+    uint32_t limit(int basis, bool usable, uint32_t refresh_hz) const {
+        return reflex_limit_us(basis, cap.on, usable, generating(), applied.frames, refresh_hz);
+    }
+    bool after_present() { return free_later.presented(generating()); }   // (true: slFreeResources now)
+};
+
+/// The "generation on/off" lines: one when what was sent or what DLSS-G answered changes, the repeats only counted (a result 39 on
+/// every frame in Castle Town filled the log)
+struct LineGate {
+    int why = -1, result = -1000;
+    Mode mode{};
+    uint32_t repeats = 0;
+    bool changed(int w, const Mode& m, int r) {
+        if (w == why && r == result && same_mode(m, mode)) return repeats++, false;
+        why = w, result = r, mode = m;
+        return true;
+    }
+};
+
 // ---- the log ----
 
 struct Stats {
     uint64_t presents = 0, shown = 0, on = 0;
     uint32_t off[OFF_COUNT] = {};
     uint32_t status = 0;   // (every status seen, or'd)
+    uint32_t vram_warn = 0, sent = 0, repeats = 0;   // (presents a DLSS-G call said eWarnOutOfVRAM; options sent; lines not logged)
+    uint64_t vram_used_mb = 0, vram_budget_mb = 0;   // (at the last warning)
+    void warned(uint64_t used_mb, uint64_t budget_mb) { vram_warn++, vram_used_mb = used_mb, vram_budget_mb = budget_mb; }
     /// One present: why it was off (or ON), the frames DLSS-G said it showed for it (numFramesActuallyPresented; 0 is taken as 1, the
     /// game's own frame is always shown), its status
     void add(int reason, uint32_t frames_shown, uint32_t st) {
@@ -321,16 +369,23 @@ struct Stats {
     /// The log line, e.g. "vk: dlssg: 600 presents: 2.00 frames shown per game frame (1200 shown), generating 600 at 2x, status ok;
     /// off: user 0, menu 0, no DLSS frame 0, no image 0, swapchain 0, minimized 0, too small 0, status 0, unavailable 0"
     int line(char* out, size_t n, int multiplier) const {
-        char st[24];
+        char st[24], vram[96];
         if (status) snprintf(st, sizeof st, "%#x", (unsigned)status);
         else snprintf(st, sizeof st, "ok");
-        return snprintf(out, n,
+        if (vram_warn)
+            snprintf(vram, sizeof vram, "over the VRAM budget in %u (%llu of %llu MB used then)", vram_warn,
+                     (unsigned long long)vram_used_mb, (unsigned long long)vram_budget_mb);
+        else
+            snprintf(vram, sizeof vram, "within the VRAM budget");
+        const int k = snprintf(out, n,
                         "vk: dlssg: %llu presents: %.2f frames shown per game frame (%llu shown), generating %llu at %dx, status %s; "
                         "off: user %u, menu %u, no DLSS frame %u, no image %u, swapchain %u, minimized %u, too small %u, status %u, "
                         "unavailable %u",
                         (unsigned long long)presents, presents ? (double)shown / (double)presents : 0.0, (unsigned long long)shown,
                         (unsigned long long)on, multiplier, st, off[OFF_USER], off[OFF_MENU], off[OFF_NO_DLSS], off[OFF_NO_IMAGE],
                         off[OFF_SWAPCHAIN], off[OFF_WINDOW], off[OFF_TOO_SMALL], off[OFF_STATUS], off[OFF_UNAVAILABLE]);
+        if (k < 0 || (size_t)k >= n) return k;
+        return k + snprintf(out + k, n - k, "; DLSS-G %s; options sent %u (%u repeated, not logged)", vram, sent, repeats);
     }
 };
 

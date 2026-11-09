@@ -49,6 +49,7 @@
 #include "shaders/dlss_output_comp_spv.h"
 #include "shaders/dlss_debug_comp_spv.h"
 #include "vk_dlss.h"
+#include "dlss_objmv.h"
 #include "vk_menu.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -5967,6 +5968,17 @@ struct DlssState {
     VkPipeline motion_pipe = VK_NULL_HANDLE, color_pipe = VK_NULL_HANDLE, output_pipe = VK_NULL_HANDLE, debug_pipe = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE, debug_layout = VK_NULL_HANDLE;
     uint32_t resets = 0, cuts = 0;   // (in the last 600 evaluations: history dropped, and of those the camera cuts)
+    // (own motion, dlss_objmv.h) each pixel's view distance, this frame's and last frame's (R32F), the frame the last ones are of,
+    // the motion pass's own layout (five bindings, 80 bytes pushed) and its counts (moved, held, checked; host memory, read at the log)
+    DlssImg dist[2];
+    int dist_cur = 0;
+    uint64_t dist_frame = ~0ull, dist_size = 0;
+    VkPipelineLayout mv_layout = VK_NULL_HANDLE;
+    VkBuffer counts = VK_NULL_HANDLE;
+    VmaAllocation counts_mem = nullptr;
+    void* counts_map = nullptr;
+    uint32_t counts_seen[3] = {};
+    uint32_t objmv_frames = 0;   // (frames the check ran in, since the last log)
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     const char* reason = nullptr;   // (the last fallback's)
     uint64_t repeats = 0;
@@ -6068,7 +6080,29 @@ bool dlss_pipelines() {
         vkDestroyShaderModule(dev.device, m, nullptr);
         return pl;
     };
-    ds.motion_pipe = make(DLSS_MOTION_COMP_SPV, sizeof DLSS_MOTION_COMP_SPV);
+    {   // (the motion pass: depth, motion, last and this frame's distances, its counts; the clip-to-previous and the depth terms pushed)
+        VkDescriptorSetLayoutBinding mb[5] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                              {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                              {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                              {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                              {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo ml = li;
+        ml.bindingCount = 5, ml.pBindings = mb;
+        VkDescriptorSetLayout mset{};
+        const VkPushConstantRange mr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+        VkPipelineLayoutCreateInfo mp = pi;
+        mp.pSetLayouts = &mset, mp.pPushConstantRanges = &mr;
+        if (vkCreateDescriptorSetLayout(dev.device, &ml, nullptr, &mset) == VK_SUCCESS &&
+            vkCreatePipelineLayout(dev.device, &mp, nullptr, &ds.mv_layout) == VK_SUCCESS) {
+            std::swap(ds.layout, ds.mv_layout);
+            ds.motion_pipe = make(DLSS_MOTION_COMP_SPV, sizeof DLSS_MOTION_COMP_SPV);
+            std::swap(ds.layout, ds.mv_layout);
+        }
+        if (create_buffer_cached(16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ds.counts, ds.counts_mem, &ds.counts_map) && ds.counts_map)
+            std::memset(ds.counts_map, 0, 16);
+        else
+            ds.counts = VK_NULL_HANDLE;
+    }
     ds.color_pipe = make(DLSS_COLOR_COMP_SPV, sizeof DLSS_COLOR_COMP_SPV);
     ds.output_pipe = make(DLSS_OUTPUT_COMP_SPV, sizeof DLSS_OUTPUT_COMP_SPV);
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -6076,7 +6110,7 @@ bool dlss_pipelines() {
     vkCreateSampler(dev.device, &si, nullptr, &ds.nearest);
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
     vkCreateSampler(dev.device, &si, nullptr, &ds.linear);
-    ds.ready = ds.motion_pipe && ds.color_pipe && ds.output_pipe && ds.nearest && ds.linear;
+    ds.ready = ds.motion_pipe && ds.color_pipe && ds.output_pipe && ds.nearest && ds.linear && ds.counts;
     if (ds.ready && dlss_debug()) {   // (four sampled images and the target)
         VkDescriptorSetLayoutBinding db[5];
         for (uint32_t i = 0; i < 5; i++)
@@ -6106,6 +6140,68 @@ void dlss_pass(VkCommandBuffer cmd, VkPipeline pipe, VkSampler sampler, VkImageV
     vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.layout, 0, 2, wr);
     if (push) vkCmdPushConstants(cmd, ds.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 64, push);
     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+}
+/// (hookshot) RX_DLSS_OBJMV=0: the camera's motion alone, as before the check (dlss_objmv.h)
+bool objmv_on() {
+    static const bool on = !(getenv("RX_DLSS_OBJMV") && atoi(getenv("RX_DLSS_OBJMV")) == 0);
+    return on;
+}
+/// The motion pass (shaders/dlss_motion.comp): the camera's motion of each pixel from its depth and, with the check, own motion for
+/// what moves by itself (the character the camera follows: zero). Last frame's distances are used when they are of the frame just
+/// before, at this size, and the camera did not cut
+void dlss_motion_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, const Mat& clip, uint64_t now, bool cut) {
+    float a = 0, b = 0;
+    const bool on = objmv_on() && objmv::depth_terms(ds.used.cur.data(), a, b);
+    // (last frame's distances: of the frame just before, at this size (a new size makes the images again), no camera cut)
+    const uint64_t size = (uint64_t)rw << 32 | rh;
+    const bool prev_ok = on && !cut && ds.dist_frame != ~0ull && ds.dist_frame + 1 == now && ds.dist_size == size;
+    DlssImg& out = ds.dist[ds.dist_cur];
+    const DlssImg& prev = ds.dist[ds.dist_cur ^ 1];
+    const VkDescriptorImageInfo ii{ds.nearest, ds.used.depth_view, VK_IMAGE_LAYOUT_GENERAL}, oi{VK_NULL_HANDLE, ds.motion.view, VK_IMAGE_LAYOUT_GENERAL},
+        pi{VK_NULL_HANDLE, prev.view, VK_IMAGE_LAYOUT_GENERAL}, di{VK_NULL_HANDLE, out.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorBufferInfo ci{ds.counts, 0, 16};
+    VkWriteDescriptorSet wr[5];
+    for (uint32_t i = 0; i < 5; i++) {
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstBinding = i, wr[i].descriptorCount = 1;
+        wr[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : i == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    wr[0].pImageInfo = &ii, wr[1].pImageInfo = &oi, wr[2].pImageInfo = &pi, wr[3].pImageInfo = &di, wr[4].pBufferInfo = &ci;
+    float push[20];
+    std::copy(clip.begin(), clip.end(), push);
+    push[16] = a, push[17] = b, push[18] = on ? 1.0f : 0.0f, push[19] = prev_ok ? 1.0f : 0.0f;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.motion_pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds.mv_layout, 0, 5, wr);
+    vkCmdPushConstants(cmd, ds.mv_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+    vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+    VkMemoryBarrier2 hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (the counts, read on the CPU at the log)
+    hb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, hb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    hb.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, hb.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo hd{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    hd.memoryBarrierCount = 1, hd.pMemoryBarriers = &hb;
+    vkCmdPipelineBarrier2(cmd, &hd);
+    if (on) ds.dist_cur ^= 1, ds.dist_frame = now, ds.dist_size = size, ds.objmv_frames += prev_ok;
+    else ds.dist_frame = ~0ull;
+    static bool told;
+    if (!told) {
+        told = true;
+        logf("vk: dlss: own motion %s", on ? "on: what moves by itself is checked against last frame's depth (RX_DLSS_OBJMV=0: camera only)"
+                                           : objmv_on() ? "off: the scene's projection is not a perspective one" : "off (RX_DLSS_OBJMV=0): the camera's motion alone");
+    }
+}
+/// The 600-frame log's line on own motion: of the pixels checked, those that moved by themselves and those held still on screen
+void objmv_log() {
+    if (!ds.counts_map) return;
+    invalidate_mapped(ds.counts_mem, 16);
+    const volatile uint32_t* c = (const volatile uint32_t*)ds.counts_map;
+    const uint32_t now[3] = {c[0], c[1], c[2]};
+    const uint32_t moved = now[0] - ds.counts_seen[0], held = now[1] - ds.counts_seen[1], checked = now[2] - ds.counts_seen[2];
+    std::copy_n(now, 3, ds.counts_seen);
+    if (!objmv_on()) return;
+    logf("vk: dlss: own motion over %u frames: %.2f%% of %.0f checked pixels a frame moved by themselves, %.2f%% held still on screen "
+         "(the followed character: no motion)", ds.objmv_frames, checked ? 100.0 * moved / checked : 0.0,
+         ds.objmv_frames ? (double)checked / ds.objmv_frames : 0.0, checked ? 100.0 * held / checked : 0.0);
+    ds.objmv_frames = 0;
 }
 /// RX_DLSS_DEBUG: its view into the network's target (out), then this frame's colour kept as the next one's previous
 bool dlss_debug_pass(VkCommandBuffer cmd, VkImageView out, uint32_t w, uint32_t h, const DlssCamera& cam) {
@@ -6169,7 +6265,10 @@ bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
     if (!dlss_image(ds.color, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd) ||
         // (TRANSFER_SRC: DLSS Frame Generation's tag of it is copied by Streamline when it is made, vk_dlss.cpp)
         !dlss_image(ds.motion, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16_SFLOAT,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd))
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd) ||
+        // (own motion's view distances, this and last frame's: made with RX_DLSS_OBJMV=0 too, the motion pass binds them always)
+        !dlss_image(ds.dist[0], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd) ||
+        !dlss_image(ds.dist[1], ds.cam.w, ds.cam.h, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT, cmd))
         return dlss_fallback("images not made"), false;
     int32_t push[16] = {encode ? 1 : 0};
     gprof_begin(cmd);
@@ -6230,10 +6329,10 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     Mat clip{};
     const bool have_motion = clip_to_previous(ds.used.cur, ds.used.prev, clip);
     if (ok && have_motion) {
-        dlss_pass(cmd, ds.motion_pipe, ds.nearest, ds.used.depth_view, ds.motion.view, rw, rh, clip.data());
-        full_barrier(cmd);
         bool same_camera = true;   // (a camera cut: the previous matrix is not last frame's current one)
         for (int i = 0; i < 16; i++) same_camera = same_camera && std::abs(ds.used.prev[i] - ds.last_vp[i]) < 0.001f;
+        dlss_motion_pass(cmd, rw, rh, clip, now, !same_camera);   // (own motion: dlss_objmv.h)
+        full_barrier(cmd);
         const bool reset = ds.last_frame == ~0ull || now != ds.last_frame + 1 || !same_camera;
         ds.resets += reset, ds.cuts += reset && !same_camera;
         if (dlss_debug() && ds.evals >= 1500 && ds.evals < 1512) {   // (the camera of 12 frames: a jitter would move [0][3]/[1][3] by ~1/w)
@@ -6244,6 +6343,7 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
         if (ds.evals % 600 == 599) {   // (a cut every frame would mean +0x180 is not last frame's camera: no history, no ghosting)
             logf("vk: dlss: the last 600 frames: %u history resets, %u of them camera cuts", ds.resets, ds.cuts);
             ds.resets = ds.cuts = 0;
+            objmv_log();
         }
         const DlssImage color{ds.color.image, ds.color.view, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT};
         const DlssImage depth{ds.used.depth->image, ds.used.depth_view, VK_FORMAT_D32_SFLOAT, rw, rh, VK_IMAGE_ASPECT_DEPTH_BIT,
