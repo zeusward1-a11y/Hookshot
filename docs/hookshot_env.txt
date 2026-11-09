@@ -1,0 +1,19 @@
+# Copie este arquivo pra pasta do jogo, ao lado do hookshot.exe (copy it next to hookshot.exe).
+# Vale ao abrir o jogo. Mudar FOG/EXPOSURE refaz o cache de shaders: os primeiros minutos travam mais.
+# Takes effect at start. Changing FOG/EXPOSURE rebuilds the shader cache: expect stutter for the first minutes.
+
+# Menos VRAM parada: blocos de 32 MB em vez de 128 (PR #887). Less idle VRAM: 32 MB image blocks.
+RX_VK_IMAGE_BLOCK_MB=32
+
+# Visual mais escuro e menos enevoado, perto do Switch 2 / Mac (ajuste oficial do Hookshot, vem desligado).
+# Darker, less foggy look (official Hookshot switch, off by default).
+#   RX_VK_OOT_FOG: névoa / fog (1 = do jogo / the game's, 0.5 = metade / half)
+#   RX_VK_OOT_EXPOSURE: exposição / exposure (1 = do jogo / the game's; 0.65 é escuro demais / too dark)
+#   Desligar / turn off: RX_VK_OOT_VISUAL=0
+RX_VK_OOT_VISUAL=1
+RX_VK_OOT_FOG=0.5
+RX_VK_OOT_EXPOSURE=0.85
+
+# PR #816 (luz ambiente do céu / sky ambient light) já está no código deste ramo. Pra desligar só ela, tire o #:
+# PR #816 is built into this branch. To turn only it off, remove the #:
+#EDEN_F32_ADD_TRACK=0

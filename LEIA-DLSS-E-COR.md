@@ -30,7 +30,7 @@ Este ramo é o Hookshot oficial no **b234b43** (main de 08/11/2026, v2.0.5 mais 
    - **DLSS:** On, e reinicie o jogo
    - **DLSS mode:** Quality, ou DLAA se a placa aguentar
    - **DLSS preset:** K ou M
-5. **Visual mais escuro e menos enevoado (opcional):** isso já existe no Hookshot oficial, só vem desligado. Crie um `hookshot_env.txt` ao lado do `hookshot.exe` com:
+5. **Visual mais escuro e menos enevoado (opcional):** isso já existe no Hookshot oficial, só vem desligado. Copie o [`docs/hookshot_env.txt`](docs/hookshot_env.txt) deste ramo pra pasta do jogo, ao lado do `hookshot.exe`. Ele tem estas linhas:
 
    ```
    RX_VK_IMAGE_BLOCK_MB=32
@@ -73,4 +73,4 @@ This branch is official Hookshot at **b234b43** (main as of 2026-11-08, v2.0.5 p
    - **Output resolution:** your monitor's
    - **DLSS:** On, then restart the game
    - **DLSS mode:** Quality
-5. Optional, for a darker and less foggy look (built into official Hookshot, off by default): put the `hookshot_env.txt` lines from the Portuguese section next to `hookshot.exe`.
+5. Optional, for a darker and less foggy look (built into official Hookshot, off by default): copy [`docs/hookshot_env.txt`](docs/hookshot_env.txt) next to `hookshot.exe`.
