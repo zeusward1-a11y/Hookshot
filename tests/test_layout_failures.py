@@ -51,7 +51,7 @@ def generated_files(directory):
     draw = block(source, '    PipeEntry* pe;\n    {')
     dispatch = block(source, '    Program& p = const_cast<Program&>(*cp);\n    if (!p.layout) {')
     warm = block(source, '    const auto warm_compute = [&](Program& p) {') + ';'
-    seed = block(source, '            if (std::unique_ptr<Program> p = seed_program(i / 3, (int)(i % 3))) {')
+    seed = block(source, '            if (std::unique_ptr<Program> p = seed_program(k, (int)(i % 3))) {')
     callback = block(source, '    const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {') + ');'
     pre = block(source, '    struct Pre {') + ';'
     worker = block(source, '    const auto worker = [pre, total] {') + ';'
@@ -62,7 +62,7 @@ def generated_files(directory):
     wrappers += 'void call_draw(Program& p) { NvnState s{}; Targets at{}; VkPrimitiveTopology topo=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; uint8_t types[8]{};\n' + draw +'\n(void)pe; ++after_guard; }\n'
     wrappers += 'void call_dispatch(Program* cp) {\n' + dispatch + '\n++after_guard; }\n'
     wrappers += 'void call_warm(Program& p) { bool warm_cs=true; auto& libs=counts.libs;\n' + warm + '\nwarm_compute(p); }\n'
-    wrappers += 'void call_seed() { size_t i=0; bool warm=true; auto blank=std::make_unique<NvnState>(); auto& made=counts.made; auto& libs=counts.libs;\n' + seed + '\n}\n'
+    wrappers += 'void call_seed() { size_t i=0, k=0; bool warm=true; auto blank=std::make_unique<NvnState>(); auto& made=counts.made; auto& libs=counts.libs;\n' + seed + '\n}\n'
     wrappers += 'void call_precompile(std::vector<std::unique_ptr<PipeNote>> notes) { std::unordered_set<uint64_t> wanted; std::vector<Program*> computes;\n' + callback + '\n(void)programs_n;\n' + pre + '\nconst size_t total=notes.size()+computes.size(); Pre* pre=new Pre; pre->notes=std::move(notes); pre->computes=std::move(computes);\n' + worker + '\nworker(); delete pre; }\n'
     wrappers += 'void call_predict(const std::vector<const PipeNote*>& list) { std::vector<uint64_t> keys{7}; size_t i=0; auto& made=counts.made;\n' + predict + '\n}\n'
     (directory / 'layout_callers.inc').write_text(wrappers, encoding='utf-8')
