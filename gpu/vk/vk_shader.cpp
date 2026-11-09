@@ -1136,6 +1136,35 @@ struct Reader {
     }
 };
 
+/// (hookshot) A program record's head, what comes before its stages: written and read only here, so that program_cache_read and
+/// program_cache_each read the same fields. program_cache_each read only the first ones and took the mesh fallback's five words
+/// for the stage count: no kept program reached the prediction (vk_predict.cpp, "predicted 0 pipelines")
+void put_head(std::vector<uint8_t>& o, const Program& p) {
+    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0) | (p.fallback_task ? 8 : 0)));
+    put_list(o, p.answers);
+    put_list(o, p.questions);
+    put(o, p.workgroup);
+    put(o, p.shared_memory);
+    put(o, (uint32_t)p.fallback_topology);
+    put(o, p.fallback_vertices_per_workgroup);
+    put(o, p.fallback_record_words);
+    put(o, p.fallback_payload_words);
+    put(o, p.fallback_task_threads);
+}
+void get_head(Reader& r, Program& p) {
+    const uint32_t kind = r.get<uint32_t>();
+    p.compute = (kind & 1) != 0, p.mesh = (kind & 2) != 0, p.fallback = (kind & 4) != 0, p.fallback_task = (kind & 8) != 0;
+    r.list(p.answers);
+    r.list(p.questions);
+    p.workgroup = r.get<std::array<uint32_t, 3>>();
+    p.shared_memory = r.get<uint32_t>();
+    p.fallback_topology = (VkPrimitiveTopology)r.get<uint32_t>();
+    p.fallback_vertices_per_workgroup = r.get<uint32_t>();
+    p.fallback_record_words = r.get<uint32_t>();
+    p.fallback_payload_words = r.get<uint32_t>();
+    p.fallback_task_threads = r.get<uint32_t>();
+}
+
 /// Shader::Info is plain data but for these members (the boost containers are heap vectors here, static_vector too);
 /// they go on their own, the rest as it lies
 void put_info(std::vector<uint8_t>& o, const Shader::Info& i) {
@@ -1186,17 +1215,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
-    put(o, (uint32_t)((p.compute ? 1 : 0) | (p.mesh ? 2 : 0) | (p.fallback ? 4 : 0) |
-                      (p.fallback_task ? 8 : 0)));
-    put_list(o, p.answers);
-    put_list(o, p.questions);
-    put(o, p.workgroup);
-    put(o, p.shared_memory);
-    put(o, (uint32_t)p.fallback_topology);
-    put(o, p.fallback_vertices_per_workgroup);
-    put(o, p.fallback_record_words);
-    put(o, p.fallback_payload_words);
-    put(o, p.fallback_task_threads);
+    put_head(o, p);
     put(o, (uint64_t)p.stages.size());
     for (size_t k = 0; k < p.stages.size(); k++) {
         const Stage& st = p.stages[k];
@@ -1246,19 +1265,8 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
         Reader r{data.data() + 16, data.data() + data.size()};
         auto p = std::make_unique<Program>();
         p->key = key;
-        const uint32_t kind = r.get<uint32_t>();
-        p->compute = (kind & 1) != 0, p->mesh = (kind & 2) != 0, p->fallback = (kind & 4) != 0,
-        p->fallback_task = (kind & 8) != 0;
-        r.list(p->answers);
-        r.list(p->questions);
+        get_head(r, *p);
         p->variant = answers_hash(*p);
-        p->workgroup = r.get<std::array<uint32_t, 3>>();
-        p->shared_memory = r.get<uint32_t>();
-        p->fallback_topology = (VkPrimitiveTopology)r.get<uint32_t>();
-        p->fallback_vertices_per_workgroup = r.get<uint32_t>();
-        p->fallback_record_words = r.get<uint32_t>();
-        p->fallback_payload_words = r.get<uint32_t>();
-        p->fallback_task_threads = r.get<uint32_t>();
         const uint64_t n = r.count(1);
         bool ok = !r.bad && n <= 8;   // (a program has at most a few stages)
         for (uint64_t k = 0; ok && k < n; k++) {
@@ -2088,12 +2096,8 @@ void program_cache_each(const std::function<void(const KeptProgram&)>& fn) {
         Reader r{data.data(), data.data() + data.size()};
         Program p;
         p.key = key;
-        const uint32_t kind = r.get<uint32_t>();
-        r.list(p.answers);
-        r.list(p.questions);   // (the state list's, vk_draw.cpp)
-        k.key = key, k.variant = answers_hash(p), k.mesh = (kind & 2) != 0;
-        r.get<std::array<uint32_t, 3>>();
-        r.get<uint32_t>();   // (shared memory)
+        get_head(r, p);   // (the whole head: reading past only part of it took the fallback's fields for the stage count)
+        k.key = key, k.variant = answers_hash(p), k.mesh = p.mesh;
         const uint64_t n = r.count(1);
         k.stages.resize(n <= 8 ? n : 0);
         for (auto& [stage, spirv] : k.stages) {
