@@ -3199,6 +3199,20 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
                         dev.swap_extent.height);
     res = vkQueuePresentKHR(dev.queue, &pi);
     dlssg_present_end(game_frame);
+    {   // (RX_VK_FRAME_LOG=<file>: one CSV line a present: frame, seconds since the first, frame time in ms. Frame
+        // pacing on the Steam Deck, where MangoHud's log stays empty under gamescope)
+        static FILE* fl = getenv("RX_VK_FRAME_LOG") ? std::fopen(getenv("RX_VK_FRAME_LOG"), "w") : nullptr;
+        static std::chrono::steady_clock::time_point first, prev;
+        static uint64_t frames;
+        if (fl) {
+            const auto t = std::chrono::steady_clock::now();
+            if (!frames) first = prev = t, std::fputs("frame,time_s,frametime_ms\n", fl);
+            std::fprintf(fl, "%llu,%.4f,%.3f\n", (unsigned long long)frames, std::chrono::duration<double>(t - first).count(),
+                         std::chrono::duration<double, std::milli>(t - prev).count());
+            prev = t;
+            if (++frames % 60 == 0) std::fflush(fl);
+        }
+    }
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR)
         create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
 }
