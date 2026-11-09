@@ -5,7 +5,7 @@
    guest main thread, run every module's DT_INIT in rtld's order (the SDK crt's _init: TLS registration with musl,
    then the module's constructors), then nninitStartup and nnMain.
 
-   Usage: <game>.exe image.bin --romfs <dir> --user <dir>
+   Usage: <game>.exe [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]
    Environment: HOS_TRACE=1 (log HLE calls), HOS_MEMORY_MB (memory the game is told it has),
                 HOS_NVN_CONTINUE=1 (go on past nvnBootstrapLoader). */
 #include "hos.h"
@@ -1250,7 +1250,8 @@ static int game_main(int argc, char **argv) {
         }
     }
     if (!image) {
-        fprintf(stderr, "usage: %s image.bin --romfs <dir> --user <dir> [--trace]\n", argv[0]);
+        fprintf(stderr, "usage: %s [image.bin] [--romfs <dir>] [--user <dir>] [--trace] [--prepare-shaders]\n",
+                argv[0]);
         return 2;
     }
     if (getenv("HOS_TRACE")) hos_trace = 1;
