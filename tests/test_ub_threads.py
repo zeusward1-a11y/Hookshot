@@ -21,6 +21,14 @@ def block(text, marker, start=0):
     return text[start:end]
 
 
+def first_run(body):
+    """Where the body first runs a job: fn(); or run_guarded(fn); (a job that throws is logged, vk_jobs.cpp)"""
+    at = [body.index(m) for m in ("run_guarded(fn);", "fn();") if m in body]
+    if not at:
+        raise SystemExit("no job run found")
+    return min(at)
+
+
 def main():
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
     if "void ub_thread_off(" not in replay:
@@ -39,10 +47,10 @@ def main():
 
     jobs = (ROOT / "gpu" / "vk" / "vk_jobs.cpp").read_text(encoding="utf-8")
     worker = block(jobs, "void worker(")
-    if "ub_thread_off();" not in worker or worker.index("ub_thread_off();") > worker.index("fn();"):
+    if "ub_thread_off();" not in worker or worker.index("ub_thread_off();") > first_run(worker):
         raise SystemExit("a shared worker runs jobs before leaving the update list")
     serial = block(jobs, "void jobs_push_serial(")
-    if "ub_thread_off();" not in serial or serial.index("ub_thread_off();") > serial.index("fn();"):
+    if "ub_thread_off();" not in serial or serial.index("ub_thread_off();") > first_run(serial):
         raise SystemExit("the serial build thread runs jobs before leaving the update list")
 
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")

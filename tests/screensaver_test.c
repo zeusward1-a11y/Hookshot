@@ -80,6 +80,7 @@ static BOOL ValidateRect(HWND w, const RECT *rect) { (void)w; (void)rect; unexpe
 static void hos_log(const char *text) { (void)text; unexpected(); }
 static void hos_log_flush(void) { unexpected(); }
 static void ExitProcess(unsigned code) { (void)code; unexpected(); }
+void hos_vk_note_key_press(unsigned key) { (void)key; }   /* (host/rx_backend.c: the menu notes key presses; nothing here) */
 
 /* ACTUAL_WNDPROC */
 
