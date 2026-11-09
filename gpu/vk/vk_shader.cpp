@@ -2195,6 +2195,23 @@ void seed_close() {
 std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], const uint32_t attributes[16], const uint8_t color_types[8],
                                         uint64_t* key_out);
 
+/// (hookshot) How many variants of key are in memory, made or read in already, their variant hashes to *variants. They are kept
+/// too, though disk_records no longer lists them: program_cache_load and program_cache_load_some take a key's records out as they
+/// read them. By disk_records alone the prepare in play (prepare_background) translated again every program the precompile had
+/// read, every kept compute program among them, and kept each a second time
+size_t loaded_variants(uint64_t key, std::unordered_set<uint64_t>* variants) {
+    std::lock_guard lk(shader_mu);
+    const auto it = programs.find(key);
+    if (it == programs.end()) return 0;
+    size_t n = 0;
+    for (const auto& p : it->second)
+        if (p->ready.load(std::memory_order_acquire) && !p->failed) {
+            n++;
+            if (variants) variants->insert(p->variant);
+        }
+    return n;
+}
+
 // (the game's skinned models read their bone indices as unsigned integers from generic attributes 6 and 7: each vertex program that
 // reads those is also made that way)
 std::unique_ptr<Program> seed_program(size_t i, int inputs) {
@@ -2242,7 +2259,7 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
         std::lock_guard lk(disk_mu);
         have = disk_records.count(key) != 0;
     }
-    if (have) return nullptr;
+    if (have || loaded_variants(key, nullptr)) return nullptr;
     Code code[8];
     for (int k = 0; k < 8; k++)
         if (by_stage[k]) {
@@ -2302,6 +2319,7 @@ SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program
                 if (!rd.bad) variants.insert(answers_hash(q));
             }
     }
+    loaded_variants(cs->key, &variants);
     const size_t had = variants.size();
     const Code code = stage_of_seed(*cs);
     if (!code.ok) return st_failed++, r.failed = true, r;
