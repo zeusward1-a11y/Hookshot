@@ -59,7 +59,7 @@ def generated_files(directory):
     borrow = block(shader, 'void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn) {')
     skip = next(line for line in source.splitlines() if line.startswith('#define SKIP_HERE()'))
     wrappers = skip + '\n' + borrow + '\n'
-    wrappers += 'void call_draw(Program& p) { NvnState s{}; Targets at{}; VkPrimitiveTopology topo=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;\n' + draw + '\n(void)pe; ++after_guard; }\n'
+    wrappers += 'void call_draw(Program& p) { NvnState s{}; Targets at{}; VkPrimitiveTopology topo=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; uint8_t types[8]{};\n' + draw +'\n(void)pe; ++after_guard; }\n'
     wrappers += 'void call_dispatch(Program* cp) {\n' + dispatch + '\n++after_guard; }\n'
     wrappers += 'void call_warm(Program& p) { bool warm_cs=true; auto& libs=counts.libs;\n' + warm + '\nwarm_compute(p); }\n'
     wrappers += 'void call_seed() { size_t i=0; bool warm=true; auto blank=std::make_unique<NvnState>(); auto& made=counts.made; auto& libs=counts.libs;\n' + seed + '\n}\n'

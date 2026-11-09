@@ -38,6 +38,8 @@ static uint32_t handles[3]{};
 static uint8_t answers[4]{0,2,2,2};
 thread_local const std::vector<Program::Answer>* answers_in = nullptr;
 uint32_t driver_bank_word(const NvnState&, int, int, uint32_t offset) { return handles[offset/8]; }
+// (local: #1014 reads a handle through stage_cbuf_word; for the driver bank 2, the only one used here, it is driver_bank_word)
+uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset) { return index == 0 || index == 2 ? driver_bank_word(s, (int)index, st.nvn_stage, offset) : 0; }
 uint32_t stage_handle(const NvnState&, const Stage&, uint32_t) { std::abort(); }
 uint8_t texture_answer(uint32_t h) { return h ? answers[h] : 0xff; }
 uint32_t texture_slot_version(int id) { return 10+id; }

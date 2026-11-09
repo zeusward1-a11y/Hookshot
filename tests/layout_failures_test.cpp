@@ -118,7 +118,7 @@ std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;
 VkPipeline build_graphics(const Program& p, const NvnState&, const Targets&, VkPrimitiveTopology, int = -1) {
     ++counts.graphics; CHECK(layouts.count(id(p.layout))); return new_pipeline();
 }
-PipeEntry* graphics_pipeline(const Program& p, const NvnState&, const Targets&, VkPrimitiveTopology) {
+PipeEntry* graphics_pipeline(const Program& p, const NvnState&, const Targets&, VkPrimitiveTopology, const uint8_t*) {   // (+ the targets' types, #939)
     ++counts.graphics; CHECK(layouts.count(id(p.layout))); static PipeEntry entry; return &entry;
 }
 Targets note_targets(const PipeNote&) { return {}; }
