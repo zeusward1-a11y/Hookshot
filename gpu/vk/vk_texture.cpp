@@ -213,6 +213,18 @@ bool remade_log_on() {
     static const bool on = getenv("RX_VK_LOG_REMADE") && atoi(getenv("RX_VK_LOG_REMADE")) != 0;
     return on;
 }
+// (hookshot) Textures uploaded from the game's memory (never drawn by the GPU) that the budget evicted: storage, size and format.
+// Made again, such a texture is uploaded from that memory whatever ranges render targets once took over it (upload's "storage
+// the GPU rendered" skip below). Skipped, its new image was never filled: whatever the VRAM held before, random-colour blocks on
+// characters, shop shelves, floors, which spread over play time on 4-8 GB cards (the ones that evict) and changed each time a
+// menu was opened and closed (issue 993). RX_VK_REMADE_SKIP=1: as before
+std::mutex from_memory_mu;
+std::unordered_map<uint64_t, uint64_t> evicted_from_memory;   // (evicted_key -> guest size)
+std::atomic<uint64_t> st_remade_uploaded{0};
+bool remade_skip_old() {
+    static const bool on = getenv("RX_VK_REMADE_SKIP") && atoi(getenv("RX_VK_REMADE_SKIP")) != 0;
+    return on;
+}
 
 struct Dead {
     uint64_t value;
@@ -2083,7 +2095,20 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // was unswizzled from that memory: 55 MB for the 3072 x 3072 x 3 shadow map, frame after frame. Not "storage
     // the write watch never saw written": the game fills memory before it makes a pool of it.)
     static const bool upload_all = getenv("RX_VK_UPLOAD_ALL") != nullptr;   // (A/B: such storage uploaded too)
-    const uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
+        std::lock_guard lk(from_memory_mu);
+        auto e = evicted_from_memory.find(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format));
+        if (e != evicted_from_memory.end() && e->second == tex->guest_size) {
+            evicted_from_memory.erase(e);
+            owned = 0;
+            const uint64_t n = ++st_remade_uploaded;
+            if (n <= 20 || n % 100 == 0)
+                logf("vk: texture #%u %#llx %ux%u NVN %#x evicted, made again over storage render targets took: uploaded from "
+                     "the game's memory (%llu so far)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height,
+                     tex->nvn_format, (unsigned long long)n);
+        }
+    }
     watch_tex(tex, owned ? "sampled, over rendered storage" : "sampled, uploaded");
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
@@ -3401,6 +3426,11 @@ void texture_frame(uint64_t completed) {
         Texture* tex = e.tex;
         if (e.shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
+        if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
+            std::lock_guard lk(from_memory_mu);
+            if (evicted_from_memory.size() > 50000) evicted_from_memory.clear();   // (a bound)
+            evicted_from_memory[evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format)] = tex->guest_size;
+        }
         if (remade_log_on()) {
             std::lock_guard lk(evicted_mu);
             if (evicted_at.size() > 20000) evicted_at.clear();   // (a bound: only the recent ones matter)
