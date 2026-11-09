@@ -200,6 +200,13 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None):
     while os.path.exists(os.path.join(gen_dir, "code_%03d.c" % n)):   # (fewer chunks than the last lift)
         os.remove(os.path.join(gen_dir, "code_%03d.c" % n))
         n += 1
+    # (a lift with no code_hot.c: no hot list, A64_HOT_CHUNK unset, or none of the listed functions in it. write() removes a
+    # code_hot.c, but split_hot.py has renamed it code_hot.c.whole and left code_hot_*.c, which build.py compiled again: the
+    # earlier lift's hot functions, each defined in a chunk too, linked twice)
+    if not any(os.path.basename(f) == "code_hot.c" for f in files):
+        for f in os.listdir(gen_dir):
+            if f == "code_hot.c.whole" or HOT_PIECE.fullmatch(f):
+                os.remove(os.path.join(gen_dir, f))
     files += split_big(gen_dir, files)
     save(img_dir, starts or b.recorded)
     print("chunks: %d, boundaries %s" % (len(files), "kept" if starts else "from sizes (saved)"))
@@ -208,6 +215,7 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None):
 
 HEAD = lifted_c.HEAD_NOTED
 PART = re.compile(r"code_(\d{3})_(\d+)\.c")
+HOT_PIECE = re.compile(r"code_hot_\d+\.c")   # (nx2/split_hot.py's pieces of code_hot.c)
 # (a function's compile time grows with the square of its size: LLVM's passes over one function of tens of thousands of blocks. Fitted to
 # a cold build of the 48 chunks at -O1 on a 24-thread desktop: seconds ~ 1.5 x MB + 4.4 x MB^2 per function, so a function of QUAD bytes
 # costs twice its size. A 24 MB chunk of small functions took ~45 s; one of 20 MB holding a few 2 MB functions, 350 s)
