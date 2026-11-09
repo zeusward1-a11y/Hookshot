@@ -7373,6 +7373,19 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     blank->nvattr = 16;
     pcache_init();   // (once, here: the workers below build compute pipelines into it)
     std::atomic<size_t> next{0}, done{0}, made{0}, libs{0}, variants{0}, asking{0}, capped{0};
+    // (hookshot) The compute programs first: each is its texture variants, up to 64 translations and as many driver compiles, seconds
+    // to tens of seconds on one worker, where a graphics program is a few milliseconds. In the seed's order they were spread over its
+    // second half, the last of them the seed's very last program: the other workers ran out of work and waited on the last few
+    // (~20 s of a ~165 s prepare with fewer and fewer CPUs busy, 12 workers on a 24-thread PC). Taken first, the graphics programs
+    // fill in behind them
+    std::vector<uint32_t> order(programs);
+    {
+        size_t at = 0;
+        for (size_t k = 0; k < programs; k++)
+            if (seed_is_compute(k)) order[at++] = (uint32_t)k;
+        for (size_t k = 0; k < programs; k++)
+            if (!seed_is_compute(k)) order[at++] = (uint32_t)k;
+    }
     // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the driver compiled
     // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
     const auto warm_compute = [&](Program& p) {
@@ -7404,15 +7417,16 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
         for (;;) {
             const size_t i = next++;
             if (i >= total) return;
-            if (seed_is_compute(i / 3)) {   // (hookshot) a compute program with each of its texture variants, each warmed
+            const size_t k = order[i / 3];
+            if (seed_is_compute(k)) {   // (hookshot) a compute program with each of its texture variants, each warmed
                 if (i % 3 == 0) {
-                    const SeedVariants v = seed_compute(i / 3, 64, warm_compute);
+                    const SeedVariants v = seed_compute(k, 64, warm_compute);
                     made += v.variants != 0, variants += v.variants, asking += v.variants > 1, capped += v.capped && v.variants;
                 }
                 done++;
                 continue;
             }
-            if (std::unique_ptr<Program> p = seed_program(i / 3, (int)(i % 3))) {
+            if (std::unique_ptr<Program> p = seed_program(k, (int)(i % 3))) {
                 if (!p->failed) made++;
                 if (!p->failed && warm && !p->compute && ensure_layout(*p)) {
                     Targets at{};
