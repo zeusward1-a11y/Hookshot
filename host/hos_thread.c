@@ -560,12 +560,33 @@ uint64_t hos_reserved_cpus(void) {
     return mask;
 }
 
+/* (hookshot) The game's render thread on the reserved core itself: in the default synchronous mode (RX_VK_ASYNC unset) the
+   Vulkan back end replays a submission on the thread that submits it, and OoT's "Presentation Thread" submits most of each
+   frame's (4 of its 6 queues). The core kept for the replay thread had nothing on it then. On a Ryzen 9 3900X in Kokiri
+   Forest: the replay ~24 -> ~22 ms a frame, 34 -> 36 fps (2026-11-08). HOS_PIN_RENDER=0: kept off the core as before */
+static int render_thread_on_reserved(const char *name) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_PIN_RENDER"), *async = getenv("RX_VK_ASYNC");
+        on = (!e || atoi(e) != 0) && !(async && atoi(async) != 0);
+    }
+    return on && name && strcmp(name, "Presentation Thread") == 0;
+}
+
 void hos_thread_pin(void *h, const char *name) {
     const uint64_t reserved = hos_reserved_cpus();
     if (reserved) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        if (render_thread_on_reserved(name) && ((uint64_t)proc & reserved)) {
+            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & reserved));
+            static volatile LONG told;
+            if (!InterlockedExchange(&told, 1))
+                hos_log("threads: %s on the reserved core (logical processors %#llx; HOS_PIN_RENDER=0: off)", name,
+                        (unsigned long long)((uint64_t)proc & reserved));
+        } else if ((uint64_t)proc & ~reserved) {
+            SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        }
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
