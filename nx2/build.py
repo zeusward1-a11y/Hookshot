@@ -319,7 +319,7 @@ class MemoryGate:
 
     def __init__(self):
         self.cv = threading.Condition()
-        self.running = {}   # (src: [need, Popen or None])
+        self.running = {}   # (per-compile lease: [need, Popen or None]; one source can have several objects)
         self.reserve = float(os.environ.get("HOOKSHOT_MEM_RESERVE_GB") or 1.5) * 1024
         self.floor = max(1, min(4, (os.cpu_count() or 2) // 2)) if os.name == "nt" else 1
 
@@ -334,11 +334,13 @@ class MemoryGate:
                 if free - owed - self.reserve >= need:
                     break
                 self.cv.wait(1.0)
-            self.running[src] = [need, None]
+            lease = object()
+            self.running[lease] = [need, None]
+            return lease
 
-    def started(self, src, proc):
+    def started(self, lease, proc):
         with self.cv:
-            self.running[src][1] = proc
+            self.running[lease][1] = proc
 
     def expected(self, jobs):
         """How many compilers the memory free now is likely to hold at once (COMPILER_MB each), between the floor and the jobs:
@@ -348,9 +350,9 @@ class MemoryGate:
             return jobs
         return max(self.floor, min(jobs, int((free - self.reserve) // COMPILER_MB)))
 
-    def leave(self, src):
+    def leave(self, lease):
         with self.cv:
-            self.running.pop(src, None)
+            self.running.pop(lease, None)
             self.cv.notify_all()
 
 
@@ -586,18 +588,17 @@ def compile_one(job):
             shutil.copyfile(cached, obj)
         open(stamp, "w").write(key)
         return src, 0.0, None
-    if GATE:
-        GATE.enter(src)
+    lease = GATE.enter(src) if GATE else None
     t = time.time()
     try:
         with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
             no_throttle(getattr(p, "_handle", None))
             if GATE:
-                GATE.started(src, p)
+                GATE.started(lease, p)
             out, err = p.communicate()
     finally:
         if GATE:
-            GATE.leave(src)
+            GATE.leave(lease)
     r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     if r.returncode:
         failure = r.stderr or r.stdout or "Compiler exited with status %d without diagnostics." % r.returncode
