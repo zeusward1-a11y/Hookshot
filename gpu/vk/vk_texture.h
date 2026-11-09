@@ -94,6 +94,9 @@ void texture_resident_flush(Texture* tex);
 /// What the replay's recording is: the main command buffer, and the one uploads and new images' layout changes go to
 /// (submitted right before it, so nothing has to end a render pass for them)
 void texture_begin_recording(VkCommandBuffer upload_cmd, uint64_t value);
+/// (hookshot-amd) the BC3 texture layers earlier recordings left for later, into this one's upload (the replay thread's)
+void texture_bc_continue();
+bool texture_bc_pending();
 /// true when anything was recorded into the upload command buffer since texture_begin_recording
 bool texture_uploads_recorded();
 /// The recording's upload command buffer, to record into (its first use orders it after the work before)

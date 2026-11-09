@@ -289,6 +289,7 @@ Recording& begin_recording(uint64_t value) {
     r.value = value;
     memory_recording_value(value, completed());
     texture_begin_recording(r.upload, value);
+    texture_bc_continue();
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
 }
@@ -1225,7 +1226,9 @@ constexpr int kMaxBatch = 6;   // (three recording threads: more segments only t
 
 void maybe_split(VkCommandBuffer& cmd) {
     static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 120;
-    if (!rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    // (hookshot-amd: every 16 while BC3 layers wait for recordings of their own, texture_bc_continue)
+    const int64_t want = texture_bc_pending() && every > 16 ? 16 : every;
+    if (!rec_cur || every <= 0 || ++part_work < want || rec_parts + 1 >= kMaxParts || dump_on()) return;
     end_pass(cmd);
     flush_ub_updates(cmd);
     memory_end_submission(cmd);

@@ -50,6 +50,7 @@
 #include "astc_bc_policy.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
+#include "bc_parts.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -742,12 +743,33 @@ VkImageView astc_level_view(Texture* tex, uint32_t level, uint32_t layer) {
     return v;
 }
 
+// (hookshot-amd) ASTC textures re-encoded as BC3 go to the GPU a few runs of layers at a time (bc_parts.h): the rest waits for
+// the next recordings (texture_bc_continue, at each one's start). All in one upload, Hyrule Field's two 1365 x 1365 x 90 terrain
+// arrays, made again when Link came back from Castle Town (evicted there), were a decode, a resize and an encode of ~570 M
+// texels in one submission: on an RX 7700S (8 GB, Adrenalin 26.10.1) it ran past Windows' 2 seconds three times out of three,
+// the driver was reset and the device lost. Until its last layers are in, a texture shows what its image held for those (a
+// frame or two of a scene change). RX_VK_BC_PART_MTEXELS=<M texels a recording> (16 by default; 0: all at once, as before)
+struct BcPending {
+    Texture* tex;
+    uint64_t total;
+    std::vector<uint32_t> layers;
+};
+std::vector<BcPending> bc_pending;
+thread_local uint64_t bc_part_texels = 0;   // (what this recording's upload holds already)
+uint64_t bc_part_budget() {
+    static const uint64_t v = (uint64_t)(getenv("RX_VK_BC_PART_MTEXELS") ? std::max(0, atoi(getenv("RX_VK_BC_PART_MTEXELS"))) : 16) << 20;
+    return v;
+}
+uint64_t astc_layer_size(const Texture& tex, uint64_t total) {
+    return tex.layers > 1 ? tex.L.layer_size : std::max<uint64_t>(tex.L.layer_size, total);
+}
+
 /// ASTC decoded on the GPU (Eden's decoder): the layers dirty overlaps (all of them without dirty), each layer's
 /// levels from the first one the image keeps (a texture that leaves out its top levels stages only the tail of
 /// every layer's chain: Eden's AssembleInto does the same)
 bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     if (tex.type != VK_IMAGE_TYPE_2D || tex.samples != VK_SAMPLE_COUNT_1_BIT || !astc_ready()) return false;
-    const uint64_t layer_size = tex.layers > 1 ? tex.L.layer_size : std::max<uint64_t>(tex.L.layer_size, total);
+    const uint64_t layer_size = astc_layer_size(tex, total);
     const uint64_t tail0 = level_geo(tex, 0).offset;
     if (!layer_size || tail0 >= layer_size || (tail0 & 15) || (layer_size & 15)) return false;
     const uint64_t tail = layer_size - tail0;
@@ -772,6 +794,30 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
     if (tex.bc) {   // (decoded into the scratch a run of consecutive layers at a time, re-encoded, copied in)
         if (!bc_scratch_layout(cmd, tex.bc_resized)) return false;
+        // (runs of layers, each with all its levels, while this recording's share lasts: see bc_pending)
+        uint64_t layer_texels = 0;   // (decoded at the game's size and encoded at the image's)
+        for (uint32_t level = 0; level < tex.levels; level++) {
+            const LevelGeo g = level_geo(tex, level);
+            layer_texels += (uint64_t)g.w * g.h + (uint64_t)std::max(1u, tex.width >> level) * std::max(1u, tex.height >> level);
+        }
+        // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
+        // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
+        // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
+        // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
+        static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
+        for (size_t r0 = 0; r0 < layers.size();) {
+            const size_t r1 = bc_parts::run_end(layers.data(), layers.size(), r0, run);
+            const uint64_t run_texels = layer_texels * (r1 - r0);
+            if (!bc_parts::run_fits(bc_part_texels, run_texels, bc_part_budget(), r0 == 0)) {   // (the rest: the next recordings)
+                bc_pending.push_back({&tex, total, std::vector<uint32_t>(layers.begin() + (long)r0, layers.end())});
+                static int64_t deferred;
+                if (deferred++ < 20 || deferred % 200 == 0)
+                    logf("vk: BC3 texture %#llx %ux%u x%u: %zu of %u layers left for the next recordings (%lld so far)",
+                         (unsigned long long)tex.gpu, tex.width, tex.height, tex.layers, layers.size() - r0, tex.layers,
+                         (long long)deferred);
+                break;
+            }
+            bc_part_texels += run_texels;
         for (uint32_t level = 0; level < tex.levels; level++) {
             const LevelGeo g = level_geo(tex, level);
             const uint64_t off = g.offset - tail0;
@@ -787,14 +833,8 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
             pc.block_height = g.tile_h;
             pc.block_height_mask = (1u << g.tile_h) - 1;
             pc.native_tiling = 1;
-            for (size_t k0 = 0; k0 < layers.size();) {
-                size_t k1 = k0 + 1;
-                // (one layer a run: with runs of up to kBcLayers, an array's layers past the run's first came out wrong in the
-                // smaller levels, and Hyrule Field's ground, which samples the terrain's material arrays (1365 x 1365 x 90, ASTC
-                // 8x8) at those levels from a distance, had its tiles outlined in dark lines (RX 6600: none with one layer a run,
-                // nor with the arrays kept as RGBA8). RX_VK_BC_LAYERS=<n>: up to n a run)
-                static const uint32_t run = getenv("RX_VK_BC_LAYERS") ? std::clamp<uint32_t>((uint32_t)atoi(getenv("RX_VK_BC_LAYERS")), 1u, kBcLayers) : 1u;
-                while (k1 < layers.size() && k1 - k0 < run && layers[k1] == layers[k1 - 1] + 1) k1++;
+            {
+                const size_t k0 = r0, k1 = r1;
                 const uint32_t n = (uint32_t)(k1 - k0);
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, astc_pipe);
                 const uint64_t from = k0 * tail + off;
@@ -812,8 +852,9 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
                     bc_encode_resized(cmd, g.w, g.h, iw, ih, n, tex, level, layers[k0]);
                 else
                     bc_encode_into(cmd, iw, ih, n, tex, level, layers[k0], 0, 0);
-                k0 = k1;
             }
+        }
+            r0 = r1;
         }
         st_astc++;
         return true;
@@ -1466,6 +1507,9 @@ uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to th
 
 void destroy_later(Texture& tex) {
     destroy_gen++;
+    if (!bc_pending.empty())   // (hookshot-amd: its layers still to come, with it)
+        bc_pending.erase(std::remove_if(bc_pending.begin(), bc_pending.end(), [&](const BcPending& p) { return p.tex == &tex; }),
+                         bc_pending.end());
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     for (auto& kv : tex.views)
         if (kv.second) d.views.push_back(kv.second);
@@ -1843,8 +1887,32 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;
     up_used = false;
+    bc_part_texels = 0;
     memory_table_begin();
     memory_rb_recording_begun();   // (which readback pages its uploads may refresh: memory_rb_refresh)
+}
+/// (hookshot-amd) at a recording's start, on the replay thread: the BC3 layers earlier recordings left (bc_pending), while
+/// this recording's share lasts
+void texture_bc_continue() {
+    if (bc_pending.empty()) return;
+    std::vector<BcPending> todo;
+    todo.swap(bc_pending);
+    size_t i = 0;
+    for (; i < todo.size(); i++) {
+        if (bc_part_budget() && bc_part_texels >= bc_part_budget()) break;
+        BcPending& p = todo[i];
+        Texture& t = *p.tex;
+        const uint64_t ls = astc_layer_size(t, p.total);
+        const uint64_t tail0 = level_geo(t, 0).offset;
+        Ranges r;
+        for (uint32_t l : p.layers) r.push_back({(uint64_t)l * ls + tail0, (uint64_t)(l + 1) * ls});
+        upload_astc_gpu(t, p.total, &r);   // (what does not fit goes back on the list)
+        t.last_value = rec_value;          // (its image is written by this recording's upload)
+    }
+    for (; i < todo.size(); i++) bc_pending.push_back(std::move(todo[i]));
+}
+bool texture_bc_pending() {
+    return !bc_pending.empty();
 }
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();
