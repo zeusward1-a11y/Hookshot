@@ -42,6 +42,10 @@ static void *at(uint64_t address) { CHECK(address <= 512 - 8); return memory + a
 
 int rx_option(int id, int otherwise) { return id == 4 ? menu_background : id == 1 ? 0 : otherwise; }
 int64_t hos_now_ns(void) { return now_ns; }
+/* (#785: the debug tools; their rows stay off here) */
+void rx_option_set(int id, int value) { (void)id, (void)value; }
+int hos_oot_flight_shortcut_ready(void) { return 0; }
+volatile int hos_oot_live_action;
 void hos_log(const char *format, ...) {
     va_list args; va_start(args, format); vsnprintf(last_log, sizeof last_log, format, args); va_end(args);
 }
