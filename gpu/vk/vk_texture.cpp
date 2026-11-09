@@ -3169,7 +3169,6 @@ void texture_frame(uint64_t completed) {
     // again in play, and the driver paged the rest out. vram_room.h)
     static const int target_pct = vram_room::target_pct(getenv("RX_VK_VRAM_TARGET"));
     const uint64_t room = known ? vram_room::room(used, allowed, block_free, total_bytes, target_pct) : UINT64_MAX;
-    budget = std::min(budget, room);
     // (near what the driver allows, the budget shrinks by the excess. The excess of what the process holds less the
     // free space in VMA's blocks, which new images take before VMA makes a block: measured by the blocks alone, the
     // textures evicted freed space inside them that the driver still counted, so 10 frames later the budget shrank
@@ -3187,6 +3186,9 @@ void texture_frame(uint64_t completed) {
         const uint64_t over = used - allowed / 100 * 97;
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
+    // (hookshot: the hard budget is the one above; the room is soft: over it only cold textures go (vram_room::min_unused))
+    const uint64_t hard = budget;
+    budget = std::min(budget, room);
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         logf("vk: VRAM: %llu MB used of %llu MB allowed (%llu MB of it free in the blocks); textures %llu MB (budget %llu "
@@ -3379,10 +3381,15 @@ void texture_frame(uint64_t completed) {
     const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : min_unused;
     const uint64_t need_dead = dead_targets ? std::min(need_unused, dead_min_unused) : need_unused;
     static uint64_t n_dead, b_dead, dead_logged_at;
+    // (hookshot: over the room alone (vram_room.h), only the cold ones; the hard budget's eviction as before)
+    static const uint64_t room_unused = vram_room::room_min_unused(getenv("RX_VK_ROOM_MIN_UNUSED"));
+    const bool over_hard = total_bytes > hard;
     for (auto& [last, tex] : order) {
         if ((!sweep && total_bytes - pending_bytes <= budget / 8 * 7) || frame_no - last < need_dead) break;
         const bool shifted = drawn_over_shifted(tex);
-        if (frame_no - last < need_unused && !shifted) continue;   // (younger: only a dead transient target goes)
+        const uint64_t unused_for =
+            sweep ? need_unused : vram_room::min_unused(over_hard, total_bytes - pending_bytes, hard, need_unused, room_unused);
+        if (frame_no - last < unused_for && !shifted) continue;   // (younger: only a dead transient target goes)
         if (tex->last_value > completed) continue;
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.

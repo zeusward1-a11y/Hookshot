@@ -35,6 +35,14 @@ int main() {
     expect(room(used, allowed, free, tex, 0) == UINT64_MAX && room(used, 0, free, tex, 85) == UINT64_MAX, "off, or unknown");
     // a 16 GB card with the same rest: the room past the 6 GB cap, which then holds
     expect(room(used, 15000 * MB, free, tex, 85) > 6144 * MB, "a bigger card: the cap of 6 GB holds, not the room");
+    // the room is soft: over the hard budget, down to 7/8 of it, the eviction as before (60 frames); under it, cold only
+    const uint64_t hard = 6144 * MB;
+    expect(min_unused(true, 6000 * MB, hard, 60, 600) == 60, "over the hard budget: 60 frames, as before");
+    expect(min_unused(true, 5300 * MB, hard, 60, 600) == 600, "down to 7/8 of the hard budget: then cold only");
+    expect(min_unused(false, 5900 * MB, hard, 60, 600) == 600, "never over the hard budget, over the room: cold only");
+    expect(min_unused(false, 5900 * MB, hard, 120, 600) == 600 && min_unused(true, 6000 * MB, hard, 120, 600) == 120, "the sweep's own");
+    expect(room_min_unused(nullptr) == 600 && room_min_unused("") == 600 && room_min_unused("0") == 600 &&
+               room_min_unused("x") == 600 && room_min_unused("300") == 300, "RX_VK_ROOM_MIN_UNUSED");
     if (failures) return std::printf("vram_room: %d failures\n", failures), 1;
     std::printf("vram_room: ok\n");
     return 0;
