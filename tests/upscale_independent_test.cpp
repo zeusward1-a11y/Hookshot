@@ -35,6 +35,7 @@ struct Offset { int x = 0, y = 0, z = 0; };
 struct Layers { int aspect = 0, level = 0, first = 0, count = 0; };
 struct VkImageBlit { Layers srcSubresource, dstSubresource; Offset srcOffsets[2], dstOffsets[2]; };
 struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
+bool dlssg_engaged() { return false; }   // (framegen_on's DLSS Frame Generation gate, vk_dlss.cpp: off here)
 struct SpyMutex {
     bool held = false;
     void lock() { CHECK(!held); held = true; }

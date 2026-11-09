@@ -22,6 +22,7 @@
 #include "vk_menu_hit.h"
 #include "oot_cheat_items.h"
 #include "vk_dlss.h"
+#include "dlssg_logic.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -51,6 +52,11 @@ struct Row {
 };
 const char* tx_framegen(int v) {
     static const char* t[] = {"Off", "", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
+    if (v >= 2 && dlssg_engaged()) {   // (DLSS Frame Generation makes the frames: this interpolation stays off)
+        static char b[40];
+        snprintf(b, sizeof b, "%s (off: DLSS FG on)", t[v]);
+        return b;
+    }
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
@@ -132,6 +138,22 @@ const char* tx_handheld(int v) { return v ? "On (restart)" : "Off (restart)"; }
 const char* tx_dlss(int v) {
     if (v && !dlss_available()) return strcmp(dlss_reason(), "not started") ? "On (no NVIDIA DLSS found)" : "On (restart)";
     return v ? "On" : "Off";
+}
+// DLSS Frame Generation: Off, 2x, 3x, 4x, or why it cannot be. It needs DLSS (its depth and motion); Streamline loads it at the
+// start only when the row is not Off then (loaded, it presents every frame through its own swapchain, even off)
+const char* tx_dlssg(int v) {
+    static const char* names[] = {"Off", "2x", "2x", "3x", "4x"};
+    static char b[96];
+    const char* n = names[std::min(std::max(v, 0), 4)];
+    if (!opts.dlss || !dlss_available()) return v ? (snprintf(b, sizeof b, "%s (needs DLSS)", n), b) : "Off";
+    if (dlssg_available()) {
+        const uint32_t max = dlssg_max_multiplier();
+        if (v >= 2 && max && (uint32_t)v > max) return snprintf(b, sizeof b, "%s (%ux on this GPU)", n, max), b;
+        return n;
+    }
+    if (!dlssg_requested()) return v ? (snprintf(b, sizeof b, "%s (restart)", n), b) : "Off";
+    snprintf(b, sizeof b, "%s (%s)", n, dlssg_reason());
+    return b;
 }
 const char* tx_dlss_preset(int v) {
     static char b[16];
@@ -225,6 +247,10 @@ Row rows[] = {
      "NVIDIA's DLSS model, changed at once. M: NVIDIA's pick for Performance, close to L's picture but nearer K's speed. L: its "
      "pick for Ultra Performance, sharper and steadier, less ghosting, slower. K: its pick for Quality, Balanced and DLAA. J: "
      "like K, slightly less ghosting, more flicker."},
+    {TAB_GRAPHICS, "DLSS Frame Generation", &opts.dlssg, 0, 4, 1, tx_dlssg,
+     "NVIDIA DLSS Frame Generation: 2x to 4x the game's frames, made by NVIDIA's AI from DLSS's depth and motion and paced with "
+     "NVIDIA Reflex. Needs DLSS on and an RTX 40 or 50 GPU (3x and 4x: RTX 50). Turning it on from Off applies after a restart; "
+     "2x, 3x and 4x change at once. While it is on, Frame generation stays off. Off in this menu and when DLSS does not draw."},
     {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
@@ -493,6 +519,7 @@ void save() {
 /// (a slider's drag: saved once it is let go)
 void set_row(Row& r, int v, int dir, bool keep = true) {
     if (r.value == &opts.framegen && v == 1) v = dir > 0 ? 2 : 0;   // (off, 2x ... 8x)
+    if (r.value == &opts.dlssg) v = dlssg::menu_step(*r.value, dir > 0);   // (off, 2x, 3x, 4x)
     if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
     if (r.value == &opts.pad_layout) {
         if (v > 2) v = dir > 0 ? 0 : 2;
@@ -1161,6 +1188,7 @@ void menu_init() {
     if (const char* e = getenv("RX_DLSS")) opts.dlss = atoi(e) != 0;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
     if (const char* e = getenv("RX_DLSS_PRESET"); e && e[0] >= 'J' && e[0] <= 'M') opts.dlss_preset = e[0] - 'J';
+    opts.dlssg = dlssg::parse_multiplier(getenv("RX_DLSSG"), dlssg::normalize_multiplier(opts.dlssg));   // (0, 2, 3 or 4)
 }
 
 void menu_note_output(uint32_t w, uint32_t h) {
@@ -1193,6 +1221,7 @@ void menu_note_frame(bool game_frame) {
     shown_frames.fetch_add(1, std::memory_order_relaxed);
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }
+void menu_note_extra_frames(uint32_t n) { shown_frames.fetch_add(n, std::memory_order_relaxed); }
 
 // The Fullscreen row and F11 are one setting: the row asks the window's thread (host/display.c), F11 shows in the row
 void fullscreen_tick() {
@@ -1684,7 +1713,7 @@ void menu_tick() {
         double shown = 0, game = 0;
         if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
             snprintf(fps_text, sizeof fps_text, "%.0f", shown);
-            if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
+            if (opts.framegen >= 2 || dlssg_generating()) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
             else fps_sub[0] = 0;
             fps_bmp.keyed = true;
             gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);

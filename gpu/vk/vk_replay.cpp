@@ -36,6 +36,7 @@
 #include "vk_texture.h"
 #include "vk_xfer.h"
 #include "vk_present_rect.h"
+#include "vk_dlss.h"
 
 #include "vk_internal.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -2539,6 +2540,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
+        dlss_note_present((uint64_t)presents);   // (DLSS-G: the frame recorded from now on is the next one)
         if (presents == 1) hang_watch_start();
         {   // (EvilBoyce, diagnostics) RX_VK_WATCH_CPU=<present>:<gpu address>[,...] (hex addresses): from that present on, the
             // CPU's writes to those 4 KB pages logged with the writer's stack (host page watch: 12 reports)
@@ -2810,7 +2812,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         log_frame_stats();
     }
     if (dev.offscreen || interpolated) return;
-    present_image(src, sw, sh, crop, direct_view);
+    present_image(src, sw, sh, crop, direct_view, (uint32_t)presents);   // (the game frame's number: DLSS-G's, dlss_frame_id)
 }
 
 } // namespace
@@ -2954,12 +2956,15 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 // for the submit and the present. Held over vkAcquireNextImageKHR and the fence, it stopped the replay's submits for as long as
 // the swapchain had no image free, twice a frame with frame interpolation.
 std::mutex present_image_mu;
-void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
+void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, uint32_t game_frame) {
     std::lock_guard lk(present_image_mu);
-    if (const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire)) {   // (the window was resized: main's resize)
-        std::lock_guard qk(dev.present_mu);
-        create_swapchain((uint32_t)(want >> 32), (uint32_t)want);
-    }
+    // (the window was resized: main's resize. With DLSS Frame Generation on, this present turns it off first and the swapchain is
+    // made at the next one: the guide wants DLSS-G off for any window change, vk_dlss.cpp dlss_defer_swapchain)
+    if (dev.swap_resize.load(std::memory_order_acquire) && !(game_frame && dlss_defer_swapchain()))
+        if (const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire)) {
+            std::lock_guard qk(dev.present_mu);
+            create_swapchain((uint32_t)(want >> 32), (uint32_t)want);
+        }
     menu_tick();
     Frame& f = frames[frame_index];
     const int log_slot = frame_index;
@@ -3074,7 +3079,13 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     pi.swapchainCount = 1;
     pi.pSwapchains = &dev.swapchain;
     pi.pImageIndices = &index;
+    // (hookshot) DLSS Frame Generation: generation on or off for this frame, its tags, the render-submit-end and present markers
+    // around the present (Streamline's vkQueuePresentKHR inserts the made frames). vk_dlss.cpp
+    // (game_frame 0: a made frame of the built-in interpolation, which turns DLSS-G off if it was on)
+    dlssg_present_begin(game_frame, src != VK_NULL_HANDLE, (int)rect.x, (int)rect.y, rect.w, rect.h, dev.swap_extent.width,
+                        dev.swap_extent.height);
     res = vkQueuePresentKHR(dev.queue, &pi);
+    dlssg_present_end(game_frame);
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR)
         create_swapchain(dev.swap_extent.width, dev.swap_extent.height);
 }
@@ -3395,6 +3406,7 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    dlssg_game_present();   // (the game's thread: DLSS-G's frames are numbered by the game's presents)
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         if (sync_waits_on()) {

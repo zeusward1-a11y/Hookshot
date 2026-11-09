@@ -222,6 +222,11 @@ static void flush_early(void) {
 }
 
 /* dll: mkw_vk.dll (our Vulkan back end) or mkw_eden.dll (Eden's renderer driven natively, gpu/eden): one export */
+/* (hookshot, DLSS Frame Generation) the renderer's frame start (gpu/vk/vk_main.cpp mkwvk_frame_start): an export of its own, looked up by
+   name, as the renderer table is in vk_api.h, which the shader caches' stamp hashes; absent (mkw_eden.dll): nothing */
+typedef void (*mkwvk_frame_start_fn)(void);
+static mkwvk_frame_start_fn frame_start_fn;
+static mkwvk_frame_start_fn frame_start_of;   /* (the DLL load_vulkan loaded last: kept once it is the renderer) */
 static const MkwVkRenderer *load_vulkan(const char *dll) {
     char path[MAX_PATH];
     const DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -234,6 +239,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
         return NULL;
     }
     mkwvk_init_fn init = (mkwvk_init_fn)(void *)GetProcAddress(m, "mkwvk_init");
+    frame_start_of = (mkwvk_frame_start_fn)(void *)GetProcAddress(m, "mkwvk_frame_start");
     const MkwVkRenderer *r = init ? init(&vk_host) : NULL;
     if (!r || r->version != MKWVK_API_VERSION) {
         hos_log("rx: the Vulkan back end did not start: WebGPU");
@@ -250,6 +256,7 @@ int rx_start(void *hwnd) {
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
             vk = r;
+            frame_start_fn = frame_start_of;
             hos_log("rx: renderer: %s (%s)", eden ? "Eden's" : "Vulkan", dll);
             flush_early();
             return 1;
@@ -288,6 +295,11 @@ void rx_wait_writebacks_reading(const void *p, uint64_t n) {
 }
 void rx_nvn_finish(void) { vk ? vk->nvn_finish() : wgr_nvn_finish(); }
 void rx_nvn_present(const nvn_tex *t, const int crop[4]) { vk ? vk->nvn_present(t, crop) : wgr_nvn_present(t, crop); }
+/* (hookshot) the game starts a frame: its window acquire, after the host's pacing (nvn_native.c). DLSS Frame Generation's Reflex
+   sleep and first latency markers; nothing without it */
+void rx_frame_start(void) {
+    if (vk && frame_start_fn) frame_start_fn();
+}
 static void forward(const early_call *c) {
     switch (c->kind) {
     case 0: {

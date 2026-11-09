@@ -1,6 +1,8 @@
-// NVIDIA DLSS super resolution through NVIDIA Streamline, manual hooking (vk_dlss.h). Ported from Lichii (Eden lineage;
-// Duck912's Eglantine work), GPL-3.0-or-later: video_core/vulkan_common/streamline.cpp (the loader) and
-// renderer_vulkan/vk_streamline_dlss.cpp (the evaluation). Streamline's headers are MIT (third_party/streamline/license.txt).
+// NVIDIA DLSS super resolution and DLSS Frame Generation through NVIDIA Streamline, manual hooking (vk_dlss.h). Super resolution
+// ported from Lichii (Eden lineage; Duck912's Eglantine work), GPL-3.0-or-later: video_core/vulkan_common/streamline.cpp (the loader)
+// and renderer_vulkan/vk_streamline_dlss.cpp (the evaluation). Frame generation follows Streamline 2.14.16's guides
+// (ProgrammingGuideDLSS_G.md, ProgrammingGuideManualHooking.md) and NX2navi's working integration (runtime/dlssg/nx2_sl.cpp: Reflex
+// from the frame's start, frames numbered by the game's presents). Streamline's headers are MIT (third_party/streamline/license.txt).
 #include "vk_dlss.h"
 #include "vk_internal.h"
 
@@ -8,20 +10,30 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <string>
 
 #include <sl.h>
 #include <sl_dlss.h>
+#include <sl_dlss_g.h>
 #include <sl_helpers_vk.h>
+#include <sl_pcl.h>
+#include <sl_reflex.h>
 #include <softpub.h>
 #include <wintrust.h>
 
 #include "dlss_result.h"
+#include "dlssg_logic.h"
 #include "vk_menu.h"
 
 namespace mkwvk {
+HWND app_window();   // (vk_main.cpp)
+void menu_note_extra_frames(uint32_t n);   // (vk_menu.cpp: frames DLSS-G showed beyond the game's, for the FPS counter)
 namespace {
 
 namespace fs = std::filesystem;
@@ -30,11 +42,18 @@ namespace fs = std::filesystem;
 constexpr const char* PROJECT_ID = "8d3e2f9a-6b41-4c7e-9a52-1f0c3b7d5e64";
 constexpr unsigned MIN_DLSS_MAJOR = 310;   // (the first DLSS with preset K)
 using Version = std::array<unsigned, 4>;
+constexpr int kSettle = 2;            // (presents with generation off after a swapchain is made)
+constexpr int kStatusRetry = 300;     // (presents with generation off after a status that was not ok, then it is tried again)
+constexpr int64_t kHoldIdleNs = 200000000;   // (no Reflex sleep once nothing was presented for this long)
+constexpr uint32_t kLogEvery = 600;   // (presents between the frame generation log lines)
 
 // the functions Streamline's manual hooking wants routed through its proxies
 #define DLSS_HOOKED(X) \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
     X(vkDeviceWaitIdle)
+// (DLSS-G) and the window surface's: Streamline learns which window a swapchain shows from vkCreateWin32SurfaceKHR, and without it
+// NX2navi's DLSS-G found "no window corresponding to this application" and made no frames (sl_hooks.h lists both as mandatory)
+#define DLSSG_HOOKED(X) X(vkCreateWin32SurfaceKHR) X(vkDestroySurfaceKHR)
 
 struct State {
     HMODULE module = nullptr;
@@ -54,23 +73,71 @@ struct State {
     std::wstring plugin_dir, model_dir;
     std::vector<std::string> inst_names, dev_names;
     std::vector<const char*> inst, devx;
-    bool tried = false, started = false, attached = false, failed = false, hooked = false;
+    bool tried = false, started = false, attached = false, failed = false, hooked = false, surface_hooked = false;
     const char* reason = "not started";
     struct {
 #define DLSS_ORIG(f) PFN_##f f = nullptr;
         DLSS_HOOKED(DLSS_ORIG)
+        DLSSG_HOOKED(DLSS_ORIG)
 #undef DLSS_ORIG
     } orig;   // (put back at stop)
     bool options_set = false;
     uint32_t rw = 0, rh = 0, ow = 0, oh = 0;   // (the sizes the options were last set for)
     sl::DLSSPreset preset{};                    // (and the preset asked for)
     uint32_t over_budget = 0;                   // (frames drawn with Streamline's eWarnOutOfVRAM: dlss_result.h)
+
+    // (DLSS Frame Generation, Reflex, PCL)
+    PFun_slSetTagForFrame* set_tag = nullptr;
+    PFun_slIsFeatureLoaded* is_loaded = nullptr;
+    PFun_slSetFeatureLoaded* set_loaded = nullptr;
+    PFun_slDLSSGSetOptions* fg_options = nullptr;
+    PFun_slDLSSGGetState* fg_state = nullptr;
+    PFun_slReflexSetOptions* reflex_options = nullptr;
+    PFun_slReflexSleep* reflex_sleep = nullptr;
+    PFun_slPCLSetMarker* marker = nullptr;
+    bool fg_asked = false;   // (the row or RX_DLSSG at the start: DLSS-G, Reflex and PCL loaded with DLSS)
+    bool fg_init = false;    // (slInit was asked for DLSS-G: unloaded again at attach when it cannot run)
+    bool fg_ok = false;      // (supported here, its functions found: dlssg_available)
+    const char* fg_reason = "not asked for";
+    uint32_t fg_max = 0;     // (numFramesToGenerateMax, 0 until DLSS-G says)
+    bool fg_announced = false;
+    uint32_t extra_graphics = 0, extra_compute = 0, extra_of = 0;
+    std::vector<std::string> feat12, feat13;   // (the Vulkan 1.2 and 1.3 features the plugins asked for)
+    dlssg::QueuePlan plan{};
+    bool planned = false;
+    std::vector<std::vector<float>> priorities;
+    DlssQueues queues;
+    int reflex_asked = 1, reflex_applied = -1;
+    sl::ResourceLifecycle tag_life = sl::ResourceLifecycle::eOnlyValidNow;
 };
 State st;
+
+// The frames (vk_dlss.h). The game's thread: game_presents, starter. The replay (the thread that records and presents):
+// replay_presents, the frame's constants and tags, and everything a present decides.
+struct Frames {
+    std::atomic<uint64_t> game_presents{0}, replay_presents{0};
+    std::atomic<int64_t> last_present_ns{0};
+    dlssg::FrameStart starter;
+    std::atomic<uint32_t> constants_frame{0}, tagged_frame{0};
+    uint32_t last_tagged = 0, tag_w = 0, tag_h = 0;
+    dlssg::Mode applied{};
+    bool applied_valid = false;
+    std::atomic<bool> generating{false};
+    int last_off = dlssg::OFF_UNAVAILABLE;
+    dlssg::SwapchainGate gate;
+    dlssg::StatusGate status;
+    dlssg::Stats stats;
+    uint32_t changes_logged = 0;
+};
+Frames fr;
 
 int env_int(const char* name, int fallback) {
     const char* v = getenv(name);
     return v ? atoi(v) : fallback;
+}
+
+int64_t now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 std::string u8(const fs::path& p) {
@@ -78,12 +145,21 @@ std::string u8(const fs::path& p) {
     return std::string(s.begin(), s.end());
 }
 
-// RX_DLSS_LOG=1: Streamline's info lines too, 2: verbose
+// RX_DLSS_LOG=1: Streamline's info lines too, 2: verbose. Its warnings and errors: the first 400, then one in 1000 (a warning a
+// present, with frame generation, filled the log), all of them with RX_DLSS_LOG
+std::mutex sl_log_mu;
+dlssg::LogLimit sl_log_limit;
 void sl_log(sl::LogType type, const char* msg) {
+    static const int level = env_int("RX_DLSS_LOG", 0);
+    const bool loud = type == sl::LogType::eError || type == sl::LogType::eWarn;
+    if (!loud && level <= 0) return;
+    if (loud && level <= 0) {
+        std::lock_guard lk(sl_log_mu);
+        if (!sl_log_limit.allow(400, 1000)) return;
+    }
     std::string s = msg ? msg : "";
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    if (type == sl::LogType::eError || type == sl::LogType::eWarn || env_int("RX_DLSS_LOG", 0) > 0)
-        logf("vk: dlss: sl: %s", s.c_str());
+    logf("vk: dlss: sl: %s", s.c_str());
 }
 
 bool off(const char* why) {
@@ -92,10 +168,25 @@ bool off(const char* why) {
     return false;
 }
 
+void fg_off(const char* why) {
+    st.fg_ok = false;
+    st.fg_reason = why;
+    logf("vk: dlssg: off: %s", why);
+}
+
 template <typename T>
 bool resolve(const char* name, T*& f) {
     f = reinterpret_cast<T*>(GetProcAddress(st.module, name));
     if (!f) logf("vk: dlss: sl.interposer.dll has no %s", name);
+    return f != nullptr;
+}
+
+template <typename T>
+bool feature_function(sl::Feature feature, const char* name, T*& f) {
+    void* p = nullptr;
+    const sl::Result r = st.get_feature_function(feature, name, p);
+    f = r == sl::Result::eOk ? reinterpret_cast<T*>(p) : nullptr;
+    if (!f) logf("vk: dlssg: no %s (result %d)", name, (int)r);
     return f != nullptr;
 }
 
@@ -200,8 +291,11 @@ void unhook() {
     if (!st.hooked) return;
 #define DLSS_RESTORE(f) vkx::f = st.orig.f;
     DLSS_HOOKED(DLSS_RESTORE)
+    if (st.surface_hooked) {
+        DLSSG_HOOKED(DLSS_RESTORE)
+    }
 #undef DLSS_RESTORE
-    st.hooked = false;
+    st.hooked = st.surface_hooked = false;
 }
 
 /// Attach failed: Streamline stops, DLSS stays off
@@ -209,6 +303,8 @@ void shut(const char* why) {
     unhook();
     st.shutdown();
     st.started = st.attached = false;
+    st.fg_ok = false;
+    st.fg_reason = "DLSS is off";
     off(why);
 }
 
@@ -241,6 +337,58 @@ sl::float4x4 identity() {
     m.setRow(3, {0.0f, 0.0f, 0.0f, 1.0f});
     return m;
 }
+/// A Streamline matrix from 16 floats already in its order (rows of a row-vector matrix: dlssg_logic.h)
+sl::float4x4 rows(const float* v) {
+    sl::float4x4 m;
+    for (uint32_t r = 0; r < 4; r++) m.setRow(r, {v[r * 4], v[r * 4 + 1], v[r * 4 + 2], v[r * 4 + 3]});
+    return m;
+}
+
+/// The frame's common constants (one slSetConstants a frame, DLSS super resolution's and DLSS-G's). DLSS-SR reads only the jitter,
+/// motion and depth conventions; DLSS-G the camera too: from the game's view-projection when it is a perspective one (dlssg_logic.h
+/// camera_from_view_projection: orthonormal vectors, the clip-to-previous-clip converted from OpenGL's z), identity otherwise
+sl::Constants frame_constants(const DlssView* view, bool reset, float rw, float rh) {
+    sl::Constants c{};
+    c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity();
+    c.jitterOffset = {0.0f, 0.0f};
+    c.mvecScale = {1.0f / rw, 1.0f / rh};   // (motion in render pixels; Streamline wants [-1,1] screen units)
+    c.cameraPinholeOffset = {0.0f, 0.0f};
+    c.cameraPos = {0.0f, 0.0f, 0.0f};
+    c.cameraUp = {0.0f, 1.0f, 0.0f};
+    c.cameraRight = {1.0f, 0.0f, 0.0f};
+    c.cameraFwd = {0.0f, 0.0f, 1.0f};
+    c.cameraNear = 0.1f, c.cameraFar = 1000.0f, c.cameraFOV = 1.0f, c.cameraAspectRatio = rw / rh;
+    c.depthInverted = sl::Boolean::eFalse;
+    c.cameraMotionIncluded = sl::Boolean::eTrue;
+    c.motionVectors3D = sl::Boolean::eFalse;
+    c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    c.motionVectorsJittered = sl::Boolean::eFalse;
+    dlssg::Camera cam;
+    if (view && view->view_projection && dlssg::camera_from_view_projection(view->view_projection, cam)) {
+        c.cameraViewToClip = rows(cam.view_to_clip);
+        c.clipToCameraView = rows(cam.clip_to_view);
+        c.cameraPos = {cam.pos[0], cam.pos[1], cam.pos[2]};
+        c.cameraRight = {cam.right[0], cam.right[1], cam.right[2]};
+        c.cameraUp = {cam.up[0], cam.up[1], cam.up[2]};
+        c.cameraFwd = {cam.fwd[0], cam.fwd[1], cam.fwd[2]};
+        c.cameraNear = cam.near_z, c.cameraFar = cam.far_z, c.cameraFOV = cam.fov_y, c.cameraAspectRatio = cam.aspect;
+        float to_prev[16], from_prev[16];
+        if (view->clip_to_previous) {
+            dlssg::sl_clip_to_prev(view->clip_to_previous, to_prev);
+            if (dlssg::invert4(to_prev, from_prev)) c.clipToPrevClip = rows(to_prev), c.prevClipToClip = rows(from_prev);
+        }
+    }
+    return c;
+}
+
+sl::FrameToken* token(uint32_t frame) {   // (Streamline's ring of six reuses its tokens: each use takes its own right before it)
+    sl::FrameToken* t = nullptr;
+    return frame && st.get_new_frame_token && st.get_new_frame_token(t, &frame) == sl::Result::eOk ? t : nullptr;
+}
+void mark(sl::PCLMarker m, uint32_t frame) {
+    if (!st.marker) return;
+    if (sl::FrameToken* t = token(frame)) st.marker(m, *t);
+}
 
 VkImageMemoryBarrier2 barrier(const DlssImage& i, VkAccessFlags2 src, VkAccessFlags2 dst, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -270,6 +418,95 @@ sl::Resource resource(const DlssImage& i, VkImageLayout layout, VkImageUsageFlag
     return r;
 }
 
+const char* support_text(sl::Result r) {
+    switch (r) {
+    case sl::Result::eErrorOSOutOfDate: return "Windows too old for it";
+    case sl::Result::eErrorDriverOutOfDate: return "NVIDIA driver too old for it";
+    case sl::Result::eErrorOSDisabledHWS: return "hardware-accelerated GPU scheduling is off";
+    case sl::Result::eErrorNoSupportedAdapterFound:
+    case sl::Result::eErrorAdapterNotSupported: return "not supported on this GPU";
+    default: return "not supported here";
+    }
+}
+
+/// Reflex's mode, set again after every swapchain (Streamline applies it to the swapchain it knows, VK_NV_low_latency2) and when the
+/// row turns generation on or off. RX_REFLEX=0|1|2 (default 1); 0 is 1 while generating (dlssg_logic.h reflex_mode)
+void apply_reflex(bool force) {
+    if (!st.fg_ok || !st.reflex_options) return;
+    const int mode = dlssg::reflex_mode(st.reflex_asked, dlssg_engaged());
+    if (!force && mode == st.reflex_applied) return;
+    sl::ReflexOptions o{};
+    o.mode = mode == 2 ? sl::ReflexMode::eLowLatencyWithBoost : mode == 1 ? sl::ReflexMode::eLowLatency : sl::ReflexMode::eOff;
+    const sl::Result r = st.reflex_options(o);
+    static int logged;
+    if (mode != st.reflex_applied || logged < 4) {
+        logged++;
+        logf("vk: dlssg: Reflex %s (result %d)%s", mode == 2 ? "low latency with boost" : mode == 1 ? "low latency" : "off", (int)r,
+             st.reflex_asked == 0 && mode != 0 ? " (RX_REFLEX=0, but DLSS-G needs Reflex while it generates)" : "");
+    }
+    st.reflex_applied = mode;
+}
+
+/// DLSS-G's state (numFramesToGenerateMax, numFramesActuallyPresented, status); false without it
+bool fg_state(sl::DLSSGState& s) {
+    return st.fg_ok && st.fg_state && st.fg_state(sl::ViewportHandle{0u}, s, nullptr) == sl::Result::eOk;
+}
+void announce() {
+    if (st.fg_announced || !st.fg_max) return;
+    st.fg_announced = true;
+    logf("vk: dlssg: available, max %ux (%u generated per game frame), Reflex %s", st.fg_max + 1, st.fg_max,
+         st.reflex_applied == 2 ? "low latency with boost" : st.reflex_applied == 1 ? "low latency" : "off");
+}
+
+/// At attach, the device known: is DLSS-G usable here. Not: unloaded again (slSetFeatureLoaded), so its present hook adds nothing
+void fg_attach(VkPhysicalDevice physical) {
+    if (!st.fg_init) return;
+    bool loaded = false;
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = physical;
+    sl::Result r = sl::Result::eOk;
+    if (st.is_loaded) st.is_loaded(sl::kFeatureDLSS_G, loaded);
+    if (!st.fg_asked) {
+        st.fg_ok = false;   // (a plugin or its requirements were missing at the start: the reason is logged there)
+    } else if (!loaded) {
+        fg_off("DLSS-G did not load (sl.dlss_g.dll and nvngx_dlssg.dll beside sl.interposer.dll)");
+    } else if ((r = st.is_feature_supported(sl::kFeatureDLSS_G, adapter)) != sl::Result::eOk) {
+        logf("vk: dlssg: slIsFeatureSupported: result %d", (int)r);
+        fg_off(support_text(r));
+    } else if ((r = st.is_feature_supported(sl::kFeatureReflex, adapter)) != sl::Result::eOk) {
+        logf("vk: dlssg: Reflex: slIsFeatureSupported result %d", (int)r);
+        fg_off("NVIDIA Reflex not supported here");
+    } else if (!feature_function(sl::kFeatureDLSS_G, "slDLSSGSetOptions", st.fg_options) ||
+               !feature_function(sl::kFeatureDLSS_G, "slDLSSGGetState", st.fg_state) ||
+               !feature_function(sl::kFeatureReflex, "slReflexSetOptions", st.reflex_options) ||
+               !feature_function(sl::kFeatureReflex, "slReflexSleep", st.reflex_sleep) ||
+               !feature_function(sl::kFeaturePCL, "slPCLSetMarker", st.marker) || !st.set_tag) {
+        fg_off("Streamline lacks DLSS-G's, Reflex's or PCL's functions");
+    } else if (st.planned && !st.plan.ok) {
+        fg_off("the GPU has too few queues for it");
+    } else {
+        st.fg_ok = true;
+        st.fg_reason = "";
+    }
+    if (!st.fg_ok) {
+        st.marker = nullptr, st.reflex_sleep = nullptr;
+        if (loaded && st.set_loaded) {
+            r = st.set_loaded(sl::kFeatureDLSS_G, false);
+            logf("vk: dlssg: DLSS-G unloaded (result %d): DLSS draws without frame generation", (int)r);
+        }
+        return;
+    }
+    apply_reflex(true);
+    sl::DLSSGState s{};
+    if (fg_state(s)) st.fg_max = s.numFramesToGenerateMax;
+    sl::FeatureVersion v{};
+    st.get_feature_version(sl::kFeatureDLSS_G, v);
+    logf("vk: dlssg: DLSS-G %s on Streamline %s; tags %s%s", v.versionNGX.toStr().c_str(), v.versionSL.toStr().c_str(),
+         st.tag_life == sl::ResourceLifecycle::eOnlyValidNow ? "copied when tagged" : "valid until the present",
+         st.fg_max ? "" : " (its most frames are known at the first swapchain)");
+    announce();
+}
+
 } // namespace
 
 bool dlss_start() {
@@ -286,6 +523,8 @@ bool dlss_start() {
             dir = fs::absolute(d, ec);
             break;
         }
+    st.fg_asked = opts.dlssg >= 2;
+    st.fg_reason = st.fg_asked ? "DLSS did not start" : "Off at the start";
     if (dir.empty()) {
         logf("vk: dlss: no sl.interposer.dll in %s", u8(dirs.back()).c_str());
         return off("no sl.interposer.dll");
@@ -299,6 +538,13 @@ bool dlss_start() {
     if (!signed_by_nvidia(interposer)) {
         logf("vk: dlss: %s is not signed by NVIDIA; not loading it", u8(interposer).c_str());
         return off("sl.interposer.dll not signed by NVIDIA");
+    }
+    if (st.fg_asked) {   // (frame generation's model, when it is in the folder: NVIDIA's too, or DLSS-G is not loaded)
+        const fs::path fg_model = dir / L"nvngx_dlssg.dll";
+        if (fs::is_regular_file(fg_model, ec) && !signed_by_nvidia(fg_model)) {
+            logf("vk: dlssg: %s is not signed by NVIDIA", u8(fg_model).c_str());
+            st.fg_asked = false, st.fg_reason = "nvngx_dlssg.dll not signed by NVIDIA";
+        }
     }
     st.module = LoadLibraryW(interposer.c_str());
     if (!st.module) {
@@ -317,6 +563,9 @@ bool dlss_start() {
         st.module = nullptr;
         return off("sl.interposer.dll incomplete");
     }
+    if (st.fg_asked && !(resolve("slSetTagForFrame", st.set_tag) && resolve("slIsFeatureLoaded", st.is_loaded) &&
+                         resolve("slSetFeatureLoaded", st.set_loaded)))
+        st.fg_asked = false, st.fg_reason = "sl.interposer.dll too old for DLSS-G";
     st.plugin_dir = dir.wstring();
     // the model: the folder's nvngx_dlss.dll, or the NVIDIA app's newest when it is newer still (a tie: the folder's)
     const fs::path app = find_app_model();
@@ -327,9 +576,11 @@ bool dlss_start() {
     if (used.empty())
         logf("vk: dlss: no nvngx_dlss.dll in %s and no DLSS %u+ from the NVIDIA app", u8(dir).c_str(), MIN_DLSS_MAJOR);
 
-    // the plugins from the interposer's folder or NVIDIA's downloads (OTA); the model from the NVIDIA app's copy first, when used
+    // the plugins from the interposer's folder or NVIDIA's downloads (OTA); the model from the NVIDIA app's copy first, when used.
+    // (DLSS-G) with frame generation: DLSS-G, Reflex (which it needs) and PCL (the latency markers), and frame-based tagging: the
+    // depth and motion are tagged for their frame (slSetTagForFrame), which Streamline refuses without the flag
     const wchar_t* plugin_paths[] = {st.model_dir.c_str(), st.plugin_dir.c_str()};
-    const sl::Feature features[] = {sl::kFeatureDLSS};
+    const sl::Feature features[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
     sl::Preferences pref{};
     pref.logLevel = env_int("RX_DLSS_LOG", 0) >= 2 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
     pref.logMessageCallback = sl_log;
@@ -337,8 +588,10 @@ bool dlss_start() {
     pref.numPathsToPlugins = st.model_dir.empty() ? 1 : 2;
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseManualHooking |
                  sl::PreferenceFlags::eAllowOTA | sl::PreferenceFlags::eLoadDownloadedPlugins;
+    if (st.fg_asked) pref.flags |= sl::PreferenceFlags::eUseFrameBasedResourceTagging;
+    st.fg_init = st.fg_asked;
     pref.featuresToLoad = features;
-    pref.numFeaturesToLoad = 1;
+    pref.numFeaturesToLoad = st.fg_asked ? 4 : 1;
     pref.engine = sl::EngineType::eCustom;
     pref.engineVersion = "1.0";
     pref.projectId = PROJECT_ID;
@@ -348,6 +601,20 @@ bool dlss_start() {
         logf("vk: dlss: slInit failed (result %d)", (int)r);
         return off("Streamline did not start");
     }
+    // what each feature asks of the instance and the device: extensions, Vulkan 1.2/1.3 features and queues of its own (all honoured:
+    // vk_main.cpp makes them, slSetVulkanInfo is told where they are)
+    const auto take = [](const sl::FeatureRequirements& req) {
+        const auto add = [](std::vector<std::string>& to, const char* name) {
+            if (name && std::find(to.begin(), to.end(), name) == to.end()) to.emplace_back(name);
+        };
+        for (uint32_t i = 0; i < req.vkNumInstanceExtensions; i++) add(st.inst_names, req.vkInstanceExtensions[i]);
+        for (uint32_t i = 0; i < req.vkNumDeviceExtensions; i++) add(st.dev_names, req.vkDeviceExtensions[i]);
+        for (uint32_t i = 0; i < req.vkNumFeatures12; i++) add(st.feat12, req.vkFeatures12[i]);
+        for (uint32_t i = 0; i < req.vkNumFeatures13; i++) add(st.feat13, req.vkFeatures13[i]);
+        st.extra_graphics += req.vkNumGraphicsQueuesRequired;
+        st.extra_compute += req.vkNumComputeQueuesRequired;
+        st.extra_of += req.vkNumOpticalFlowQueuesRequired;
+    };
     sl::FeatureRequirements req{};
     if ((r = st.get_feature_requirements(sl::kFeatureDLSS, req)) != sl::Result::eOk) {
         logf("vk: dlss: no DLSS plugin (result %d): sl.dlss.dll and sl.common.dll beside sl.interposer.dll, or the NVIDIA app",
@@ -355,29 +622,55 @@ bool dlss_start() {
         st.shutdown();
         return off("no DLSS plugin");
     }
-    if (req.vkNumComputeQueuesRequired || req.vkNumGraphicsQueuesRequired) {
-        logf("vk: dlss: DLSS wants %u compute and %u graphics queues of its own", req.vkNumComputeQueuesRequired,
-             req.vkNumGraphicsQueuesRequired);
-        st.shutdown();
-        return off("DLSS wants extra queues");
+    take(req);
+    if (st.fg_asked) {
+        static const struct { sl::Feature f; const char* dll; } fg_features[] = {
+            {sl::kFeatureDLSS_G, "sl.dlss_g.dll"}, {sl::kFeatureReflex, "sl.reflex.dll"}, {sl::kFeaturePCL, "sl.pcl.dll"}};
+        static std::string missing;
+        for (const auto& f : fg_features) {
+            sl::FeatureRequirements q{};
+            if ((r = st.get_feature_requirements(f.f, q)) != sl::Result::eOk) {
+                logf("vk: dlssg: no %s plugin (result %d)", f.dll, (int)r);
+                missing = std::string("no ") + f.dll;
+                st.fg_asked = false, st.fg_reason = missing.c_str();
+                continue;
+            }
+            if (f.f == sl::kFeatureDLSS_G && !(q.flags & sl::FeatureRequirementFlags::eVulkanSupported)) {
+                st.fg_asked = false, st.fg_reason = "this DLSS-G has no Vulkan";
+                continue;
+            }
+            if (f.f == sl::kFeatureDLSS_G)
+                logf("vk: dlssg: DLSS-G asks for %u graphics, %u compute and %u optical flow queues, driver %u.%u (%u.%u needed), "
+                     "OS %u.%u.%u (%u.%u.%u needed)%s%s", q.vkNumGraphicsQueuesRequired, q.vkNumComputeQueuesRequired,
+                     q.vkNumOpticalFlowQueuesRequired, q.driverVersionDetected.major, q.driverVersionDetected.minor,
+                     q.driverVersionRequired.major, q.driverVersionRequired.minor, q.osVersionDetected.major,
+                     q.osVersionDetected.minor, q.osVersionDetected.build, q.osVersionRequired.major, q.osVersionRequired.minor,
+                     q.osVersionRequired.build,
+                     q.flags & sl::FeatureRequirementFlags::eHardwareSchedulingRequired ? ", hardware GPU scheduling" : "",
+                     q.flags & sl::FeatureRequirementFlags::eVSyncOffRequired ? ", vsync off" : "");
+            take(q);
+        }
+        if (!st.fg_asked) logf("vk: dlssg: off: %s", st.fg_reason);
     }
-    for (uint32_t i = 0; i < req.vkNumInstanceExtensions; i++) st.inst_names.emplace_back(req.vkInstanceExtensions[i]);
-    bool khr_bda = false;
-    for (uint32_t i = 0; i < req.vkNumDeviceExtensions; i++)
-        khr_bda |= !strcmp(req.vkDeviceExtensions[i], VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
-    for (uint32_t i = 0; i < req.vkNumDeviceExtensions; i++)   // (the KHR and EXT buffer device address cannot both be on)
-        if (!khr_bda || strcmp(req.vkDeviceExtensions[i], VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))
-            st.dev_names.emplace_back(req.vkDeviceExtensions[i]);
+    bool khr_bda = false;   // (the KHR and EXT buffer device address cannot both be on)
+    for (const std::string& s : st.dev_names) khr_bda |= s == VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME;
+    if (khr_bda) st.dev_names.erase(std::remove(st.dev_names.begin(), st.dev_names.end(), VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME),
+                                    st.dev_names.end());
     for (const std::string& s : st.inst_names) st.inst.push_back(s.c_str());
     for (const std::string& s : st.dev_names) st.devx.push_back(s.c_str());
+    st.reflex_asked = dlssg::parse_reflex(getenv("RX_REFLEX"), 1);
+    if (const char* t = getenv("RX_DLSSG_TAGS"); t && !strcmp(t, "present")) st.tag_life = sl::ResourceLifecycle::eValidUntilPresent;
     sl::FeatureVersion version{};
     st.get_feature_version(sl::kFeatureDLSS, version);
     const Version mv = read_version(used).value_or(Version{});
     logf("vk: dlss: Streamline %s started from %s (DLSS %u.%u.%u.%u: %s; Streamline reports %s), %zu instance and %zu device "
-         "extensions", version.versionSL.toStr().c_str(), u8(dir).c_str(), mv[0], mv[1], mv[2], mv[3], u8(used).c_str(),
-         version.versionNGX.toStr().c_str(), st.inst.size(), st.devx.size());
+         "extensions, %u graphics, %u compute and %u optical flow queues of its own%s", version.versionSL.toStr().c_str(),
+         u8(dir).c_str(), mv[0], mv[1], mv[2], mv[3], u8(used).c_str(), version.versionNGX.toStr().c_str(), st.inst.size(),
+         st.devx.size(), st.extra_graphics, st.extra_compute, st.extra_of,
+         st.fg_asked ? "; with DLSS Frame Generation, Reflex and PCL" : "");
     st.started = true;
     st.reason = "no device yet";
+    if (st.fg_asked) st.fg_reason = "no device yet";
     return true;
 }
 
@@ -391,13 +684,89 @@ const std::vector<const char*>& dlss_device_exts() {
     return st.started ? st.devx : none;
 }
 
+const DlssQueues& dlss_queues(VkPhysicalDevice physical, uint32_t host_family, const std::vector<VkQueueFamilyProperties>& families,
+                              bool has_optical_flow_ext) {
+    std::vector<dlssg::Family> fams;
+    for (const VkQueueFamilyProperties& f : families) fams.push_back({(uint32_t)f.queueFlags, f.queueCount});
+    const bool sl_queues = st.started;
+    bool of_ok = false;   // (native optical flow: the extension and its feature; RX_DLSSG_NATIVE_OF=0: interop, as without)
+    if (sl_queues && st.extra_of && has_optical_flow_ext && env_int("RX_DLSSG_NATIVE_OF", 1) != 0) {
+        VkPhysicalDeviceOpticalFlowFeaturesNV of{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        f2.pNext = &of;
+        vkGetPhysicalDeviceFeatures2(physical, &f2);
+        of_ok = of.opticalFlow == VK_TRUE;
+    }
+    st.plan = dlssg::plan_queues(fams.data(), (uint32_t)fams.size(), host_family, sl_queues ? st.extra_graphics : 0,
+                                 sl_queues ? st.extra_compute : 0, sl_queues ? st.extra_of : 0, of_ok);
+    if (!st.plan.ok) {   // (too few queues: Streamline told only of the host's, its features without queues of their own)
+        logf("vk: dlss: the GPU's queue families have too few queues for the %u graphics and %u compute Streamline asked for",
+             st.extra_graphics, st.extra_compute);
+        st.plan = dlssg::plan_queues(fams.data(), (uint32_t)fams.size(), host_family, 0, 0, 0, false);
+        st.plan.ok = false;
+    }
+    st.planned = sl_queues;
+    st.priorities.assign(st.plan.n, {});
+    st.queues.infos.assign(st.plan.n, VkDeviceQueueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO});
+    for (uint32_t i = 0; i < st.plan.n; i++) {
+        // (Hookshot's queue first in its family at 1; Streamline's at 0, as its own proxy makes them)
+        std::vector<float>& p = st.priorities[i];
+        p.assign(st.plan.asks[i].count, 0.0f);
+        if (st.plan.asks[i].family == host_family) p[0] = 1.0f;
+        st.queues.infos[i].queueFamilyIndex = st.plan.asks[i].family;
+        st.queues.infos[i].queueCount = st.plan.asks[i].count;
+        st.queues.infos[i].pQueuePriorities = p.data();
+    }
+    st.queues.optical_flow = st.plan.native_of;
+    if (sl_queues && (st.extra_graphics || st.extra_compute || st.extra_of))
+        logf("vk: dlss: queues for Streamline: graphics family %u from %u, compute family %u from %u, optical flow %s", st.plan.graphics_family,
+             st.plan.graphics_index, st.plan.compute_family, st.plan.compute_index,
+             st.plan.native_of ? "native (VK_NV_optical_flow)" : st.extra_of ? "interop (no VK_NV_optical_flow)" : "none");
+    return st.queues;
+}
+
+void dlss_check_features(const VkPhysicalDeviceVulkan12Features& f12, const VkPhysicalDeviceVulkan13Features& f13) {
+    if (!st.started) return;
+    // (each name alone through Streamline's own table, sl_helpers_vk.h, against the same field of what the device is made with)
+    const auto check = [](const std::vector<std::string>& names, const auto& have, auto make, const VkBool32* have_first,
+                          size_t count, const char* which) {
+        (void)have;
+        for (const std::string& n : names) {
+            const char* name = n.c_str();
+            const auto want = make(1u, &name);
+            const VkBool32* w = reinterpret_cast<const VkBool32*>(reinterpret_cast<const char*>(&want) +
+                                                                  (reinterpret_cast<const char*>(have_first) -
+                                                                   reinterpret_cast<const char*>(&have)));
+            bool known = false, ok = true;
+            for (size_t i = 0; i < count; i++)
+                if (w[i]) known = true, ok = ok && have_first[i];
+            if (!known) logf("vk: dlss: Streamline asked for Vulkan %s feature %s, not one this build knows", which, name);
+            else if (!ok) logf("vk: dlss: the GPU lacks Vulkan %s feature %s, which Streamline asked for", which, name);
+        }
+    };
+    const size_t n12 = (sizeof(VkPhysicalDeviceVulkan12Features) - offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge)) /
+                       sizeof(VkBool32);
+    const size_t n13 = (sizeof(VkPhysicalDeviceVulkan13Features) - offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess)) /
+                       sizeof(VkBool32);
+    check(st.feat12, f12, sl::getVkPhysicalDeviceVulkan12Features, &f12.samplerMirrorClampToEdge, n12, "1.2");
+    check(st.feat13, f13, sl::getVkPhysicalDeviceVulkan13Features, &f13.robustImageAccess, n13, "1.3");
+}
+
 void dlss_attach(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queue_family) {
     if (!st.started || st.attached) return;
     sl::VulkanInfo info{};
     info.device = device;
     info.instance = instance;
     info.physicalDevice = physical;
-    info.computeQueueFamily = info.graphicsQueueFamily = queue_family;   // (one family for both, as Hookshot's queue)
+    info.computeQueueFamily = info.graphicsQueueFamily = queue_family;   // (one family for both, as Hookshot's queue, index 0)
+    if (st.planned) {   // (where vk_main.cpp made Streamline's own queues: ManualHooking guide 5.2.2)
+        info.graphicsQueueFamily = st.plan.graphics_family, info.graphicsQueueIndex = st.plan.graphics_index;
+        info.computeQueueFamily = st.plan.compute_family, info.computeQueueIndex = st.plan.compute_index;
+        if (st.plan.native_of) {
+            info.opticalFlowQueueFamily = st.plan.of_family, info.opticalFlowQueueIndex = 0;
+            info.useNativeOpticalFlowMode = true;
+        }
+    }
     sl::Result r = st.set_vulkan_info(info);
     if (r != sl::Result::eOk) {
         logf("vk: dlss: slSetVulkanInfo failed (result %d)", (int)r);
@@ -418,6 +787,7 @@ void dlss_attach(VkInstance instance, VkPhysicalDevice physical, VkDevice device
     void* get_optimal = nullptr;   // (the menu's DLSS mode labels and render sizes; standard ratios without it)
     if (st.get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", get_optimal) == sl::Result::eOk)
         st.get_optimal = reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(get_optimal);
+    fg_attach(physical);
     // manual hooking: Streamline does its per-frame work in these. RX_DLSS_NO_HOOKS=1: not routed (does DLSS-SR need them?)
     if (env_int("RX_DLSS_NO_HOOKS", 0) != 1) {
 #define DLSS_HOOK(f)                                                                                  \
@@ -425,8 +795,14 @@ void dlss_attach(VkInstance instance, VkPhysicalDevice physical, VkDevice device
         if (FARPROC p = GetProcAddress(st.module, #f)) vkx::f = reinterpret_cast<PFN_##f>(p);         \
         else logf("vk: dlss: sl.interposer.dll has no %s", #f);
         DLSS_HOOKED(DLSS_HOOK)
+        if (st.fg_ok) {   // (before the window's surface is made: vk_main.cpp start)
+            DLSSG_HOOKED(DLSS_HOOK)
+            st.surface_hooked = true;
+        }
 #undef DLSS_HOOK
         st.hooked = true;
+    } else if (st.fg_ok) {
+        fg_off("RX_DLSS_NO_HOOKS: the present is not Streamline's");
     }
     st.attached = true;
     st.reason = "";
@@ -467,16 +843,19 @@ const char* dlss_reason() {
 
 void dlss_stop() {
     if (!st.started) return;
-    if (st.attached) st.free_resources(sl::kFeatureDLSS, sl::ViewportHandle{0u});
+    if (st.attached) {
+        st.free_resources(sl::kFeatureDLSS, sl::ViewportHandle{0u});
+        if (st.fg_ok) st.free_resources(sl::kFeatureDLSS_G, sl::ViewportHandle{0u});
+    }
     unhook();
     const sl::Result r = st.shutdown();
-    st.started = st.attached = false;
+    st.started = st.attached = st.fg_ok = false;
     if (!st.failed) st.reason = "stopped";
     logf("vk: dlss: stopped (result %d)", (int)r);
 }
 
 bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage& depth, const DlssImage& motion,
-                   const DlssImage& output, bool reset, uint32_t frame_index) {
+                   const DlssImage& output, bool reset, uint32_t frame, const DlssView& view) {
     if (!dlss_available()) return false;
     const sl::DLSSPreset preset = preset_now();   // (the menu's row: a change applies at once, history reset)
     static const char* const mode_names[] = {"off", "Performance", "Balanced", "Quality", "Ultra Performance", "Ultra Quality", "DLAA"};
@@ -510,8 +889,19 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
         else st.options_set = true, st.preset = preset, st.rw = color.width, st.rh = color.height, st.ow = output.width,
              st.oh = output.height;
     }
-    sl::FrameToken* frame = nullptr;
-    if (!stage && ((r = st.get_new_frame_token(frame, &frame_index)) != sl::Result::eOk || !frame)) stage = "slGetNewFrameToken";
+    // the frame's constants, once a frame (DLSS-G reads the same; the guide: never twice in a frame). Generation's history is reset
+    // with DLSS's, and after a frame it did not have (dlssg_logic.h reset_history)
+    const bool fg_on = dlssg_engaged();   // (the row Off: no tags, no copies; turned on again, the first frame resets)
+    const bool fg_reset = fg_on && (dlssg::reset_history(reset, frame, fr.last_tagged) || fr.tag_w != color.width ||
+                                    fr.tag_h != color.height);
+    sl::FrameToken* t = nullptr;
+    if (!stage && !(t = token(frame))) r = sl::Result::eErrorInvalidParameter, stage = "slGetNewFrameToken";
+    if (!stage && fr.constants_frame.load() != frame) {
+        const sl::Constants c = frame_constants(&view, reset || fg_reset, (float)color.width, (float)color.height);
+        if ((r = st.set_constants(c, *t, viewport)) != sl::Result::eOk) stage = "slSetConstants";
+        else fr.constants_frame = frame;
+    }
+    if (!stage && !(t = token(frame))) r = sl::Result::eErrorInvalidParameter, stage = "slGetNewFrameToken";
     if (!stage) {
         constexpr VkImageUsageFlags out_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -523,47 +913,45 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
                        barrier(depth, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R),
                        barrier(motion, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT, G, R),
                        barrier(output, any, dlss_out, G, G)});
-
-        // DLSS-SR reads only the jitter, motion and depth conventions; the camera fields are frame generation's
-        const float rw = (float)color.width, rh = (float)color.height;
-        sl::Constants c{};
-        c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity();
-        c.jitterOffset = {0.0f, 0.0f};
-        c.mvecScale = {1.0f / rw, 1.0f / rh};   // (motion in render pixels; Streamline wants [-1,1] screen units)
-        c.cameraPinholeOffset = {0.0f, 0.0f};
-        c.cameraPos = {0.0f, 0.0f, 0.0f};
-        c.cameraUp = {0.0f, 1.0f, 0.0f};
-        c.cameraRight = {1.0f, 0.0f, 0.0f};
-        c.cameraFwd = {0.0f, 0.0f, 1.0f};
-        c.cameraNear = 0.1f, c.cameraFar = 1000.0f, c.cameraFOV = 1.0f, c.cameraAspectRatio = rw / rh;
-        c.depthInverted = sl::Boolean::eFalse;
-        c.cameraMotionIncluded = sl::Boolean::eTrue;
-        c.motionVectors3D = sl::Boolean::eFalse;
-        c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
-        c.motionVectorsJittered = sl::Boolean::eFalse;
-        if ((r = st.set_constants(c, *frame, viewport)) != sl::Result::eOk) {
-            stage = "slSetConstants";
-        } else {
-            sl::Resource rc = resource(color, R, VK_IMAGE_USAGE_SAMPLED_BIT), rd = resource(depth, R, VK_IMAGE_USAGE_SAMPLED_BIT),
-                         rm = resource(motion, R, VK_IMAGE_USAGE_SAMPLED_BIT), ro = resource(output, G, out_usage);
-            const sl::Extent render_area{0, 0, color.width, color.height}, output_area{0, 0, output.width, output.height};
-            // local tags: everything stays put until the evaluation is recorded
-            sl::ResourceTag tc{&rc, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
-                            td{&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
-                            tm{&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
-                            to{&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
-            const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to};
-            r = st.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, (uint32_t)std::size(inputs),
-                                    reinterpret_cast<sl::CommandBuffer*>(cmd));
-            if (!dlss_drawn(r)) {
-                stage = "slEvaluateFeature";
-            } else if (r == sl::Result::eWarnOutOfVRAM && st.over_budget++ % 600 == 0) {   // (drawn: a warning only)
-                logf("vk: dlss: drawn over the VRAM budget (Streamline's eWarnOutOfVRAM, %u frames so far)", st.over_budget);
-            }
+        sl::Resource rc = resource(color, R, VK_IMAGE_USAGE_SAMPLED_BIT), rd = resource(depth, R, VK_IMAGE_USAGE_SAMPLED_BIT),
+                     rm = resource(motion, R, VK_IMAGE_USAGE_SAMPLED_BIT), ro = resource(output, G, out_usage);
+        const sl::Extent render_area{0, 0, color.width, color.height}, output_area{0, 0, output.width, output.height};
+        // local tags: everything stays put until the evaluation is recorded
+        sl::ResourceTag tc{&rc, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
+                        td{&rd, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
+                        tm{&rm, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &render_area},
+                        to{&ro, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
+        const sl::BaseStructure* inputs[] = {&viewport, &tc, &td, &tm, &to};
+        r = st.evaluate_feature(sl::kFeatureDLSS, *t, inputs, (uint32_t)std::size(inputs), reinterpret_cast<sl::CommandBuffer*>(cmd));
+        if (!dlss_drawn(r)) {
+            stage = "slEvaluateFeature";
+        } else if (r == sl::Result::eWarnOutOfVRAM && st.over_budget++ % 600 == 0) {   // (drawn: a warning only)
+            logf("vk: dlss: drawn over the VRAM budget (Streamline's eWarnOutOfVRAM, %u frames so far)", st.over_budget);
         }
         // back to GENERAL, the output written (also when the evaluation failed: the caller's layouts hold)
         barriers(cmd, {barrier(color, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(depth, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
                        barrier(motion, VK_ACCESS_2_SHADER_READ_BIT, any, R, G), barrier(output, dlss_out, any, G, G)});
+        // (DLSS-G) the same depth and motion for frame generation at the present, in GENERAL here. Copied by Streamline as they are
+        // now (eOnlyValidNow): the game's depth target is drawn into again before the present, and next frame's motion pass
+        // rewrites ours. RX_DLSSG_TAGS=present: tagged valid until the present instead (no copies)
+        if (!stage && fg_on) {
+            constexpr VkImageUsageFlags depth_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+            constexpr VkImageUsageFlags motion_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            sl::Resource gd = resource(depth, G, depth.usage ? depth.usage : depth_usage),
+                         gm = resource(motion, G, motion.usage ? motion.usage : motion_usage);
+            const sl::ResourceTag tags[] = {sl::ResourceTag{&gd, sl::kBufferTypeDepth, st.tag_life, &render_area},
+                                            sl::ResourceTag{&gm, sl::kBufferTypeMotionVectors, st.tag_life, &render_area}};
+            sl::FrameToken* ft = token(frame);
+            const sl::Result tr = ft ? st.set_tag(*ft, viewport, tags, 2, reinterpret_cast<sl::CommandBuffer*>(cmd))
+                                     : sl::Result::eErrorInvalidParameter;
+            if (tr == sl::Result::eOk) {
+                fr.tagged_frame = frame, fr.last_tagged = frame, fr.tag_w = color.width, fr.tag_h = color.height;
+            } else {
+                static int told;
+                if (told++ < 8) logf("vk: dlssg: frame %u: slSetTagForFrame failed (result %d): no generation for it", frame, (int)tr);
+            }
+        }
     }
     if (stage) {
         st.failed = true;
@@ -574,6 +962,140 @@ bool dlss_evaluate(VkCommandBuffer cmd, const DlssImage& color, const DlssImage&
     return true;
 }
 
+// ---- DLSS Frame Generation ----
+
+bool dlssg_requested() { return st.fg_asked; }
+bool dlssg_available() { return st.fg_ok && dlss_available(); }
+const char* dlssg_reason() { return st.fg_ok && !dlss_available() ? "DLSS is off" : st.fg_reason; }
+uint32_t dlssg_max_multiplier() { return st.fg_max ? st.fg_max + 1 : 0; }
+bool dlssg_engaged() { return dlssg_available() && opts.dlssg >= 2; }
+bool dlssg_generating() { return fr.generating.load(std::memory_order_relaxed); }
+uint32_t dlss_frame_id() { return dlssg::frame_of(fr.replay_presents.load(std::memory_order_relaxed)); }
+void dlss_note_present(uint64_t presents) { fr.replay_presents.store(presents, std::memory_order_relaxed); }
+void dlssg_game_present() { fr.game_presents.fetch_add(1, std::memory_order_relaxed); }
+
+void dlssg_frame_start() {
+    if (!st.fg_ok || !st.marker) return;
+    const uint32_t f = dlssg::frame_of(fr.game_presents.load(std::memory_order_relaxed));
+    if (!fr.starter.begin(f)) return;
+    // Reflex holds the frame's start until the time the driver computes from the measured render and queue times, so that the game's
+    // CPU work ends about when the GPU is free for it (NX2navi: without this sleep DLSS-G halved the game's frame rate). The game's
+    // simulation and its recording are one span here (its threads cannot be told apart): its markers at the start, the render submit
+    // until the present sends the frame's work (dlssg_present_begin)
+    if (st.reflex_sleep && st.reflex_applied > 0 && dlssg::hold(now_ns(), fr.last_present_ns.load(), kHoldIdleNs))
+        if (sl::FrameToken* t = token(f)) st.reflex_sleep(*t);
+    mark(sl::PCLMarker::eSimulationStart, f);
+    mark(sl::PCLMarker::eSimulationEnd, f);
+    mark(sl::PCLMarker::eRenderSubmitStart, f);
+}
+
+bool dlss_defer_swapchain() {
+    if (!st.fg_ok) return false;
+    const bool wait = fr.gate.defer(fr.generating.load(), kSettle);
+    static int told;   // (a window dragged to a new size resizes every frame: the first few only)
+    if (wait && told++ < 10) logf("vk: dlssg: the swapchain is made again after this present, which turns generation off");
+    return wait;
+}
+
+void dlss_swapchain_created() {
+    if (!st.fg_ok) return;
+    fr.gate.changed(kSettle);
+    apply_reflex(true);
+    sl::DLSSGState s{};
+    if (!st.fg_max && fg_state(s) && s.numFramesToGenerateMax) st.fg_max = s.numFramesToGenerateMax;
+    announce();
+}
+
+void dlssg_present_begin(uint32_t frame, bool image, int x, int y, uint32_t w, uint32_t h, uint32_t sw, uint32_t sh) {
+    if (!st.fg_ok) return;
+    const sl::ViewportHandle viewport{0u};
+    if (!frame) {   // (the built-in interpolation presents: the row was turned Off at run time, so DLSS-G goes off, its memory freed)
+        if (fr.applied_valid && fr.applied.on) {
+            const dlssg::Mode m = dlssg::mode_for(dlssg::OFF_USER, opts.dlssg, st.fg_max);
+            sl::DLSSGOptions o{};
+            o.mode = sl::DLSSGMode::eOff;
+            o.numFramesToGenerate = m.frames;
+            if (st.fg_options(viewport, o) == sl::Result::eOk) fr.applied = m;
+            logf("vk: dlssg: generation off (the built-in frame generation presents)");
+        }
+        fr.generating = false;
+        return;
+    }
+    apply_reflex(false);   // (the row may have turned generation on or off: Reflex's mode follows)
+    dlssg::PresentState p;
+    p.available = dlssg_available() && st.fg_options;
+    p.multiplier = opts.dlssg;
+    p.minimized = app_window() && IsIconic(app_window());
+    p.swapchain_hold = fr.gate.hold;
+    p.status_hold = fr.status.hold;
+    p.menu_open = menu_is_open();
+    p.image = image;
+    p.tagged = fr.tagged_frame.load() == frame;
+    const int why = dlssg::decide(p);
+    fr.last_off = why;
+    // generation on or off for this present (slDLSSGSetOptions takes effect at the next present: this one, on this thread)
+    const dlssg::Mode m = dlssg::mode_for(why, opts.dlssg, st.fg_max);
+    if (!fr.applied_valid || !dlssg::same_mode(m, fr.applied)) {
+        sl::DLSSGOptions o{};
+        o.mode = m.on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        o.numFramesToGenerate = m.frames;
+        o.flags = m.retain ? sl::DLSSGFlags::eRetainResourcesWhenOff : sl::DLSSGFlags{};
+        const sl::Result r = st.fg_options(viewport, o);
+        if (fr.changes_logged++ < 40 || r != sl::Result::eOk)
+            logf("vk: dlssg: frame %u: generation %s (%s, %u generated%s; result %d)", frame, m.on ? "on" : "off", dlssg::off_name(why),
+                 m.on ? m.frames : 0u, m.retain ? "" : ", resources freed", (int)r);
+        if (r == sl::Result::eOk) fr.applied = m, fr.applied_valid = true;
+    }
+    fr.generating = fr.applied_valid && fr.applied.on;
+    // a frame DLSS did not draw: no depth and motion for it (null tags, as the guide asks while they are not valid) and neutral
+    // constants, so that every frame has its one set
+    sl::FrameToken* t = nullptr;
+    if (fr.tagged_frame.load() != frame && st.set_tag && (t = token(frame))) {
+        const sl::ResourceTag none[] = {sl::ResourceTag{nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
+                                        sl::ResourceTag{nullptr, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent}};
+        st.set_tag(*t, viewport, none, 2, nullptr);
+    }
+    if (fr.constants_frame.load() != frame && (t = token(frame))) {
+        const sl::Constants c = frame_constants(nullptr, true, (float)std::max(w, 1u), (float)std::max(h, 1u));
+        if (st.set_constants(c, *t, viewport) == sl::Result::eOk) fr.constants_frame = frame;
+    }
+    // the game's picture inside the window's image when it has bars: generation runs on that part only, the rest copied
+    if (m.on && (x || y || w != sw || h != sh) && w && h && (t = token(frame))) {
+        const sl::Extent part{(uint32_t)std::max(y, 0), (uint32_t)std::max(x, 0), w, h};   // (Extent: top, left, width, height)
+        const sl::ResourceTag bb[] = {sl::ResourceTag{nullptr, sl::kBufferTypeBackbuffer, sl::ResourceLifecycle::eValidUntilPresent, &part}};
+        st.set_tag(*t, viewport, bb, 1, nullptr);
+    }
+    mark(sl::PCLMarker::eRenderSubmitEnd, frame);
+    mark(sl::PCLMarker::ePresentStart, frame);   // (this frame's number is what DLSS-G looks its constants and tags up by)
+}
+
+void dlssg_present_end(uint32_t frame) {
+    if (!st.fg_ok || !frame) return;
+    mark(sl::PCLMarker::ePresentEnd, frame);
+    fr.last_present_ns = now_ns();
+    sl::DLSSGState s{};
+    const bool have = fg_state(s);
+    // asked after each present, numFramesActuallyPresented is what that present showed (2 with one generated frame)
+    const uint32_t shown = have ? s.numFramesActuallyPresented : 1;
+    if (have && s.numFramesToGenerateMax && s.numFramesToGenerateMax != st.fg_max) {
+        if (st.fg_announced) logf("vk: dlssg: max now %ux", s.numFramesToGenerateMax + 1);
+        st.fg_max = s.numFramesToGenerateMax;
+        announce();
+    }
+    if (fr.status.update(fr.generating.load(), have ? (uint32_t)s.status : 0u, kStatusRetry))
+        logf("vk: dlssg: frame %u: status %#x%s", frame, (unsigned)s.status,
+             (uint32_t)s.status ? ": generation off for 300 presents, then tried again (the reason is in Streamline's lines above)" : ": ok");
+    fr.gate.presented();
+    if (shown > 1) menu_note_extra_frames(shown - 1);
+    fr.stats.add(fr.last_off, shown, have ? (uint32_t)s.status : 0u);
+    if (fr.stats.presents >= kLogEvery) {
+        char line[512];
+        fr.stats.line(line, sizeof line, opts.dlssg);
+        logf("%s", line);
+        fr.stats.clear();
+    }
+}
+
 } // namespace mkwvk
 
 #else   // (Streamline is Windows only)
@@ -582,14 +1104,38 @@ namespace mkwvk {
 bool dlss_start() { return false; }
 const std::vector<const char*>& dlss_instance_exts() { static const std::vector<const char*> none; return none; }
 const std::vector<const char*>& dlss_device_exts() { static const std::vector<const char*> none; return none; }
+const DlssQueues& dlss_queues(VkPhysicalDevice, uint32_t host_family, const std::vector<VkQueueFamilyProperties>&, bool) {
+    static const float one = 1.0f;
+    static DlssQueues q;
+    q.infos.assign(1, VkDeviceQueueCreateInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO});
+    q.infos[0].queueFamilyIndex = host_family, q.infos[0].queueCount = 1, q.infos[0].pQueuePriorities = &one;
+    q.optical_flow = false;
+    return q;
+}
+void dlss_check_features(const VkPhysicalDeviceVulkan12Features&, const VkPhysicalDeviceVulkan13Features&) {}
 void dlss_attach(VkInstance, VkPhysicalDevice, VkDevice, uint32_t) {}
 bool dlss_available() { return false; }
 void dlss_render_size(int, uint32_t ow, uint32_t oh, uint32_t& w, uint32_t& h) { w = ow, h = oh; }
 const char* dlss_reason() { return "Windows only"; }
 void dlss_stop() {}
-bool dlss_evaluate(VkCommandBuffer, const DlssImage&, const DlssImage&, const DlssImage&, const DlssImage&, bool, uint32_t) {
+bool dlss_evaluate(VkCommandBuffer, const DlssImage&, const DlssImage&, const DlssImage&, const DlssImage&, bool, uint32_t,
+                   const DlssView&) {
     return false;
 }
+bool dlssg_requested() { return false; }
+bool dlssg_available() { return false; }
+const char* dlssg_reason() { return "Windows only"; }
+uint32_t dlssg_max_multiplier() { return 0; }
+bool dlssg_engaged() { return false; }
+bool dlssg_generating() { return false; }
+uint32_t dlss_frame_id() { return 1; }
+void dlss_note_present(uint64_t) {}
+void dlssg_game_present() {}
+void dlssg_frame_start() {}
+bool dlss_defer_swapchain() { return false; }
+void dlss_swapchain_created() {}
+void dlssg_present_begin(uint32_t, bool, int, int, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void dlssg_present_end(uint32_t) {}
 } // namespace mkwvk
 
 #endif

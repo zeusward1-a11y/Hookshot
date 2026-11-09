@@ -97,6 +97,10 @@ bool create_instance() {
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         for (const char* e : dlss_instance_exts())
             if (has_extension(all, e) && std::none_of(exts.begin(), exts.end(), [&](const char* x) { return !std::strcmp(x, e); })) exts.push_back(e);
+        // (DLSS-G: the guide's VK_EXT_debug_utils, so that Streamline's and NGX's resources and markers have names in Nsight)
+        if (dlssg_requested() && has_extension(all, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) &&
+            std::none_of(exts.begin(), exts.end(), [&](const char* x) { return !std::strcmp(x, VK_EXT_DEBUG_UTILS_EXTENSION_NAME); }))
+            exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     }
     const uint32_t n_exts = (uint32_t)exts.size();
 #else
@@ -251,11 +255,11 @@ bool create_device() {
             (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
             dev.queue_family = i;
     if (dev.queue_family == UINT32_MAX) return false;
-    const float priority = 1.0f;
-    VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    q.queueFamilyIndex = dev.queue_family;
-    q.queueCount = 1;
-    q.pQueuePriorities = &priority;
+    // (hookshot) Hookshot's queue, and the queues NVIDIA Streamline's features asked for (DLSS-G: graphics and compute queues of its
+    // own, an optical flow one with VK_NV_optical_flow), planned as Streamline's own vkCreateDevice would: vk_dlss.cpp dlss_queues
+    const DlssQueues& queues = dlss_queues(dev.physical, dev.queue_family, families, has_extension(exts, VK_NV_OPTICAL_FLOW_EXTENSION_NAME));
+    if (queues.optical_flow && std::none_of(want.begin(), want.end(), [](const char* x) { return !std::strcmp(x, VK_NV_OPTICAL_FLOW_EXTENSION_NAME); }))
+        want.push_back(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
 
     // features: what the hardware has of what the replay uses (all of them on the GPUs MKW-class hardware maps to)
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -290,7 +294,10 @@ bool create_device() {
     if (dev.view_2d_of_3d) *tail = &v2d3d, tail = &v2d3d.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};   // (DLSS-G's, native)
+    if (queues.optical_flow) *tail = &optical_flow, tail = &optical_flow.pNext;
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    dlss_check_features(f12, f13);   // (the Vulkan 1.2 and 1.3 features Streamline asked for: all the device has are on)
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
@@ -374,8 +381,8 @@ bool create_device() {
     dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
-    ci.queueCreateInfoCount = 1;
-    ci.pQueueCreateInfos = &q;
+    ci.queueCreateInfoCount = (uint32_t)queues.infos.size();
+    ci.pQueueCreateInfos = queues.infos.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
     if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
@@ -515,6 +522,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     vkGetSwapchainImagesKHR(dev.device, sc, &n, dev.swap_images.data());
     logf("vk: swapchain %ux%u, %u images, %s", width, height, n,
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
+    dlss_swapchain_created();   // (hookshot, DLSS-G: Reflex's mode is the swapchain's; generation waits a few presents)
     return true;
 }
 
@@ -723,3 +731,16 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
 namespace mkwvk {
 HWND app_window() { return main_window; }   // (hookshot: the Insert menu's Fullscreen row)
 } // namespace mkwvk
+
+// (hookshot, DLSS Frame Generation) The game's thread at its window acquire (host/nvn_native.c nvnWindowAcquireTexture, after its
+// own pacing): Reflex's sleep and the frame's first latency markers (vk_dlss.cpp dlssg_frame_start). A second export, looked up by
+// name (host/rx_backend.c), and not an entry of the renderer table: vk_api.h is one of the files the shader caches' stamp hashes
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void mkwvk_frame_start(void) {
+    mkwvk::dlssg_frame_start();
+}

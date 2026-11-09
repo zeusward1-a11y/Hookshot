@@ -17,6 +17,7 @@
 #include <thread>
 
 #include "vk_framegen.h"
+#include "vk_dlss.h"
 #include "vk_menu.h"
 #include "vk_texture.h"
 
@@ -344,7 +345,8 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    // (hookshot) NVIDIA DLSS Frame Generation makes the frames while its row is on: this interpolation stays off (vk_dlss.cpp)
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg_engaged();
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {

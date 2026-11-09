@@ -34,6 +34,8 @@ struct Options {
     int dlss = 0;         // the game's gameplay upscale through NVIDIA DLSS (vk_dlss.cpp); read once, at the start (RX_DLSS=0/1 over it)
     int dlss_mode = 3;    // the render size with DLSS on: 0 Ultra Performance .. 3 Quality, 4 DLAA (dlss_render_size)
     int dlss_preset = 3;  // DLSS's model: 0 J, 1 K, 2 L, 3 M; applies at once (RX_DLSS_PRESET=J..M over it)
+    int dlssg = 0;        // NVIDIA DLSS Frame Generation: 0 off, or 2, 3, 4 times the game's frames (vk_dlss.cpp; RX_DLSSG=0|2|3|4 over it).
+                          // Loaded with DLSS at the start when not Off then; 2x to 4x change at once
 };
 extern Options opts;
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
@@ -54,6 +56,7 @@ int menu_player_flight();
 int menu_free_camera();
 int menu_take_cheat_action();
 void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
+void menu_note_extra_frames(uint32_t n);   // (frames DLSS Frame Generation showed beyond the game's: vk_dlss.cpp)
 /// Over the window's image (TRANSFER_DST_OPTIMAL), w x h: the menu and the FPS counter. slot: the frame in flight, 0 to 2.
 void menu_record(VkCommandBuffer cmd, VkImage dst, int slot, uint32_t w, uint32_t h);
 

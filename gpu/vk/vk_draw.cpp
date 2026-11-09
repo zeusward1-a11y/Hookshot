@@ -6167,7 +6167,9 @@ bool dlss_take_colour(VkCommandBuffer cmd, const Program& p, bool encode) {
         return dlss_fallback("no scene depth at the camera's size"), false;
     if (!dlss_pipelines()) return dlss_fallback("no pipelines"), false;
     if (!dlss_image(ds.color, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd) ||
-        !dlss_image(ds.motion, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, cmd))
+        // (TRANSFER_SRC: DLSS Frame Generation's tag of it is copied by Streamline when it is made, vk_dlss.cpp)
+        !dlss_image(ds.motion, ds.cam.w, ds.cam.h, VK_FORMAT_R16G16_SFLOAT,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, cmd))
         return dlss_fallback("images not made"), false;
     int32_t push[16] = {encode ? 1 : 0};
     gprof_begin(cmd);
@@ -6244,10 +6246,16 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
             ds.resets = ds.cuts = 0;
         }
         const DlssImage color{ds.color.image, ds.color.view, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT};
-        const DlssImage depth{ds.used.depth->image, ds.used.depth_view, VK_FORMAT_D32_SFLOAT, rw, rh, VK_IMAGE_ASPECT_DEPTH_BIT};
-        const DlssImage motion{ds.motion.image, ds.motion.view, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT};
+        const DlssImage depth{ds.used.depth->image, ds.used.depth_view, VK_FORMAT_D32_SFLOAT, rw, rh, VK_IMAGE_ASPECT_DEPTH_BIT,
+                              ds.used.depth->usage};
+        const DlssImage motion{ds.motion.image, ds.motion.view, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_ASPECT_COLOR_BIT,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         const DlssImage output{ds.out.image, ds.out.view, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_ASPECT_COLOR_BIT};
-        ok = dlss_evaluate(cmd, color, depth, motion, output, reset, ds.evals++);
+        // (the frame's camera for the constants DLSS and DLSS Frame Generation share; the frame numbered by the game's presents)
+        DlssView view;
+        view.view_projection = ds.used.cur.data(), view.clip_to_previous = clip.data();
+        ok = dlss_evaluate(cmd, color, depth, motion, output, reset, dlss_frame_id(), view);
+        ds.evals++;
         if (ok) {
             if (ds.reason || ds.last_frame == ~0ull)
                 logf("vk: dlss: DLSS draws the upscale from frame %llu (%ux%u -> %ux%u)", (unsigned long long)now, rw, rh, ow, oh);
