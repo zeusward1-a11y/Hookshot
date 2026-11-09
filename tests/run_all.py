@@ -29,6 +29,7 @@ ARGS = {
     "tests/test_frame_wait_bounds.py": ["--cxx", "{cxx}"],
     "tests/test_mesh_args_cleanup.py": ["--cxx", "{cxx}"],
     "tests/test_fallback_buffer_cleanup.py": ["--cxx", "{cxx}"],
+    "tests/test_direct_buffer_writes.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
     "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
