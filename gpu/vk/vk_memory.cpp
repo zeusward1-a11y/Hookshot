@@ -26,6 +26,7 @@
 #include <windows.h>
 
 #include "vk_internal.h"
+#include "common/container_hash.h"   // (Common::FastHash)
 #include "vk_texture.h"   // (upload_command_buffer)
 #include "vk_gprof.h"      // (RX_VK_PASS_TIMING)
 #include "import_hold.h"
@@ -1185,7 +1186,9 @@ void memory_drop_shadow(uint64_t guest, uint64_t size) {
 // from a mirror, and small bindings written in place). RX_VK_NO_READBACK_WAIT=1: none
 namespace {
 std::mutex wb_pages_mu;
-std::unordered_map<uint32_t, uint64_t> wb_pages;
+// (hookshot) by the page number itself (Common::FastHash): std::hash is a byte-wise FNV-1a on MSVC, which scatters the run of pages a
+// note writes over the whole bucket array; as they are, neighbouring pages take neighbouring buckets (~40% less a page in an R-stub)
+std::unordered_map<uint32_t, uint64_t, Common::FastHash<uint32_t>> wb_pages;
 uint64_t wb_pruned_at = 0;
 void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
     static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
