@@ -25,7 +25,11 @@ layout(location = 0) in vec4 before;
 layout(location = 0) out vec2 motion;
 
 void main() {
-    const uint scene = floatBitsToUint(texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r);
+    const float depth = texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r;
+    // (the sky and the far plane keep the camera's motion, as the motion pass gives them (dlss_motion.comp SKY_DEPTH): the
+    // captured motion's sky draws lit the whole sky's reprojection error, 09/11)
+    if (depth >= 0.99999) discard;
+    const uint scene = floatBitsToUint(depth);
     const uint here = floatBitsToUint(gl_FragCoord.z);
     if (max(scene, here) - min(scene, here) > pc.tolerance || before.w <= 1e-6) discard;
     const vec2 size = vec2(uintBitsToFloat(data.w[34]), uintBitsToFloat(data.w[35]));

@@ -83,6 +83,9 @@ FILE* disk_idx = nullptr;
 std::mutex disk_mu;
 std::unordered_map<uint64_t, std::vector<DiskRecord>> disk_records;
 std::atomic<int64_t> st_cache_hits{0};
+bool keep_vertex = true;   // (DLSS's captured motion keeps the vertex stages' SPIR-V: RX_DLSS_CAPTURE=0 does not)
+bool capture_keeps_spirv() { return keep_vertex; }
+std::atomic<int64_t> capture_spirv_bytes{0};
 #include "cache_functions.inc"
 
 void save(uint64_t key, bool empty_second = false) {
@@ -113,6 +116,7 @@ int main(int argc, char** argv) {
     disk_in = disk_out = std::tmpfile();
     CHECK(disk_in);
     const std::string scenario = argv[1];
+    keep_vertex = scenario != "unkept";
     save(7, scenario == "empty");
     if (scenario == "first") fail_at = 1;
     if (scenario == "second" || scenario == "mixed") fail_at = 2;
@@ -123,14 +127,18 @@ int main(int argc, char** argv) {
     }
     std::vector<std::unique_ptr<Program>> programs;
     program_cache_load(7, programs);
-    unsigned accepted = scenario == "valid" || scenario == "mixed" ? 1 : 0;
+    unsigned accepted = scenario == "valid" || scenario == "mixed" || scenario == "unkept" ? 1 : 0;
     CHECK(programs.size() == accepted && st_cache_hits == accepted);
     std::printf("%s: created=%u destroyed=%u accepted_modules=%u\n", scenario.c_str(), created, releases, accepted * 2);
     CHECK(created - releases == accepted * 2);
     if (scenario == "first") CHECK(created == 0 && releases == 0);
     if (scenario == "second" || scenario == "empty") CHECK(created == 1 && releases == 1);
     if (scenario == "truncated") CHECK(created == 0 && releases == 0);
-    if (scenario == "valid") CHECK(created == 2 && releases == 0);
+    if (scenario == "valid" || scenario == "unkept") CHECK(created == 2 && releases == 0);
+    // (the vertex stage's SPIR-V kept with the program, and counted, only when the capture keeps it and the record is taken)
+    if (scenario == "valid") CHECK(programs[0]->vertex_spirv == std::vector<uint32_t>{0x07230203} && capture_spirv_bytes == 4);
+    if (scenario == "unkept") CHECK(programs[0]->vertex_spirv.empty() && capture_spirv_bytes == 0);
+    if (scenario == "second" || scenario == "empty" || scenario == "first" || scenario == "truncated") CHECK(capture_spirv_bytes == 0);
     if (scenario == "mixed") {
         CHECK(created == 3 && releases == 1);
         program_cache_load(9, programs);

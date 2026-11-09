@@ -136,6 +136,17 @@ inline void head(const float cur[16], const float prev[16], float ux, float uy, 
     out[32] = 2.0f * ux / (float)w, out[33] = -2.0f * uy / (float)h, out[34] = (float)w, out[35] = (float)h;
 }
 
+/// The captured motion pass's head (shaders/dlss_capture.vert): head()'s 36 words, then the clip-to-previous-clip of the cameras
+/// (vk_draw.cpp clip_to_previous: row major, column vectors, NVN's clip) at 36, and at 52 the limit, in render pixels, of a
+/// triangle's motion of its own (where it was less where the camera's motion takes it): over it, a jump, left to the camera's
+constexpr uint32_t kCaptureHeadWords = 56;
+inline void capture_head(const float cur[16], const float prev[16], float ux, float uy, uint32_t w, uint32_t h, const float to_prev[16],
+                         float limit, float out[kCaptureHeadWords]) {
+    head(cur, prev, ux, uy, w, h, out);
+    for (int i = 0; i < 16; i++) out[36 + i] = to_prev[i];
+    out[52] = limit, out[53] = out[54] = out[55] = 0.0f;
+}
+
 /// RX_DLSS_ACTOR_TOL: depth steps (float ulps) from the scene's within which a pixel of a draw drawn again takes its motion; 64
 /// when unset, not a number or out of 0..65536
 inline uint32_t tolerance_of(const char* env) {
@@ -144,5 +155,60 @@ inline uint32_t tolerance_of(const char* env) {
     const long v = std::strtol(env, &end, 10);
     return end == env || *end || v < 0 || v > 65536 ? 64u : (uint32_t)v;
 }
+
+/// Captured motion (vk_draw.cpp dlss_capture_*: the game's vertex stage records its clip positions by transform feedback): where
+/// each captured draw's positions go in the captures buffer, two halves taking turns by frame, so a frame's go into one while the
+/// frame before's stay in the other for the motion pass. A draw's key: its model's (key(..., 0)) with which draw of that model it
+/// is in its frame (the n-th is matched with the n-th the frame before). Counted with a map: a frame has ~2000 such draws
+struct CaptureRing {
+    struct Entry {
+        uint64_t key = 0;
+        uint32_t at = 0, count = 0;   // (the first vertex, in the whole buffer; vertices)
+        uint64_t target = 0;          // (the depth image it was drawn into: the pass takes the scene's only)
+    };
+    uint32_t capacity = 0;            // (vertices a half)
+    uint64_t frame = ~0ull, before_frame = ~0ull;
+    int half = 0;
+    uint32_t used = 0;                // (vertices of this frame's half)
+    std::vector<Entry> now, before;
+    std::unordered_map<uint64_t, uint32_t> nths;       // (this frame's draws of each model so far)
+    std::unordered_map<uint64_t, size_t> before_at;     // (the frame before's draws by key: their index in before)
+    uint32_t most = 0;   // (the most draws of one model in a frame, since the caller last set it to 0: the log's)
+    /// The key of a draw of model (key(..., 0)) in frame f: the model and how many of its draws came before it this frame, mixed
+    /// into 64 bits (splitmix64's finalizer). No limit on that n-th: key()'s 8 bits of it gave every draw of a model past its
+    /// 255th one key, and each took the last one's frame before (a grass tuft drawn 900 times a frame; 09/11 review). Asked for
+    /// every draw of the scene that could be recorded, before the checks that leave one out for a while (its pipeline not made
+    /// yet), so the next ones keep their n-ths. A new frame turns the halves: the last frame's draws become the frame before's
+    uint64_t key_of(uint64_t model, uint64_t f) {
+        if (f != frame) {
+            before.swap(now);
+            now.clear();
+            before_frame = frame, frame = f, half ^= 1, used = 0;
+            nths.clear(), before_at.clear();
+            for (size_t i = 0; i < before.size(); i++) before_at[before[i].key] = i;
+        }
+        const uint32_t nth = nths[model]++;
+        most = std::max(most, nth + 1);
+        uint64_t z = model + 0x9e3779b97f4a7c15ull * ((uint64_t)nth + 1);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    }
+    /// Room for this frame's (f, the frame of the key) draw of key with count vertices: its first vertex in the whole buffer (at);
+    /// false when the half is full, the draw has none or the key is not of frame f
+    bool place(uint64_t key, uint32_t count, uint64_t f, uint32_t* at, uint64_t target = 0) {
+        if (f != frame || !count || count > capacity || used > capacity - count) return false;
+        *at = (uint32_t)half * capacity + used;
+        now.push_back({key, *at, count, target});
+        used += count;
+        return true;
+    }
+    /// The frame before's capture of a draw of this frame (f): when the halves hold that frame (f - 1) and it had as many vertices
+    const Entry* before_of(uint64_t key, uint32_t count, uint64_t f) const {
+        if (frame != f || before_frame + 1 != f) return nullptr;
+        const auto it = before_at.find(key);
+        return it == before_at.end() || before[it->second].count != count ? nullptr : &before[it->second];
+    }
+};
 
 } // namespace dlss_actor

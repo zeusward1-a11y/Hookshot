@@ -50,6 +50,7 @@
 #include "shaders/dlss_color_comp_spv.h"
 #include "shaders/dlss_actor_vert_spv.h"
 #include "shaders/dlss_actor_frag_spv.h"
+#include "shaders/dlss_capture_vert_spv.h"
 #include "shaders/dlss_output_comp_spv.h"
 #include "shaders/dlss_debug_comp_spv.h"
 #include "vk_dlss.h"
@@ -57,6 +58,7 @@
 #include "dlss_jitter.h"
 #include "dlss_actor.h"
 #include "dlss_actor_plan.h"
+#include "spirv_xfb.h"
 #include "vk_menu.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -758,6 +760,10 @@ struct Targets {
 struct PipeEntry {
     std::atomic<bool> ready{false};
     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};   // (a fast-linked one first, the worker's full build over it)
+    // (hookshot: DLSS's captured motion, dlss_capture_draw: this pipeline with its vertex stage recording the clip positions;
+    // 0 not asked, 1 on a worker, 2 made (or not: capture null))
+    std::atomic<int> capture_state{0};
+    std::atomic<VkPipeline> capture{VK_NULL_HANDLE};
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
@@ -874,7 +880,8 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
     return r;
 }
 #endif
-VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
+VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1,
+                          VkShaderModule vs_override = VK_NULL_HANDLE);   // (vs_override: DLSS's captured motion, dlss_capture_draw)
 thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
@@ -891,6 +898,7 @@ uint32_t target_write_mask(const Program& p, const NvnState& s, int i) {
     return (s.chmask.mask >> (4 * i)) & 0xF & (all || !written ? 0xFu : (uint32_t)written);
 }
 thread_local const Program* cur_program = nullptr;   // (the draw's, for its dynamic write masks)
+thread_local bool skin_noted = false;   // (hookshot: the draw is a skinned one DLSS's actor motion took: not captured too)
 /// (hookshot) What target_write_mask reads of a program, as one word: whether its fragment stage stores each output and which
 /// components it writes of it (6 bits each). Two programs with the same word make the same masks from the same state
 uint64_t program_wm_sig(const Program& p) {
@@ -1411,7 +1419,8 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 
 /// part: -1 the whole pipeline, or the graphics pipeline library it stands for: 0 vertex input, 1 pre-rasterization, 2 fragment
 /// shader, 3 fragment output
-VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part) {
+VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part,
+                          VkShaderModule vs_override) {
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
@@ -1423,7 +1432,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             continue;
         VkPipelineShaderStageCreateInfo si{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         si.stage = st.vk_stage;
-        si.module = st.module;
+        si.module = vs_override && st.vk_stage == VK_SHADER_STAGE_VERTEX_BIT ? vs_override : st.module;   // (the capture's vertex stage)
         si.pName = "main";
         pin_subgroup(si);
         stages.push_back(si);
@@ -5036,6 +5045,9 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
 }
 void dlss_note_camera(const NvnState& s, const Targets& at);   // (below, with the DLSS frame code)
 void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);   // (below: DLSS's actor motion)
+void dlss_capture_draw(VkCommandBuffer cmd, const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at, PipeEntry* pe,
+                       VkPrimitiveTopology topo);   // (below: DLSS's captured motion)
+void dlss_capture_left_out(const Targets& at, int why);   // (below: a scene draw the captured motion cannot record)
 void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);   // (below: RX_DLSS_TRACE)
 bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p);
 
@@ -5403,6 +5415,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (stats_query.cmd && gpu_dump_on) stats_query.state = &s, stats_query.prog = p.key;
     }
     if (d.mesh) {
+        dlss_capture_left_out(at, 0);   // (hookshot: transform feedback records no mesh pipeline's)
         if (p.fallback) {   // (hookshot: the generated vertex stage reads the records; one vertex a corner)
             if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);
             st_mesh++;
@@ -5563,6 +5576,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     const VkIndexType itype = d.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : d.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     if (d.indexed && d.itype == 0 && !dev.index_uint8) SKIP_HERE();
     if (d.prim == NVN_DRAW_PRIMITIVE_QUADS) {   // (quads as two triangles each: indices made in the stream)
+        dlss_capture_left_out(at, 2);   // (hookshot: not recorded by DLSS's captured motion)
         if (d.indirect || d.count < 4) SKIP_HERE();
         const uint32_t quads = (uint32_t)d.count / 4, unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         std::vector<uint32_t> src(d.indexed ? (size_t)quads * 4 : 0);
@@ -5592,6 +5606,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         return;
     }
     if (d.indirect) {
+        dlss_capture_left_out(at, 1);   // (hookshot: not recorded by DLSS's captured motion: its count is the GPU's)
         BufferRef args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 16), false);
         BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
         if (!args) SKIP_HERE();
@@ -5617,9 +5632,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+        dlss_capture_draw(cmd, s, p, d, at, pe, topo);   // (hookshot: DLSS's captured motion, after the game's draw)
     } else {
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
+        dlss_capture_draw(cmd, s, p, d, at, pe, topo);
     }
     st_draws++, pass().draws++;
 }
@@ -6670,6 +6687,7 @@ void dlss_note_camera(const NvnState& s, const Targets& at) {
 /// (and 5, RGBA8), the joints at 6 (and 7, RGBA16UI or RGBA8UI), the bone palette in the vertex stage's uniform buffer 6 (NVN's
 /// binding 3: 3 x 4 matrices, a whole number of them) and the object's origin in its buffer 4 (binding 1, at 0x40). After #841
 void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
+    skin_noted = false;
     if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth || at.width < 640 ||
         at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !actors_on() || !dlss_on() || parallel_replay() ||
         (ds.actor_tried && !ds.actor))   // (no pipeline on this device: nothing to note)
@@ -6716,13 +6734,14 @@ void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, con
     // (the same model drawn twice in a frame: the n-th draw of it is the n-th the frame before; this frame's list, dlss_actor_plan.h)
     if (sk.nbones && ds.skins.next_key(model, now, &sk.key)) {
         ds.skins.draws.push_back(std::move(sk));
+        skin_noted = true;
         ds.actor_noted++;
     }
     ds.actor_ns += (std::chrono::steady_clock::now() - t0).count();
 }
 
-/// (hookshot, after #841's 26a5247: a diagnostic for DLSS's motion) RX_DLSS_TRACE=<frames>: every that many frames, one frame's
-/// draws into targets at least 640 wide, logged: the program, its targets' formats, the geometry and the uniform buffers (which
+/// (hookshot, after #841's 26a5247: a diagnostic for DLSS's motion) RX_DLSS_TRACE=<frames>: every that many frames, two frames'
+/// draws in a row (what stays the same from one to the next: the captured motion's keys) into targets at least 640 wide, logged: the program, its targets' formats, the geometry and the uniform buffers (which
 /// draws are what: the skinned ones, the foliage the wind moves)
 void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     static const int every = getenv("RX_DLSS_TRACE") ? atoi(getenv("RX_DLSS_TRACE")) : 0;
@@ -6733,7 +6752,7 @@ void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, con
         return;
     }
     const uint64_t f = texture_frame_no();
-    if (f % (uint64_t)every != (uint64_t)every / 2) return;
+    if (f % (uint64_t)every != (uint64_t)every / 2 && f % (uint64_t)every != (uint64_t)every / 2 + 1) return;   // (two frames in a row)
     char line[3072];
     int n = snprintf(line, sizeof line, "vk: dlss-trace f%llu prog %016llx%s%s %ux%u prim %d c[", (unsigned long long)f,
                      (unsigned long long)p.key, d.mesh ? " mesh" : "", p.fallback ? "(fb)" : "", at.width, at.height, d.prim);
@@ -6761,6 +6780,306 @@ void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs& d, con
     }
     // (logf keeps 1023 characters a line: a long one goes in pieces, each after the first marked with +)
     for (int pos = 0; pos < n && pos < (int)sizeof line - 1; pos += 900) logf("%s%.900s", pos ? "vk: dlss-trace + " : "", line + pos);
+}
+
+/// (hookshot) DLSS's captured motion. OoT gives DLSS and frame generation the camera's motion only, and the actor pass gives the
+/// skinned draws theirs; what the vertex stage moves by itself (the wind in the field's grass, ~1900 draws a frame) or a rigid
+/// part that moves without bones (Link's shield) kept the camera's, and frame generation put it in the wrong place in every
+/// frame it made (the "jelly" of 09/11). Each draw into the scene's depth is drawn again right after the game's, with the same
+/// state and a variant of its pipeline whose vertex stage records its clip position by transform feedback (spirv_xfb.h), the
+/// rasterizer off. The frame before's records stay in the other half of the captures buffer (dlss_actor_plan.h CaptureRing);
+/// at the upscale dlss_capture_pass draws each draw's triangles again with this frame's positions and the frame before's
+/// (shaders/dlss_capture.vert), and dlss_actor.frag writes the motion where the depth is the scene's. The game's own shader
+/// computes both positions: nothing is guessed. RX_DLSS_CAPTURE=1: on. Off by default (and transform feedback not asked of the
+/// device, no vertex stage kept): the field's grass, ferns and trees are mesh draws (GPU-culled task and mesh stages), which
+/// transform feedback does not record, and what it does record moved no reprojection error measurably (09/11)
+namespace {
+constexpr uint32_t kCaptureVertices = 2500000;   // (a half of the captures buffer: the field draws ~1.6M scene vertices, 25 MB)
+struct CaptureState {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation memory = nullptr;
+    bool failed = false;
+    dlss_actor::CaptureRing ring;
+    VkDescriptorSetLayout set = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pass = VK_NULL_HANDLE;
+    bool pass_tried = false;
+    std::mutex modules_mu;   // (the patched vertex stages: made on the workers)
+    std::unordered_map<const Program*, VkShaderModule> modules;
+    std::atomic<int64_t> unpatched{0};
+    int64_t draws = 0, vertices = 0, waiting = 0, full = 0, passes = 0, pass_draws = 0, no_before = 0;
+    int64_t not_scene = 0, not_camera = 0, not_list = 0, no_pipeline = 0;   // (draws left out, and why)
+    int64_t mesh = 0, indirect = 0, quads = 0, no_stage = 0;   // (of the scene's: mesh, indirect and quad draws, no vertex stage)
+    int64_t other_target = 0;   // (records of a draw into another depth image than the one the pass is for: left out)
+    int64_t other_depth = 0;   // (of not_scene: the scene's size, another depth image)
+    const Texture* other = nullptr;   // (the last such image, its format and how many colour targets the draw had)
+    int other_format = 0, other_n = 0;
+    struct Block {
+        uint64_t addr;
+        bool scene;
+    } blocks[32];
+    int nblocks = 0;
+    uint64_t blocks_frame = ~0ull;
+};
+CaptureState cs;
+bool capture_on() {
+    static const bool on = getenv("RX_DLSS_CAPTURE") && std::strcmp(getenv("RX_DLSS_CAPTURE"), "0");
+    return on;
+}
+/// The draw's vertex constant buffer 3 is the scene camera's block (dlss_note_camera's checks: -1, 0 at +0xa8, the target's size
+/// at +0x120): its geometry is the world's, projected by the scene's camera. Full-screen passes into the scene (the sky over the
+/// field: its corners do not move, and their motion of zero over the camera's lit the reprojection error of the whole sky, 09/11)
+/// and the HUD have other blocks. The same test as the jitter's (dlss_jitter_of), cached a frame by the block's address
+bool capture_camera_draw(const NvnState& s, const Targets& at) {
+    const nvn_p_bind_buf& u = s.ubo[0][0];
+    if (!u.addr || (u.size && u.size < 0x128)) return false;
+    const uint64_t now = texture_frame_no();
+    if (cs.blocks_frame != now) cs.blocks_frame = now, cs.nblocks = 0;
+    for (int i = 0; i < cs.nblocks; i++)
+        if (cs.blocks[i].addr == u.addr) return cs.blocks[i].scene;
+    float ab[2], wh[2];
+    const bool scene = ub_read(u.addr + 0xa8, ab, sizeof ab) && ub_read(u.addr + 0x120, wh, sizeof wh) && ab[0] == -1.0f && ab[1] == 0.0f &&
+                       wh[0] == (float)at.width && wh[1] == (float)at.height;
+    if (cs.nblocks < 32) cs.blocks[cs.nblocks++] = {u.addr, scene};
+    return scene;
+}
+/// A program's vertex stage recording its clip position (made once, on a worker); null when it cannot be patched
+VkShaderModule capture_module(const Program& p) {
+    std::lock_guard lk(cs.modules_mu);
+    if (auto it = cs.modules.find(&p); it != cs.modules.end()) return it->second;
+    VkShaderModule m = VK_NULL_HANDLE;
+    std::vector<uint32_t> xfb;
+    std::string why;
+    if (spirv_xfb::patch(p.vertex_spirv, xfb, &why)) {
+        VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        ci.codeSize = xfb.size() * 4, ci.pCode = xfb.data();
+        if (vkCreateShaderModule(dev.device, &ci, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+    }
+    if (!m && cs.unpatched++ < 8)
+        logf("vk: dlss: captured motion: program %016llx's vertex stage not patched (%s)", (unsigned long long)p.key,
+             why.empty() ? "its module was not made" : why.c_str());
+    return cs.modules[&p] = m;
+}
+/// The motion pass's pipeline: shaders/dlss_capture.vert, dlss_actor.frag; the cameras' buffer, the scene's depth, the captures
+bool make_capture_pass() {
+    if (cs.pass) return true;
+    if (cs.pass_tried) return false;
+    cs.pass_tried = true;
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    li.bindingCount = 3, li.pBindings = b;
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &cs.set) != VK_SUCCESS) return false;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ActorPush)};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &cs.set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &cs.layout) != VK_SUCCESS) return false;
+    VkShaderModule m[2]{};
+    const uint32_t* code[2] = {DLSS_CAPTURE_VERT_SPV, DLSS_ACTOR_FRAG_SPV};
+    const size_t size[2] = {sizeof DLSS_CAPTURE_VERT_SPV, sizeof DLSS_ACTOR_FRAG_SPV};
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    for (int i = 0; i < 2; i++) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = size[i], mi.pCode = code[i];
+        vkCreateShaderModule(dev.device, &mi, nullptr, &m[i]);
+        stages[i] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+        stages[i].module = m[i], stages[i].pName = "main";
+    }
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL, rs.cullMode = VK_CULL_MODE_NONE, rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1, cb.pAttachments = &ba;
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dsi{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dsi.dynamicStateCount = 2, dsi.pDynamicStates = dyn;
+    const VkFormat format = VK_FORMAT_R16G16_SFLOAT;   // (ds.motion)
+    VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1, ri.pColorAttachmentFormats = &format;
+    VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri, gi.stageCount = 2, gi.pStages = stages;
+    gi.pVertexInputState = &vi, gi.pInputAssemblyState = &ia, gi.pViewportState = &vp, gi.pRasterizationState = &rs;
+    gi.pMultisampleState = &ms, gi.pColorBlendState = &cb, gi.pDynamicState = &dsi, gi.layout = cs.layout;
+    const bool ok = m[0] && m[1] && vkCreateGraphicsPipelines(dev.device, VK_NULL_HANDLE, 1, &gi, nullptr, &cs.pass) == VK_SUCCESS;
+    for (VkShaderModule x : m)
+        if (x) vkDestroyShaderModule(dev.device, x, nullptr);
+    if (!ok) cs.pass = VK_NULL_HANDLE, logf("vk: dlss: captured motion: its pass's pipeline was not made");
+    return ok;
+}
+
+/// RX_DLSS_CAPTURE_JUMP: the limit, in render pixels, of a triangle's motion of its own (shaders/dlss_capture.vert): 24
+float capture_jump() {
+    static const float v = getenv("RX_DLSS_CAPTURE_JUMP") ? std::max(1.0f, (float)atof(getenv("RX_DLSS_CAPTURE_JUMP"))) : 24.0f;
+    return v;
+}
+/// The captured draws of this frame with a record the frame before, drawn again into the motion over the camera's and the actors'.
+/// Returns the draws drawn
+int dlss_capture_pass(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint64_t now, const Mat& to_prev) {
+    if (!cs.buffer || cs.ring.frame != now || cs.ring.now.empty() || !make_capture_pass()) return 0;
+    std::vector<ActorPush> draws;
+    draws.reserve(cs.ring.now.size());
+    // (the records of draws into the depth image DLSS takes this frame: a smaller target the camera was noted on first, then
+    // left for a bigger one, has its draws' records too, of another size and viewport)
+    const uint64_t target = (uint64_t)(uintptr_t)ds.used.depth;
+    for (const auto& e : cs.ring.now) {
+        if (e.target != target) {
+            cs.other_target++;
+            continue;
+        }
+        const dlss_actor::CaptureRing::Entry* was = cs.ring.before_of(e.key, e.count, now);
+        if (!was || was->target != target) {
+            cs.no_before++;
+            continue;
+        }
+        ActorPush a{};
+        a.count = e.count, a.first = e.at, a.base_vertex = (int32_t)was->at, a.tolerance = actor_tolerance();
+        draws.push_back(a);
+    }
+    if (draws.empty()) return 0;
+    const uint64_t salign = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 16);
+    const uint64_t head_at = stream_alloc(dlss_actor::kCaptureHeadWords * 4, salign);
+    if (head_at == UINT64_MAX) return 0;
+    const bool jittered = ds.jit.used_frame == now;
+    const float ux = jittered ? ds.jit.ux : 0.0f, uy = jittered ? ds.jit.uy : 0.0f;
+    dlss_actor::capture_head(ds.used.cur.data(), ds.used.prev.data(), ux, uy, rw, rh, to_prev.data(), capture_jump(),
+                             (float*)(cur->mapped + head_at));
+    full_barrier(cmd);   // (the records written by transform feedback, read by the vertex stage)
+    VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = ds.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea = {{0, 0}, {rw, rh}}, ri.layerCount = 1, ri.colorAttachmentCount = 1, ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(cmd, &ri);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cs.pass);
+    // (the scene's viewport: negative height, the jitter's offset; the records are its clip positions as its draws wrote them)
+    const VkViewport viewport{ux, uy + (float)rh, (float)rw, -(float)rh, 0.0f, 1.0f};
+    const VkRect2D scissor{{0, 0}, {rw, rh}};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    const VkDescriptorBufferInfo bi{cur->stream, head_at, dlss_actor::kCaptureHeadWords * 4}, ci{cs.buffer, 0, VK_WHOLE_SIZE};
+    const VkDescriptorImageInfo ii{ds.nearest, ds.used.depth_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w[3]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                              {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w[0].pBufferInfo = &bi;
+    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[1].pImageInfo = &ii;
+    w[2].dstBinding = 2, w[2].descriptorCount = 1, w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w[2].pBufferInfo = &ci;
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cs.layout, 0, 3, w);
+    for (const ActorPush& a : draws) {
+        vkCmdPushConstants(cmd, cs.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof a, &a);
+        vkCmdDraw(cmd, a.count, 1, 0, 0);
+    }
+    vkCmdEndRendering(cmd);
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    cs.passes++, cs.pass_draws += (int64_t)draws.size();
+    return (int)draws.size();
+}
+} // namespace
+
+/// From draw(), right after the game's draw: the same draw again with its vertex stage recording where each vertex lands
+/// (transform feedback), the rasterizer off, for the motion pass. Only the scene's (its depth DLSS takes, its camera's block),
+/// triangle lists, not the skinned ones the actor pass draws, not with the parallel replay (the ring is the replay thread's).
+/// Its pipeline is made the first time on the thread that builds one at a time (jobs_push_serial: the workers stay the game's):
+/// until then the draw is not recorded
+void dlss_capture_draw(VkCommandBuffer cmd, const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at, PipeEntry* pe,
+                       VkPrimitiveTopology topo) {
+    // (p.mesh, p.fallback, d.indirect: draw() calls this after its direct draws only; a guard)
+    if (!capture_on() || !dev.xfb || cs.failed || skin_noted || !dlss_on() || parallel_replay() || p.mesh || p.fallback || d.indirect)
+        return;
+    const uint64_t now = texture_frame_no();
+    // (the scene's depth image, as the camera last found it: the same image every frame, and not "noted this frame", which the
+    // first draws of a frame come before. The game draws ~500 draws a frame into another depth image of the scene's size with
+    // one colour target: taken too, they gave whole objects motion that was not theirs in the motion view, and with the jumps'
+    // limit of dlss_capture.vert still a tree's, for 0.4 ms of the GPU and no less reprojection error (09/11): counted, left out)
+    if (!at.depth || at.depth != ds.cam.depth) {
+        if (at.depth && at.width == ds.cam.w && at.height == ds.cam.h)
+            cs.other_depth++, cs.other = at.depth, cs.other_format = (int)at.depth_format, cs.other_n = at.n;
+        return void(cs.not_scene++);
+    }
+    if (p.vertex_spirv.empty()) return void(cs.no_stage++);
+    // (its key before the checks that may leave it out: a draw left out for a while (its pipeline not made yet) still takes its
+    // n-th, so the next draws of its model keep theirs, and their frame before's)
+    const uint64_t key = cs.ring.key_of(dlss_actor::key(s.vbuf[0].address, d.indexed ? d.ibuf : 0, d.count,
+                                                        d.indexed ? d.base_vertex : d.first, p.key, 0), now);
+    if (topo != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST) return void(cs.not_list++);
+    if (!capture_camera_draw(s, at)) return void(cs.not_camera++);
+    // (whole triangles: transform feedback records only those of each instance, and the pass reads the records as triangles)
+    const uint32_t count = (uint32_t)(d.count - d.count % 3) * (uint32_t)std::max(1, d.instances);
+    if (!count) return;
+    int state = pe->capture_state.load(std::memory_order_acquire);
+    if (state != 2) {
+        if (state == 0 && pe->capture_state.compare_exchange_strong(state, 1)) {
+            struct Job {
+                PipeEntry* e;
+                const Program* p;
+                NvnState s;
+                Targets at;
+                VkPrimitiveTopology topo;
+            };
+            auto job = std::make_shared<Job>();
+            job->e = pe, job->p = &p, job->s = s, job->at = at, job->topo = topo;
+            jobs_push_serial([job] {
+                // (a build that throws is left without a pipeline, not waiting for ever: run_guarded only logs it)
+                struct Done {
+                    PipeEntry* e;
+                    ~Done() { e->capture_state.store(2, std::memory_order_release); }
+                } done{job->e};
+                const VkShaderModule m = capture_module(*job->p);
+                job->e->capture.store(m ? build_graphics(*job->p, job->s, job->at, job->topo, -1, m) : VK_NULL_HANDLE);
+            });
+        }
+        cs.waiting++;
+        return;
+    }
+    const VkPipeline cp = pe->capture.load(std::memory_order_acquire);
+    if (!cp) return void(cs.no_pipeline++);
+    if (!cs.buffer) {
+        if (!create_device_buffer((VkDeviceSize)kCaptureVertices * 2 * 16,
+                                  VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, cs.buffer, cs.memory)) {
+            cs.failed = true;
+            logf("vk: dlss: captured motion: its buffer (%u MB) was not made: off", (unsigned)(kCaptureVertices * 2 * 16 >> 20));
+            return;
+        }
+        cs.ring.capacity = kCaptureVertices;
+    }
+    uint32_t first = 0;
+    if (!cs.ring.place(key, count, now, &first, (uint64_t)(uintptr_t)at.depth)) {
+        cs.full++;
+        return;
+    }
+    vkCmdSetRasterizerDiscardEnable(cmd, VK_TRUE);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cp);
+    const VkDeviceSize off = (VkDeviceSize)first * 16, size = (VkDeviceSize)count * 16;
+    vkCmdBindTransformFeedbackBuffersEXT(cmd, 0, 1, &cs.buffer, &off, &size);
+    vkCmdBeginTransformFeedbackEXT(cmd, 0, 0, nullptr, nullptr);
+    if (d.indexed) vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+    else vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
+    vkCmdEndTransformFeedbackEXT(cmd, 0, 0, nullptr, nullptr);
+    // (the rasterizer back as the game's draw had it, so its dynamic state cache still holds; its pipeline bound again at its
+    // next draw. ~1900 of these a frame: setting all of its dynamic state again after each was a cost on the replay thread)
+    vkCmdSetRasterizerDiscardEnable(cmd, last_dyn_valid ? last_dyn.discard : VK_FALSE);   // (invalid: all set again at the next draw)
+    last_pipeline = VK_NULL_HANDLE;
+    cs.draws++, cs.vertices += count;
+}
+
+/// From draw(): a draw into the scene's depth the capture cannot record (why: 0 a mesh draw: transform feedback records no mesh
+/// pipeline's, and the field's grass, ferns and trees are these; 1 an indirect draw; 2 quads), counted for the log: how much of
+/// the scene keeps the camera's motion
+void dlss_capture_left_out(const Targets& at, int why) {
+    if (!capture_on() || !dev.xfb || !at.depth || at.depth != ds.cam.depth || parallel_replay()) return;
+    (why == 0 ? cs.mesh : why == 1 ? cs.indirect : cs.quads)++;
 }
 
 /// From dynamic_state, every draw: the viewport offset of DLSS's jitter (DlssJitter) when this draw is the scene camera's. False:
@@ -6891,6 +7210,8 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
         // (actor motion: the skinned draws of the scene drawn again over that motion, each with its own; DLSS's history needs
         // the frame before, whose poses the pass kept)
         if (dlss_actor_pass(cmd, rw, rh, now, ds.last_frame != ~0ull && ds.last_frame + 1 == now)) full_barrier(cmd);
+        // (captured motion: what the game's vertex stages moved, recorded at their draws, over the actors' and the camera's)
+        if (dlss_capture_pass(cmd, rw, rh, now, clip)) full_barrier(cmd);
         const bool reset = ds.last_frame == ~0ull || now != ds.last_frame + 1 || !same_camera;
         ds.resets += reset, ds.cuts += reset && !same_camera;
         if (dlss_debug() && ds.evals >= 1500 && ds.evals < 1512) {   // (the camera of 12 frames: a jitter would move [0][3]/[1][3] by ~1/w)
@@ -6908,6 +7229,25 @@ bool dlss_dispatch(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
                      (unsigned long long)ds.actor_draws, (unsigned long long)ds.actor_frames, (unsigned long long)ds.actor_noted,
                      (unsigned long long)ds.actor_not_lists, (unsigned long long)ds.actor_skipped, ds.actor_ns / 1e6 / 600);
             ds.actor_ns = 0;
+            if (capture_on() && dev.xfb)
+                logf("vk: dlss: captured motion: %lld draws recorded (%.0f k vertices a frame), %lld drawn again in %lld passes, %lld without "
+                     "a record before, %lld waiting for their pipeline, %lld without room; left out: %lld not the scene's target, %lld not "
+                     "its camera, %lld not triangle lists, %lld without a pipeline, %lld without their vertex stage, %lld of another "
+                     "target; not recordable, into the scene's depth: %lld mesh draws, %lld indirect, %lld quads; at most %u draws of "
+                     "one model in a frame; vertex stages kept %.1f MB",
+                     (long long)cs.draws, cs.vertices / 600.0 / 1000.0, (long long)cs.pass_draws, (long long)cs.passes,
+                     (long long)cs.no_before, (long long)cs.waiting, (long long)cs.full, (long long)cs.not_scene, (long long)cs.not_camera,
+                     (long long)cs.not_list, (long long)cs.no_pipeline, (long long)cs.no_stage, (long long)cs.other_target,
+                     (long long)cs.mesh, (long long)cs.indirect, (long long)cs.quads, cs.ring.most, capture_spirv_bytes.load() / 1048576.0);
+            if (capture_on() && dev.xfb && cs.other_depth)
+                logf("vk: dlss: captured motion: %lld of those not the scene's target had its size and another depth image (%p, format %d, "
+                     "%d colour targets; the scene's %p)", (long long)cs.other_depth, (const void*)cs.other, cs.other_format, cs.other_n,
+                     (const void*)ds.cam.depth);
+            cs.other_depth = 0;
+            cs.draws = cs.vertices = cs.pass_draws = cs.passes = cs.no_before = cs.waiting = cs.full = 0;
+            cs.not_scene = cs.not_camera = cs.not_list = cs.no_pipeline = cs.mesh = cs.indirect = cs.quads = cs.no_stage = 0;
+            cs.other_target = 0;
+            cs.ring.most = 0;
             ds.resets = ds.cuts = 0;
             objmv_log();
         }

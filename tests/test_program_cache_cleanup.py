@@ -87,6 +87,9 @@ class CacheModuleCleanupTests(unittest.TestCase):
     def test_independent_records_continue(self):
         self.run_case('mixed')
 
+    def test_vertex_stage_not_kept_without_the_capture(self):
+        self.run_case('unkept')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)

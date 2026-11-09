@@ -128,7 +128,7 @@ def main():
     # (a GPU with mesh shaders: the task and mesh stages are the graphics pipeline's own. Left out of a native mesh program,
     # its pipeline was its fragment stage alone, drew none of the grass, leaves or terrain and then lost the device)
     graphics = block(draw, "VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, "
-                           "VkPrimitiveTopology topo, int part) {")
+                           "VkPrimitiveTopology topo, int part,")
     if "if (p.fallback && (st.vk_stage & (VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_TASK_BIT_EXT |" \
             not in graphics:
         raise SystemExit("build_graphics leaves out the task and mesh stages of native mesh programs too")

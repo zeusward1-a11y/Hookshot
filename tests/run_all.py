@@ -51,6 +51,7 @@ ARGS = {
     "tests/test_dlss_objmv_gpu.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
     "tests/test_dlss_actor.py": ["--cxx", "{cxx}"],
     "tests/test_dlss_actor_gpu.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
+    "tests/test_dlss_capture_gpu.py": ["--cxx", "clang++", "--headers", "{vulkan_headers}"],
     "tests/test_imnmx_immediate.py": ["--cxx", "clang++"],
     "tests/test_text_speed.py": ["--cc", "gcc"],
     "tests/test_fps_cap.py": ["--cc", "gcc"],
@@ -109,6 +110,7 @@ SKIP = {
     "nx2/test_bc_storage_views.py": ({"linux", "windows"}, "needs a Windows Vulkan device"),
     "tests/test_dlss_objmv_gpu.py": ({"linux", "windows"}, "needs a Vulkan device (run it by name)"),
     "tests/test_dlss_actor_gpu.py": ({"linux", "windows"}, "needs a Vulkan device (run it by name)"),
+    "tests/test_dlss_capture_gpu.py": ({"linux", "windows"}, "needs a Vulkan device (run it by name)"),
     # (Linux only)
     "tests/test_hookshot_launch.py": ({"windows"}, "the Linux launcher, a POSIX shell script"),
     "tests/test_linux_update.py": ({"windows"}, "the Linux builder's update and folder launcher, POSIX files and shell scripts"),

@@ -2,6 +2,7 @@
 // (the review of 09/11: a list left by a fallback shifted the n-ths and gave a draw another one's pose), the two pose buffers taking
 // turns, when the frame before's pose is taken, the push constants, the cameras' buffer, RX_DLSS_ACTOR_TOL. Built and run by
 // tests/test_dlss_actor.py.
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -149,16 +150,84 @@ static void heads() {
     CHECK(out[32] == 2.0f * 0.25f / 1920 && out[33] == -2.0f * -0.4f / 1080 && out[34] == 1920 && out[35] == 1080);
 }
 
+static void capture_heads() {
+    float cur[16], prev[16], c2p[16], out[kCaptureHeadWords], base[kHeadWords];
+    for (int i = 0; i < 16; i++) cur[i] = (float)i, prev[i] = 50.0f + i, c2p[i] = -1.0f - i;
+    capture_head(cur, prev, 0.3f, -0.2f, 1920, 1080, c2p, 24.0f, out);
+    head(cur, prev, 0.3f, -0.2f, 1920, 1080, base);
+    CHECK(!std::memcmp(out, base, sizeof base));   // (dlss_actor.frag's 36 words, as the actor pass's)
+    CHECK(!std::memcmp(out + 36, c2p, 64) && out[52] == 24.0f);
+}
+
 static void tolerances() {
     CHECK(tolerance_of(nullptr) == 64 && tolerance_of("") == 64 && tolerance_of("16") == 16 && tolerance_of("0") == 0);
     CHECK(tolerance_of("-5") == 64 && tolerance_of("abc") == 64 && tolerance_of("12x") == 64 && tolerance_of("70000") == 64);
 }
 
+static void captures() {
+    CaptureRing r;
+    r.capacity = 100;
+    const uint64_t a = key(0x1000, 0x2000, 30, 0, 9, 0), b = key(0x3000, 0x4000, 12, 0, 9, 0);
+    uint32_t at = 0;
+    // frame 1: a twice, b once, in the first half they are given (frame 1 turns the halves from the start: half 1)
+    const uint64_t a0 = r.key_of(a, 1), b0 = r.key_of(b, 1), a1 = r.key_of(a, 1), a2 = r.key_of(a, 1);
+    CHECK(a0 != a1 && a1 != a2 && a0 != a2 && a0 != b0);   // (each draw its own key)
+    CHECK(r.place(a0, 30, 1, &at, 0xd00) && at == 100 && r.now.back().target == 0xd00);   // (the target kept with it)
+    CHECK(r.place(b0, 12, 1, &at) && at == 130 && r.now.back().target == 0);
+    CHECK(r.place(a1, 30, 1, &at) && at == 142);
+    CHECK(!r.place(a2, 30, 1, &at));       // (172 + 30 > 200: no room)
+    CHECK(!r.before_of(a0, 30, 1));         // (nothing before frame 1)
+    CHECK(r.most == 3);                     // (a: three draws in frame 1)
+    // frame 2: the other half; the same draws the same keys (of the model and its n-th alone); the frame before's by key, count
+    CHECK(r.key_of(a, 2) == a0 && !r.place(a0, 30, 1, &at) && r.place(a0, 30, 2, &at) && at == 0);   // (a key of frame 2 only)
+    const CaptureRing::Entry* was = r.before_of(a0, 30, 2);
+    CHECK(was && was->at == 100);
+    CHECK(r.key_of(b, 2) == b0 && r.place(b0, 12, 2, &at) && at == 30);
+    CHECK(r.before_of(b0, 12, 2) && r.before_of(b0, 12, 2)->at == 130);
+    CHECK(!r.before_of(b0, 13, 2));         // (another count: another draw)
+    CHECK(r.key_of(a, 2) == a1 && r.place(a1, 30, 2, &at) && r.before_of(a1, 30, 2) && r.before_of(a1, 30, 2)->at == 142);
+    CHECK(!r.place(r.key_of(a, 2), 0, 2, &at));   // (no vertices)
+    // frame 4 after a frame without captures (3): frame 2's are not the frame before's
+    CHECK(r.key_of(a, 4) == a0 && r.place(a0, 30, 4, &at) && !r.before_of(a0, 30, 4));
+    // frame 5: frame 4's are; the halves still take turns (frame 4 wrote half 1, frame 5 writes half 0)
+    CHECK(r.key_of(a, 5) == a0 && r.place(a0, 30, 5, &at) && at == 0 && r.before_of(a0, 30, 5) && r.before_of(a0, 30, 5)->at == 100);
+    // a draw bigger than a half
+    CHECK(!r.place(r.key_of(b, 5), 101, 5, &at));
+
+    // a draw left out for a frame after its key (its pipeline not made yet): the next draws of its model keep their n-ths
+    CaptureRing s;
+    s.capacity = 100;
+    const uint64_t c0 = s.key_of(a, 7), c1 = s.key_of(a, 7);   // (frame 7: the first draw of a left out, the second recorded)
+    CHECK(s.place(c1, 30, 7, &at) && at == 100);
+    CHECK(s.key_of(a, 8) == c0 && s.place(c0, 30, 8, &at) && !s.before_of(c0, 30, 8));
+    CHECK(s.key_of(a, 8) == c1 && s.place(c1, 30, 8, &at) && s.before_of(c1, 30, 8) && s.before_of(c1, 30, 8)->at == 100);
+
+    // a model drawn 1000 times a frame (a grass tuft): every draw its own key, and its own frame before
+    CaptureRing g;
+    g.capacity = 3000;
+    std::vector<uint32_t> first(1000);
+    std::set<uint64_t> keys;
+    for (int i = 0; i < 1000; i++) {
+        const uint64_t k = g.key_of(a, 20);
+        keys.insert(k);
+        CHECK(g.place(k, 3, 20, &first[i]));
+    }
+    CHECK(keys.size() == 1000 && g.most == 1000);
+    int own = 0;
+    for (int i = 0; i < 1000; i++) {
+        const uint64_t k = g.key_of(a, 21);
+        own += g.place(k, 3, 21, &at) && g.before_of(k, 3, 21) && g.before_of(k, 3, 21)->at == first[i];
+    }
+    CHECK(own == 1000);
+}
+
 int main() {
+    captures();
     noted();
     poses();
     pushes();
     heads();
+    capture_heads();
     tolerances();
     if (failures) return std::printf("dlss_actor_plan: %d failures\n", failures), 1;
     std::printf("dlss_actor_plan: ok\n");

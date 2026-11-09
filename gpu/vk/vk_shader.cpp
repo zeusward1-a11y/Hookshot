@@ -52,6 +52,7 @@
 #include "vk_internal.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
+#include "vk_dlss.h"   // (hookshot: dlss_available, capture_keeps_spirv)
 
 // (EvilOOT, RX_VK_PTR_DIAG) the pointer pass's counts for this thread's translations
 // (global_memory_to_storage_buffer_pass.cpp, declared by hand so no Eden header changes)
@@ -563,7 +564,7 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
     return t;
 }
 
-VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
+VkShaderModule make_module(const std::vector<uint32_t>& spirv) {   // (hookshot: capture_keeps_spirv below, out of this namespace)
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = spirv.size() * 4;
     ci.pCode = spirv.data();
@@ -573,6 +574,14 @@ VkShaderModule make_module(const std::vector<uint32_t>& spirv) {
 }
 
 } // namespace
+
+std::atomic<int64_t> capture_spirv_bytes{0};
+bool capture_keeps_spirv() {
+    static const bool keep = getenv("RX_DLSS_CAPTURE") && std::strcmp(getenv("RX_DLSS_CAPTURE"), "0");   // (RX_DLSS_CAPTURE=1)
+    // (and only where the capture can run: transform feedback on the device (asked for with DLSS's menu row on), DLSS attached
+    // (vk_main.cpp create_device, before any program))
+    return keep && dev.xfb && dlss_available();
+}
 
 /// A word of a stage's constant bank: c0 / c2 the driver's banks, c1 its own constants, c3.. its uniform buffers
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset) {
@@ -1283,6 +1292,8 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
             }
             st.module = make_module(spirv);
             ok = ok && st.module;
+            if (st.vk_stage == VK_SHADER_STAGE_VERTEX_BIT && capture_keeps_spirv())   // (DLSS's captured motion: vk_shader.h)
+                p->vertex_spirv = std::move(spirv);
         }
         if (!ok) {
             static std::atomic<int> logged{0};
@@ -1298,6 +1309,7 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
                      (unsigned long long)key, (long long)d.at, d.size);
             continue;
         }
+        capture_spirv_bytes += (int64_t)p->vertex_spirv.size() * 4;   // (the kept programs' only)
         p->ready.store(true, std::memory_order_release);
         variants.push_back(std::move(p));
         st_cache_hits++;
@@ -1441,6 +1453,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             }
             v.info = vs->program.info;
             v.module = make_module(vspirv);
+            if (capture_keeps_spirv()) capture_spirv_bytes += (int64_t)vspirv.size() * 4, p.vertex_spirv = vspirv;   // (vk_shader.h)
             kept.push_back(vspirv);
             v.vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
             v.c1 = vsc->c1;

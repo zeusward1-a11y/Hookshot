@@ -228,6 +228,10 @@ bool create_device() {
     optional(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, dev.push_descriptor);
     optional(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME, dev.conditional_rendering);
     optional(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, dev.provoking_vertex);
+    // (hookshot: DLSS's captured motion, vk_draw.cpp dlss_capture_*: the game's vertex stage records where each vertex lands by
+    // transform feedback. Only with RX_DLSS_CAPTURE=1 and DLSS on (its menu row decides the device): else the device as before)
+    if (opts.dlss && getenv("RX_DLSS_CAPTURE") && strcmp(getenv("RX_DLSS_CAPTURE"), "0"))
+        optional(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, dev.xfb);
     optional(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, dev.vertex_divisor);
     optional(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, dev.stencil_export);
     optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, dev.memory_budget);
@@ -286,6 +290,8 @@ bool create_device() {
     if (dev.depth_clip_control) *tail = &clip, tail = &clip.pNext;
     if (dev.conditional_rendering) *tail = &cond, tail = &cond.pNext;
     if (dev.provoking_vertex) *tail = &pv, tail = &pv.pNext;
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT xfbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    if (dev.xfb) *tail = &xfbf, tail = &xfbf.pNext;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vdiv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     if (dev.vertex_divisor) *tail = &vdiv, tail = &vdiv.pNext;
     if (dev.graphics_pipeline_library) *tail = &gpl, tail = &gpl.pNext;
@@ -332,6 +338,8 @@ bool create_device() {
     dev.null_descriptor = dev.null_descriptor && robust2.nullDescriptor;
     pv.transformFeedbackPreservesProvokingVertex = VK_FALSE;
     dev.provoking_vertex = dev.provoking_vertex && pv.provokingVertexLast;
+    dev.xfb = dev.xfb && xfbf.transformFeedback;
+    xfbf.geometryStreams = VK_FALSE;   // (one stream is all the capture writes)
     dev.conditional_rendering = dev.conditional_rendering && cond.conditionalRendering;
     dev.custom_border_color = dev.custom_border_color && border.customBorderColors && border.customBorderColorWithoutFormat;
     dev.depth_clip_control = dev.depth_clip_control && clip.depthClipControl;

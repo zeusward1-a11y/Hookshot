@@ -101,7 +101,7 @@ void jobs_push_serial(std::function<void()> fn) {
                 jobs_notify();
             }
         }).detach();
-        logf("vk: compute pipelines are built one at a time");
+        logf("vk: a thread builds pipelines one at a time (Intel's compute pipelines, DLSS's captured motion's)");
     }
     sq.push_back(std::move(fn));
     scv.notify_one();

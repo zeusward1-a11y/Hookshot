@@ -74,7 +74,13 @@ struct Program {
     // bound (the pipeline state list, vk_draw.cpp)
     std::vector<uint8_t> questions;
     uint64_t codes[4]{};   // (hookshot) its stages' code keys: vertex (mesh), fragment, task, the header-only stage (the state list)
+    // (hookshot) the vertex stage's SPIR-V, kept for DLSS's captured motion (vk_draw.cpp dlss_capture_*: its transform feedback
+    // variant, spirv_xfb.h). Empty with RX_DLSS_CAPTURE=0, for mesh programs and the mesh fallback's
+    std::vector<uint32_t> vertex_spirv;
 };
+/// (hookshot) Whether programs keep their vertex stage's SPIR-V for DLSS's captured motion (RX_DLSS_CAPTURE not 0), and the bytes kept
+bool capture_keeps_spirv();
+extern std::atomic<int64_t> capture_spirv_bytes;
 
 enum class ProgramKind { Graphics, Compute, Mesh };
 

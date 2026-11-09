@@ -44,7 +44,7 @@ struct Device {
     bool mesh_shader = false, external_memory_host = false, external_memory_fd = false, dma_buf_import = false, pipeline_library = false,
          graphics_pipeline_library = false, custom_border_color = false, dynamic_state3 = false,
          depth_clip_control = false, null_descriptor = false, index_uint8 = false, push_descriptor = false,
-         conditional_rendering = false, provoking_vertex = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
+         conditional_rendering = false, provoking_vertex = false, xfb = false, vertex_divisor = false, stencil_export = false, memory_budget = false,
          checkpoints = false,   // (RX_VK_CHECKPOINTS: VK_NV_device_diagnostic_checkpoints)
          buffer_marker = false, // (RX_VK_CHECKPOINTS=1 without the NV extension: VK_AMD_buffer_marker, AMD and Intel)
          device_fault = false,  // (VK_EXT_device_fault: what a lost device faulted on)
