@@ -64,6 +64,7 @@ inline u32 RenameableFields(u32 opcode) {
     switch (opcode) {
     case 0x381: case 0x981: return 1 | 2;   // LDG Rd, [Ra] (0x381: Ra a register pair)
     case 0x986: return 2 | 4;          // STG [Ra], Rb
+    case 0x593: return 1 | 2 | 4;      // SUATOM: scalar destination, coordinate and addend
     default: break;
     }
     if (extended_renaming) {
@@ -94,6 +95,7 @@ inline u32 RenameableFields(u32 opcode) {
 // 32-bit operand taken for a quad reached R239 or the scratch from R236 or R244 and failed whole mesh programs (OoT's
 // foliage).
 inline u32 FieldSpan(u32 opcode, u32 field) {
+    if (opcode == 0x593) return field < 3 ? 1 : 0;
     if (!extended_renaming) return 0;
     const u32 family = opcode & 0x1ff, form = (opcode >> 9) & 7;
     if (opcode == 0x805) return field == 0 ? 2 : 0;
@@ -1442,6 +1444,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{15} << 20) | (u64{dimension} << 33) |
                 (bindless ? u64{250} << 39 : (u64{offset} << 36) | (u64{1} << 51)));
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
+            break;
+        }
+        case 0x593: { // SUATOM.D.1D.ADD.U32.STRONG.GPU.IGN, direct descriptor, no fault predicate.
+            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+            if (insn.words[2] != 0x001ee000 || insn.Bits(59, 5) || binding >= 18 || offset > 0x1fff ||
+                (insn.words[3] & 0xc00001ffU))
+                return fail(index, "native direct surface atomic mode");
+            if (!bind_texture_buffer(binding))
+                return fail(index, "native surface descriptor buffer conflict");
+            // Strong(GPU) is the atomic's coherence/scope, not acquire/release. The existing image
+            // atomic backend uses Device/Relaxed; explicit native MEMBARs are lowered separately.
+            emit(base(0xea00000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
+                (u64{insn.Bits(32, 8)} << 20) | (u64{offset} << 36));
             break;
         }
         case 0x59f: { // SURED.D.2D.<op>.STRONG.GPU.IGN U32, direct descriptor (title 1's race compute).
