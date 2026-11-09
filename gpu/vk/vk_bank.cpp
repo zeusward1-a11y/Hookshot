@@ -37,6 +37,7 @@ std::vector<TexReg> tex_regs;
 std::vector<SampReg> samp_regs;
 std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
+std::atomic<uint64_t> samp_gen{1};  // (bumped when a sampler registration's contents change: sampler_for's cache, vk_draw.cpp)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
@@ -179,8 +180,14 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     const nvn_samp_par* p = &par;
     std::lock_guard lk(reg_mu);
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
+    // (sampler_for's cache goes stale only when a registration's contents change, not at each rewrite of the same)
+    const bool same = samp_regs[id].ok && !std::memcmp(&samp_regs[id].p, p, sizeof *p);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    if (!same) samp_gen.fetch_add(1, std::memory_order_acq_rel);
+}
+uint64_t sampler_registrations_generation() {
+    return samp_gen.load(std::memory_order_acquire);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);

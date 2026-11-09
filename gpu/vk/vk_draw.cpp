@@ -48,6 +48,7 @@ namespace mkwvk {
 struct PointerEntry { uint64_t addr, size; };
 const PointerEntry* pointer_table(const NvnState& s, int stage);
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset);   // (vk_shader.cpp)
+uint64_t sampler_registrations_generation();   // (vk_bank.cpp: sampler_for's cache)
 namespace {
 
 // ---- (hookshot) RX_VK_PROF_FINE=1: where a draw's time goes, finer than the frame line's phases, and what each draw does ----
@@ -1286,7 +1287,23 @@ uint32_t aniso_override() {
     return n;
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare)
+VkSampler sampler_make(int id, bool compare);
+// (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
+// ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
+// changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0: off)
 VkSampler sampler_for(int id, bool compare) {
+    static const bool on = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
+    if (!on || id < 0 || id >= 4096) return sampler_make(id, compare);
+    struct Entry { uint64_t gen; VkSampler s; };
+    static thread_local Entry table[2][4096];   // (gen 0: never filled; the generation starts at 1)
+    const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
+    Entry& e = table[compare ? 1 : 0][id];
+    if (e.gen == gen) return e.s;
+    const VkSampler made = sampler_make(id, compare);
+    e = {gen, made};
+    return made;
+}
+VkSampler sampler_make(int id, bool compare) {
     nvn_samp_par p{};
     if (!sampler_of(id, &p)) p.minf = NVN_MIN_FILTER_LINEAR, p.magf = NVN_MAG_FILTER_LINEAR, p.lod_max = 1000.0f;
     uint64_t key = mix(compare ? 0xC0 : 0xAB, aniso_override());
