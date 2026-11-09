@@ -2633,6 +2633,23 @@ void flush_textures(std::vector<Flush>& fs) {
         for (Flush& f : fs) f.ok = false;
     }
     const bool gpu_ok = any && readback_submit_wait();
+    if (any && !gpu_ok) {
+        // (the read-back did not complete: its 5 s wait, which also covers what queue_flush_locked just submitted, or a submit
+        // that failed. The copies may still be writing into the staging buffers, so they are not freed here: they go the way a
+        // destroyed image does, once a submission made after this one is done. The batch's write-backs are lost, as a single
+        // one's was before)
+        static int logged;
+        if (logged++ < 8)
+            logf("vk: a batch of %zu texture write-backs did not complete in time: not written back, its staging buffers kept "
+                 "until the GPU is past them", fs.size());
+        for (Flush& f : fs)
+            if (f.buf) {
+                Dead d{rec_value + 1, VK_NULL_HANDLE, nullptr, {}, {}};
+                d.buffer = f.buf, d.buffer_alloc = f.alloc;
+                dead.push_back(std::move(d));
+                f.buf = VK_NULL_HANDLE, f.alloc = nullptr, f.map = nullptr;
+            }
+    }
     for (Flush& f : fs) f.ok = flush_finish(f, gpu_ok);
 }
 bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
@@ -3392,7 +3409,9 @@ void texture_frame(uint64_t completed) {
     static const uint64_t room_unused = vram_room::room_min_unused(getenv("RX_VK_ROOM_MIN_UNUSED"));
     const bool over_hard = total_bytes > hard;
     for (auto& [last, tex] : order) {
-        if ((!sweep && total_bytes - pending_bytes <= budget / 8 * 7) || frame_no - last < need_dead) break;
+        // (total_bytes can have drifted below the textures' sum (destroy_later clamps it): the chosen ones' bytes past it mean the
+        // budget is met, not a wrapped difference that never is)
+        if ((!sweep && (pending_bytes >= total_bytes || total_bytes - pending_bytes <= budget / 8 * 7)) || frame_no - last < need_dead) break;
         const bool shifted = drawn_over_shifted(tex);
         const uint64_t unused_for =
             sweep ? need_unused : vram_room::min_unused(over_hard, total_bytes - pending_bytes, hard, need_unused, room_unused);
@@ -3474,7 +3493,7 @@ void texture_frame(uint64_t completed) {
         for (const Evict& e : evict) {
             if (!e.flush) continue;
             batch.push_back(Flush{e.tex, e.tex->gpu, e.tex->gpu + e.tex->guest_size});
-            batch_bytes += e.tex->bytes;
+            batch_bytes += e.tex->guest_size;   // (what its staging buffer holds: the texels as the storage lays them out)
             if (batch.size() >= 64 || batch_bytes >= (512ull << 20)) run();
         }
         run();
