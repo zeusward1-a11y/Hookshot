@@ -49,6 +49,7 @@ static void mirror_sync(Pool& p) { ++synced; p.synced_epoch = mirror_epoch; p.sy
 static uint64_t texture_segment() { return 0; }
 static void publish_cap_ranges() { throw std::runtime_error("unexpected mirror publication"); }
 static void logf(const char*, ...) {}
+static void rb_hazard_locked(uint64_t, uint64_t) {}   // (local: #1069's readback hazard, called by the refresh; not what is tested here)
 static void* gpu_ptr(uint64_t, uint64_t* avail) {
     *avail = mapping_valid ? 4ull << 20 : 0;
     return mapping_valid ? &pool : nullptr;
