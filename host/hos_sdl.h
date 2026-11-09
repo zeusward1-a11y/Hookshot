@@ -25,18 +25,23 @@ int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out);   /
 void hos_sdl_pixel_size(void *window, int *width, int *height);
 const uint8_t *hos_sdl_keys(int *count);   /* the keyboard by scancode (USB HID usage), 1 a key down */
 uint32_t hos_sdl_mouse_buttons(void);   /* 1 left, 2 middle, 4 right */
+void hos_sdl_window_size(void *window, int *width, int *height);   /* (in the units of the mouse's position, not pixels) */
 void hos_sdl_icon(void *window, const char *png);   /* (SDL 3.4's PNG loader: nothing on SDL2 or an older SDL3) */
 
 /* ---- events, as the window's loop wants them ---- */
 enum {
     HOS_SDL_EV_OTHER, HOS_SDL_EV_QUIT, HOS_SDL_EV_CLOSE, HOS_SDL_EV_RESIZED, HOS_SDL_EV_FOCUS_GAINED,
-    HOS_SDL_EV_FOCUS_LOST, HOS_SDL_EV_MOUSE_LEAVE, HOS_SDL_EV_KEY_DOWN, HOS_SDL_EV_MOUSE_DOWN, HOS_SDL_EV_MOUSE_MOTION
+    HOS_SDL_EV_FOCUS_LOST, HOS_SDL_EV_MOUSE_LEAVE, HOS_SDL_EV_KEY_DOWN, HOS_SDL_EV_MOUSE_DOWN, HOS_SDL_EV_MOUSE_MOTION,
+    HOS_SDL_EV_MOUSE_UP, HOS_SDL_EV_MOUSE_WHEEL, HOS_SDL_EV_MOUSE_ENTER
 };
 typedef struct {
     int type;
     int scancode, repeat;   /* (key down) */
     uint16_t mod;           /* (key down: 0x300 an Alt key) */
     float dx, dy;           /* (mouse motion, relative) */
+    float x, y;             /* (mouse motion, down and up: the cursor in the window, hos_sdl_window_size's units) */
+    int button;             /* (mouse down and up: 1 left, 2 middle, 3 right, as SDL numbers them) */
+    float wheel;            /* (mouse wheel: notches, up or away from the player positive) */
 } HosSdlEvent;
 int hos_sdl_wait_event(HosSdlEvent *e, int timeout_ms);   /* 1 when there was one */
 int hos_sdl_poll_event(HosSdlEvent *e);

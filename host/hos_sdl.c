@@ -15,7 +15,7 @@ static struct {
     /* window */
     void *CreateWindow, *SetWindowPosition, *SetWindowFullscreen, *SetRelativeMouseMode, *GetPrimaryDisplay,
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
-        *PollEvent, *LoadPNG, *SetWindowIcon, *DestroySurface;
+        *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface;
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
     /* controllers */
@@ -47,6 +47,7 @@ static int get_all(HMODULE m, int three) {
     GET2(PixelSize, "SDL_GetWindowSizeInPixels", "SDL_Vulkan_GetDrawableSize");
     GET(GetKeyboardState, "SDL_GetKeyboardState");
     GET(GetMouseState, "SDL_GetMouseState");
+    GET(GetWindowSize, "SDL_GetWindowSize");
     GET(WaitEventTimeout, "SDL_WaitEventTimeout");
     GET(PollEvent, "SDL_PollEvent");
     GET2(PadOpen, "SDL_OpenGamepad", "SDL_GameControllerOpen");
@@ -183,6 +184,10 @@ uint32_t hos_sdl_mouse_buttons(void) {
     return version == 3 ? CALL(uint32_t (*)(float *, float *), GetMouseState)(NULL, NULL)
                         : CALL(uint32_t (*)(int *, int *), GetMouseState)(NULL, NULL);
 }
+void hos_sdl_window_size(void *window, int *width, int *height) {
+    if (version == 3) CALL(_Bool (*)(void *, int *, int *), GetWindowSize)(window, width, height);
+    else CALL(void (*)(void *, int *, int *), GetWindowSize)(window, width, height);
+}
 
 /* ---- events ---- */
 static void read_event(const uint8_t *raw, HosSdlEvent *e) {
@@ -203,18 +208,32 @@ static void read_event(const uint8_t *raw, HosSdlEvent *e) {
             memcpy(i, raw + 24, 4), e->scancode = i[0];
             memcpy(&e->mod, raw + 32, 2), e->repeat = raw[37];
             break;
-        case 0x400:   /* (SDL_MouseMotionEvent: xrel and yrel at 36 and 40, floats) */
+        case 0x20c: e->type = HOS_SDL_EV_MOUSE_ENTER; break;
+        case 0x400:   /* (SDL_MouseMotionEvent: x and y at 28 and 32, xrel and yrel at 36 and 40, floats) */
             e->type = HOS_SDL_EV_MOUSE_MOTION;
+            memcpy(&e->x, raw + 28, 4), memcpy(&e->y, raw + 32, 4);
             memcpy(&e->dx, raw + 36, 4), memcpy(&e->dy, raw + 40, 4);
             break;
-        case 0x401: e->type = HOS_SDL_EV_MOUSE_DOWN; break;
+        case 0x401:
+        case 0x402:   /* (SDL_MouseButtonEvent: button at 24, x and y at 28 and 32, floats) */
+            e->type = type == 0x401 ? HOS_SDL_EV_MOUSE_DOWN : HOS_SDL_EV_MOUSE_UP;
+            e->button = raw[24];
+            memcpy(&e->x, raw + 28, 4), memcpy(&e->y, raw + 32, 4);
+            break;
+        case 0x403: {   /* (SDL_MouseWheelEvent: y at 28, a float; direction at 32, 1 flipped) */
+            uint32_t dir;
+            e->type = HOS_SDL_EV_MOUSE_WHEEL;
+            memcpy(&e->wheel, raw + 28, 4), memcpy(&dir, raw + 32, 4);
+            if (dir == 1) e->wheel = -e->wheel;
+            break;
+        }
         }
         return;
     }
     switch (type) {
     case 0x100: e->type = HOS_SDL_EV_QUIT; break;
     case 0x200:   /* (SDL_WindowEvent: what at 12) */
-        e->type = raw[12] == 6 ? HOS_SDL_EV_RESIZED : raw[12] == 11 ? HOS_SDL_EV_MOUSE_LEAVE
+        e->type = raw[12] == 6 ? HOS_SDL_EV_RESIZED : raw[12] == 10 ? HOS_SDL_EV_MOUSE_ENTER : raw[12] == 11 ? HOS_SDL_EV_MOUSE_LEAVE
                 : raw[12] == 12 ? HOS_SDL_EV_FOCUS_GAINED : raw[12] == 13 ? HOS_SDL_EV_FOCUS_LOST
                 : raw[12] == 14 ? HOS_SDL_EV_CLOSE : HOS_SDL_EV_OTHER;
         break;
@@ -223,11 +242,24 @@ static void read_event(const uint8_t *raw, HosSdlEvent *e) {
         memcpy(i, raw + 16, 4), e->scancode = i[0];
         memcpy(&e->mod, raw + 24, 2), e->repeat = raw[13];
         break;
-    case 0x400:   /* (SDL_MouseMotionEvent: xrel and yrel at 28 and 32, whole pixels) */
+    case 0x400:   /* (SDL_MouseMotionEvent: x and y at 20 and 24, xrel and yrel at 28 and 32, whole pixels) */
         e->type = HOS_SDL_EV_MOUSE_MOTION;
+        memcpy(i, raw + 20, 8), e->x = (float)i[0], e->y = (float)i[1];
         memcpy(i, raw + 28, 8), e->dx = (float)i[0], e->dy = (float)i[1];
         break;
-    case 0x401: e->type = HOS_SDL_EV_MOUSE_DOWN; break;
+    case 0x401:
+    case 0x402:   /* (SDL_MouseButtonEvent: button at 16, x and y at 20 and 24, whole pixels) */
+        e->type = type == 0x401 ? HOS_SDL_EV_MOUSE_DOWN : HOS_SDL_EV_MOUSE_UP;
+        e->button = raw[16];
+        memcpy(i, raw + 20, 8), e->x = (float)i[0], e->y = (float)i[1];
+        break;
+    case 0x403: {   /* (SDL_MouseWheelEvent: y at 20, whole notches; direction at 24, 1 flipped) */
+        uint32_t dir;
+        e->type = HOS_SDL_EV_MOUSE_WHEEL;
+        memcpy(i, raw + 20, 4), memcpy(&dir, raw + 24, 4);
+        e->wheel = (float)(dir == 1 ? -i[0] : i[0]);
+        break;
+    }
     }
 }
 int hos_sdl_wait_event(HosSdlEvent *e, int timeout_ms) {

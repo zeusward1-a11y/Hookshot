@@ -4,6 +4,11 @@
 // (hookshot) A gamepad's Home button, or Select and Start together, opens it too; the D-pad chooses and changes, the bottom
 // face button changes too, the right one closes. The game gets no gamepad input while it is open either.
 // Its Controls page binds the Switch's buttons to gamepad inputs and keys.
+// (hookshot) The mouse is free while it is open (the window lets it go: WM_APP + 8, host/display.c and
+// host/posix/display_sdl.c): the row under the cursor is selected, a click on a tab shows it, on a value's left or right
+// half changes it down or up, on a toggle flips it, on a slider's track sets it (or drag it); the wheel changes the value
+// under the cursor, else moves the selection; a right click is Esc. On the Cheats page and its lists a click is Enter (on a
+// choice's or an amount's left or right half, Left or Right) and a right click goes back. vk_menu_hit.h has the layout.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -14,6 +19,7 @@
 
 #include "vk_paths.h"
 #include "vk_menu.h"
+#include "vk_menu_hit.h"
 #include "oot_cheat_items.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
@@ -311,7 +317,7 @@ std::atomic<int> item_counts[kItems];   // (-1 until the game side reports: OOT_
 int item_choice = 0, item_scroll = 0;
 constexpr int kCheatRows = 11;
 constexpr int kRows = sizeof rows / sizeof rows[0];
-constexpr int kMenuWidth = 480;   // (at a scale of 1: 720 lines)
+constexpr int kMenuWidth = menu_hit::kWidth;   // (at a scale of 1: 720 lines)
 
 int cur_tab = TAB_GRAPHICS;
 int tab_selected[TAB_COUNT] = {0, 0, 0};
@@ -346,6 +352,18 @@ bool menu_refresh = false;
 int marquee_pos = 0, marquee_max = 0;
 int64_t marquee_next = 0;
 constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // (ns)
+// (hookshot) the mouse (menu_tick): the tab strip's part under the cursor (a tab 0 to 2, 3 the previous, 4 the next; -1
+// none); paint_menu's record of each shown row's value's left edge (as with its arrows, whether shown or not) and of the
+// rows a slider's track was drawn on; the slider held with the left button (its row in the tab, -1 none)
+int hover_tab = -1;
+int row_value_l[kRows];
+bool row_slider[kRows];
+int drag_row = -1;
+bool mouse_read = false;   // (the menu has read the mouse since it opened)
+// (the Cheats page's and the list pages' record of each shown row's or line's value's left edge: the menu's width, none)
+int cheat_value_l[kCheatRows];
+int list_value_l[kTeleportLines];
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens; }
 std::string ini_path() {
     char exe[MAX_PATH];
     const DWORD n = game_module_path(exe, MAX_PATH);
@@ -421,6 +439,31 @@ void save() {
         }
         fclose(f);
     }
+}
+
+/// A row's new value v, as the arrows set it (dir: 1 up, -1 down, for the rows that skip or wrap), saved unless !keep
+/// (a slider's drag: saved once it is let go)
+void set_row(Row& r, int v, int dir, bool keep = true) {
+    if (r.value == &opts.framegen && v == 1) v = dir > 0 ? 2 : 0;   // (off, 2x ... 8x)
+    if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
+    if (r.value == &opts.pad_layout) {
+        if (v > 2) v = dir > 0 ? 0 : 2;
+        if (v < 0) v = 2;
+        *r.value = v;
+        apply_pad_layout(*r.value);
+    } else if (r.value == &opts.preset) {
+        *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+        apply_preset(*r.value);
+    } else {
+        *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
+        if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
+            r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
+            r.value != &opts.mouse_sens && r.value != &opts.mouse_invert) {   // (the controls are not the preset's)
+            opts.preset = 0; // Custom
+            sync_preset_budgets(0);
+        }
+    }
+    if (keep) save();
 }
 
 // ---- (hookshot) the Controls page: what presses each of the Switch's buttons, a gamepad input and up to two keys ----
@@ -660,7 +703,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     SelectObject(dc, body);
     if (page == 1) {   // (hookshot) the Controls page
         TextOutA(dc, 16 * s + 110 * s, 12 * s + 4 * s, "Controls", 8);
-        const int rh = 24 * s, top = 64 * s, xpad = 200 * s, xkey = 390 * s;
+        const int rh = menu_hit::kCtlRowH * s, top = menu_hit::kCtlTop * s, xpad = menu_hit::kCtlPad * s,
+                  xkey = menu_hit::kCtlKey * s;
         SetTextColor(dc, RGB(140, 150, 144));
         TextOutA(dc, 16 * s, 44 * s, "Button", 6);
         TextOutA(dc, xpad, 44 * s, "Gamepad", 7);
@@ -684,7 +728,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
                 if (sel && col == ccol) {
                     SIZE sz{};
                     GetTextExtentPoint32A(dc, v.c_str(), (int)v.size(), &sz);
-                    fill(dc, (col ? xkey : xpad) - 6 * s, y + 2 * s, (int)sz.cx + 12 * s, rh - 4 * s,
+                    fill(dc, (col ? xkey : xpad) - menu_hit::kCtlCellPad * s, y + 2 * s, (int)sz.cx + 12 * s, rh - 4 * s,
                          listening ? RGB(150, 120, 40) : RGB(70, 120, 84));
                 }
                 TextOutA(dc, col ? xkey : xpad, y + 3 * s, v.c_str(), (int)v.size());
@@ -706,9 +750,10 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         const int n = inv ? kItems : kTeleports, sections = inv ? kItemSections : kTeleportSections;
         const TeleportSection* sec = inv ? item_sections.s : teleport_sections;
         const int choice = inv ? item_choice : teleport_choice, scroll = inv ? item_scroll : teleport_scroll;
-        const int rh = 24 * s, top = 48 * s;
+        const int rh = menu_hit::kListRowH * s, top = menu_hit::kListTop * s;
         for (int line = scroll; line < std::min(n + sections, scroll + kTeleportLines); line++) {
             const int y = top + (line - scroll) * rh;
+            list_value_l[line - scroll] = (int)w;
             int section = 0;
             while (section + 1 < sections && line >= sec[section + 1].first + section + 1) section++;
             if (line == sec[section].first + section) {
@@ -733,7 +778,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
                 SIZE size{};
                 GetTextExtentPoint32A(dc, note, (int)strlen(note), &size);
                 if (!inv || strcmp(note, "Have")) SetTextColor(dc, RGB(140, 150, 144));
-                TextOutA(dc, (int)w - 16 * s - size.cx, y + 3 * s, note, (int)strlen(note));
+                list_value_l[line - scroll] = (int)w - menu_hit::kListValueRight * s - (int)size.cx;
+                TextOutA(dc, list_value_l[line - scroll], y + 3 * s, note, (int)strlen(note));
             }
         }
         SetTextColor(dc, RGB(140, 150, 144));
@@ -776,14 +822,15 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             "Swaps Link between child and adult and reloads this map in the other age (the Market when this map has no match).",
             "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts."};
         for (int i = 0; i < kCheatRows; i++) {
-            const int y = (44 + i * 28) * s;
-            if (i == cheat_selected) fill(dc, 8 * s, y, (int)w - 16 * s, 28 * s, RGB(44, 72, 54));
+            const int y = (menu_hit::kCheatTop + i * menu_hit::kCheatRowH) * s;
+            if (i == cheat_selected) fill(dc, 8 * s, y, (int)w - 16 * s, menu_hit::kCheatRowH * s, RGB(44, 72, 54));
             SetTextColor(dc, i == cheat_selected ? RGB(255, 255, 255) : RGB(196, 204, 198));
             TextOutA(dc, 16 * s, y + 4 * s, labels[i], (int)strlen(labels[i]));
             const char* value = values[i];
             SIZE size{};
             GetTextExtentPoint32A(dc, value, (int)strlen(value), &size);
-            TextOutA(dc, (int)w - 16 * s - size.cx, y + 4 * s, value, (int)strlen(value));
+            cheat_value_l[i] = *value ? (int)w - menu_hit::kListValueRight * s - (int)size.cx : (int)w;
+            TextOutA(dc, (int)w - menu_hit::kListValueRight * s - size.cx, y + 4 * s, value, (int)strlen(value));
         }
         SetTextColor(dc, RGB(176, 186, 180));
         wrap_help(dc, help[cheat_selected], (int)w - 32 * s, 16 * s, (54 + kCheatRows * 28) * s, true);
@@ -795,23 +842,23 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         return;
     }
     // the tab strip: Graphics, Gameplay, Controls (Q and E, the bumpers or Tab change it: menu_tick)
-    const int tab_y = 44 * s;
-    const int tab_h = 32 * s;
+    const int tab_y = menu_hit::kTabY * s;
+    const int tab_h = menu_hit::kTabH * s;
     fill(dc, 0, tab_y, (int)w, tab_h, RGB(22, 28, 25));
     HFONT small_font = font(12 * s, FW_SEMIBOLD);
     SelectObject(dc, small_font);
-    SetTextColor(dc, RGB(110, 135, 120));
+    SetTextColor(dc, hover_tab == 3 ? RGB(210, 225, 215) : RGB(110, 135, 120));   // (lighter under the cursor: a click goes there)
     TextOutA(dc, 16 * s, tab_y + 8 * s, "[Q / LB]", 8);
     const char* rb_hint = "[E / RB]";
     SIZE rbsz{};
     GetTextExtentPoint32A(dc, rb_hint, (int)strlen(rb_hint), &rbsz);
+    SetTextColor(dc, hover_tab == 4 ? RGB(210, 225, 215) : RGB(110, 135, 120));
     TextOutA(dc, (int)w - 16 * s - rbsz.cx, tab_y + 8 * s, rb_hint, (int)strlen(rb_hint));
     HFONT tab_font = font(13 * s, FW_BOLD);
     SelectObject(dc, tab_font);
     const char* const tab_titles[TAB_COUNT] = {"GRAPHICS", "GAMEPLAY", "CONTROLS"};
-    const int center_start = 85 * s;
-    const int center_width = (int)w - 170 * s;
-    const int tab_slot_w = center_width / TAB_COUNT;
+    const int center_start = menu_hit::kTabSide * s;
+    const int tab_slot_w = menu_hit::tab_slot_w(s, (int)w);
     for (int t = 0; t < TAB_COUNT; t++) {
         const bool active = (t == cur_tab);
         int slot_x = center_start + t * tab_slot_w;
@@ -823,6 +870,9 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             fill(dc, text_x - 10 * s, tab_y + 3 * s, tsz.cx + 20 * s, tab_h - 6 * s, RGB(38, 64, 48));
             fill(dc, text_x - 10 * s, tab_y + tab_h - 2 * s, tsz.cx + 20 * s, 2 * s, RGB(235, 205, 95));
             SetTextColor(dc, RGB(255, 255, 255));
+        } else if (t == hover_tab) {   // (under the cursor: a dimmer pill)
+            fill(dc, text_x - 10 * s, tab_y + 3 * s, tsz.cx + 20 * s, tab_h - 6 * s, RGB(30, 46, 37));
+            SetTextColor(dc, RGB(215, 225, 218));
         } else {
             SetTextColor(dc, RGB(135, 150, 142));
         }
@@ -833,7 +883,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     DeleteObject(small_font);
     fill(dc, 0, tab_y + tab_h, (int)w, std::max(1, s), RGB(52, 68, 58));
 
-    const int rh = 28 * s, top = tab_y + tab_h + 8 * s;
+    const int rh = menu_hit::kRowH * s, top = menu_hit::rows_top(s);
     const int tab_count = tab_row_count(cur_tab);
     marquee_max = 0;   // (set again below while the selected row's value is too long)
     for (int i = 0; i < tab_count; i++) {
@@ -878,6 +928,18 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             marquee_max = 0;
         }
         TextOutA(dc, (int)w - 18 * s - width(v), y + 4 * s, v.c_str(), (int)v.size());
+        // (the mouse's: where the value is, its arrows counted whether they show or not, so a click's half does not move
+        // as the row is selected)
+        row_value_l[i] = (int)w - 18 * s - std::min(r.value ? width("<  " + label + "  >") : width(v), room);
+        // (a slider's track between the name and the value, with a knob at the value: click or drag it)
+        const int tl = menu_hit::kSliderL * s, tr = menu_hit::kSliderR * s;
+        row_slider[i] = is_slider(r) && 18 * s + (int)nsz.cx + 8 * s <= tl && row_value_l[i] >= tr + 8 * s;
+        if (row_slider[i]) {
+            const int ty = y + rh / 2 - s, knob = tl + (tr - tl) * menu_hit::slider_permille(*r.value, r.lo, r.hi) / 1000;
+            fill(dc, tl, ty, tr - tl, 2 * s, RGB(60, 80, 68));
+            fill(dc, tl, ty, knob - tl, 2 * s, RGB(96, 210, 120));
+            fill(dc, knob - 3 * s, y + rh / 2 - 6 * s, 6 * s, 12 * s, sel ? RGB(255, 255, 255) : RGB(176, 186, 180));
+        }
     }
     const int help_top = top + max_tab_rows() * rh + 8 * s;   // (the same height whichever tab is shown)
     fill(dc, 16 * s, help_top - 4 * s, (int)w - 32 * s, std::max(1, s), RGB(52, 64, 56));
@@ -943,11 +1005,11 @@ int measure_help(int s) {
 }
 void redraw_menu(int s) {
     if (page == 3 || page == 4) {
-        gdi_draw(menu_bmp, kMenuWidth * s, (100u + kTeleportLines * 24u) * s, paint_menu, s);
+        gdi_draw(menu_bmp, kMenuWidth * s, (100u + kTeleportLines * (unsigned)menu_hit::kListRowH) * s, paint_menu, s);
         return;
     }
     if (page == 2) {
-        gdi_draw(menu_bmp, kMenuWidth * s, (136u + kCheatRows * 28u) * s, paint_menu, s);
+        gdi_draw(menu_bmp, kMenuWidth * s, (136u + kCheatRows * (unsigned)menu_hit::kCheatRowH) * s, paint_menu, s);
         return;
     }
     if (page == 1) {
@@ -1135,6 +1197,28 @@ void menu_option_set(int id, int value) {
     save();
 }
 
+/// A list page's line (from the top of the list, headings included) to its item: -1 a section's heading
+int list_item(int line, const TeleportSection* sec, int sections) {
+    int section = 0;
+    while (section + 1 < sections && line >= sec[section + 1].first + section + 1) section++;
+    return line == sec[section].first + section ? -1 : line - section - 1;
+}
+/// (hookshot) the mouse on a list page (the teleport list, the inventory): the item under the cursor chosen, a click on it
+/// as Enter (on an amount's left or right half, with amounts, as Left or Right), the wheel moves the choice, a right click
+/// goes back
+void list_mouse(const MkwVkPointer& ptr, int mx, int my, int mw, int mh, int scale, bool moved, bool amounts, int n,
+                int sections, const TeleportSection* sec, int scroll, int& choice, bool* press, bool& changed) {
+    const int shown = std::min(n + sections - scroll, kTeleportLines);
+    const menu_hit::Hit hit = menu_hit::list_lines(mx, my, scale, mw, mh, shown, list_value_l);
+    const int item = hit.part == menu_hit::kListLine ? list_item(scroll + hit.index, sec, sections) : -1;
+    if (item >= 0 && (moved || ptr.pressed) && item != choice) choice = item, changed = true;
+    if ((ptr.pressed & HOS_MOUSE_LEFT) && item >= 0) {
+        if (amounts && item_kinds[item] && hit.side != 0) press[hit.side < 0 ? 3 : 4] = true;
+        else press[7] = true;
+    }
+    if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+    if (ptr.wheel) choice = std::clamp(choice - ptr.wheel, 0, n - 1), changed = true;
+}
 /// Scrolls the teleport list so the chosen map (and its section heading, at the top) is in view
 void teleport_reveal() {
     int section = 0;
@@ -1220,6 +1304,27 @@ void menu_tick() {
     bool changed = scale != cur_scale || menu_refresh;
     menu_refresh = false;
     cur_scale = scale;
+    // (hookshot) the mouse, while the menu is open: the cursor in the menu's pixels (mx, my), whether it moved since the
+    // last frame, and its clicks and wheel since then (vk_menu_hit.h)
+    MkwVkPointer ptr{};
+    int mx = -1, my = -1, mw = 0, mh = 0;
+    bool mouse = false, moved = false;
+    if (open_now.load() && host && host->pointer) {
+        mouse = host->pointer(&ptr) != 0;
+        {
+            std::lock_guard lk(bmp_mu);
+            mw = (int)menu_bmp.w, mh = (int)menu_bmp.h;
+        }
+        int ix = 0, iy = 0, x0 = 0, y0 = 0;
+        menu_hit::to_image(ptr.x, ptr.y, ptr.width, ptr.height, (int)dev.swap_extent.width, (int)dev.swap_extent.height,
+                           &ix, &iy);
+        menu_hit::origin((int)dev.swap_extent.width, (int)dev.swap_extent.height, mw, mh, &x0, &y0);
+        if (mouse) mx = ix - x0, my = iy - y0;
+        static int last_x = -1, last_y = -1;
+        moved = mouse && mouse_read && (mx != last_x || my != last_y);   // (not the first read: a cursor resting over the
+        last_x = mx, last_y = my, mouse_read = true;                     // menu as it opens leaves the selection alone)
+        if (!mouse) ptr.pressed = 0, ptr.wheel = 0;
+    }
     if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
@@ -1257,6 +1362,21 @@ void menu_tick() {
                 }
             }
         } else {
+            if (mouse) {   // (the mouse: the row under it selected, a click on a binding listens for its new input, on
+                           // Reset resets; the wheel moves the selection, a right click goes back)
+                const menu_hit::Hit hit = menu_hit::controls(mx, my, scale, mw, mh, kControls);
+                const bool on = hit.part == menu_hit::kCtlRow || hit.part == menu_hit::kCtlCell;
+                if (on && (moved || ptr.pressed)) {
+                    if (hit.index != csel) csel = hit.index, changed = true;
+                    if (hit.part == menu_hit::kCtlCell && !keys_only(csel) && ccol != hit.side) ccol = hit.side, changed = true;
+                }
+                if (ptr.pressed & HOS_MOUSE_LEFT) {
+                    if (hit.part == menu_hit::kCtlCell || (hit.part == menu_hit::kCtlRow && hit.index == kControls))
+                        press[7] = true;   // (as Enter)
+                }
+                if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+                if (ptr.wheel) csel = ((csel - ptr.wheel) % (kControls + 1) + kControls + 1) % (kControls + 1), changed = true;
+            }
             if (press[5]) page = 0, changed = true;
             if (press[1]) csel = (csel + kControls) % (kControls + 1), changed = true;
             if (press[2]) csel = (csel + 1) % (kControls + 1), changed = true;
@@ -1283,6 +1403,22 @@ void menu_tick() {
         }
         if (changed) redraw_menu(scale);
     } else if (open_now.load() && page == 2) {
+        // (the Cheats rows that choose with Left and Right: Set time, Inventory item, Change quantity, Teleport)
+        auto chooses = [](int row) { return row == 4 || row == 5 || row == 6 || row == 8; };
+        if (mouse) {   // (the mouse: the row under it selected, a click as Enter, or on a choice's left or right half as
+                       // Left or Right; the wheel moves the selection, or over a choice changes it; a right click goes back)
+            const menu_hit::Hit hit = menu_hit::cheats(mx, my, scale, mw, mh, kCheatRows, cheat_value_l);
+            const bool on = hit.part == menu_hit::kCheatRow;
+            if (on && (moved || ptr.pressed) && hit.index != cheat_selected) cheat_selected = hit.index, changed = true;
+            const bool on_choice = on && hit.index == cheat_selected && chooses(hit.index) && hit.side != 0;
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && on) {
+                if (on_choice) press[hit.side < 0 ? 3 : 4] = true;
+                else press[7] = true;
+            }
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+            if (ptr.wheel && on_choice) press[ptr.wheel > 0 ? 4 : 3] = true;   // (up for the wheel away, as the options')
+            else if (ptr.wheel) cheat_selected = ((cheat_selected - ptr.wheel) % kCheatRows + kCheatRows) % kCheatRows, changed = true;
+        }
         if (press[5]) page = 0, changed = true;
         else {
             if (press[1] || press[2]) {
@@ -1332,6 +1468,9 @@ void menu_tick() {
         }
         if (changed) redraw_menu(scale);
     } else if (open_now.load() && page == 4) {   // the inventory
+        if (mouse)
+            list_mouse(ptr, mx, my, mw, mh, scale, moved, true, kItems, kItemSections, item_sections.s, item_scroll,
+                       item_choice, press, changed);
         if (press[5]) page = 2, changed = true;
         else {
             if (press[1] || press[2]) {
@@ -1357,6 +1496,9 @@ void menu_tick() {
         }
         if (changed) redraw_menu(scale);
     } else if (open_now.load() && page == 3) {   // the teleport list
+        if (mouse)
+            list_mouse(ptr, mx, my, mw, mh, scale, moved, false, kTeleports, kTeleportSections, teleport_sections,
+                       teleport_scroll, teleport_choice, press, changed);
         if (press[5]) page = 2, changed = true;
         else if (press[7]) {
             cheat_action.store(1000 + teleport_choice);
@@ -1385,6 +1527,64 @@ void menu_tick() {
         }
         if (changed) redraw_menu(scale);
     } else if (open_now.load()) {
+        if (mouse) {   // (the mouse: see the top of this file)
+            const int count = tab_row_count(cur_tab);
+            const menu_hit::Hit hit = menu_hit::options(mx, my, scale, mw, mh, TAB_COUNT, count, row_value_l, row_slider);
+            const int ht = hit.part == menu_hit::kTab ? hit.index : hit.part == menu_hit::kTabPrev ? 3
+                         : hit.part == menu_hit::kTabNext ? 4 : -1;
+            if (ht != hover_tab) hover_tab = ht, changed = true;
+            int& sel = tab_selected[cur_tab];
+            const bool on_row = hit.part == menu_hit::kRow || hit.part == menu_hit::kSlider;
+            if (drag_row >= 0) {   // (a slider held: it follows the cursor's x until let go)
+                Row& d = rows[tab_row_to_global(cur_tab, drag_row)];
+                if (!(ptr.held & HOS_MOUSE_LEFT) || !d.value) {
+                    drag_row = -1;
+                    save();
+                } else {
+                    const int v = menu_hit::slider_value(menu_hit::slider_drag(mx, scale), d.lo, d.hi, d.step);
+                    if (v != *d.value) set_row(d, v, v > *d.value ? 1 : -1, false), changed = true;
+                }
+            } else if (on_row && (moved || ptr.pressed) && hit.index != sel) {
+                sel = hit.index, changed = true;
+            }
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && drag_row < 0) {
+                if (hit.part == menu_hit::kTabPrev) tab_left = true;
+                else if (hit.part == menu_hit::kTabNext) tab_right = true;
+                else if (hit.part == menu_hit::kTab && hit.index != cur_tab) cur_tab = hit.index, changed = true;
+                else if (hit.part == menu_hit::kSlider) {
+                    Row& d = rows[tab_row_to_global(cur_tab, hit.index)];
+                    drag_row = hit.index;
+                    const int v = menu_hit::slider_value(hit.permille, d.lo, d.hi, d.step);
+                    if (v != *d.value) set_row(d, v, v > *d.value ? 1 : -1, false);
+                    changed = true;
+                } else if (hit.part == menu_hit::kRow) {
+                    Row& d = rows[tab_row_to_global(cur_tab, hit.index)];
+                    if (!d.value) press[7] = true;   // (a page: as Enter)
+                    else if (d.hi - d.lo == d.step || hit.side >= 0) press[4] = true;   // (a toggle flips; the right half, or the name, as Right)
+                    else press[3] = true;                                               // (the left half as Left)
+                }
+            }
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;   // (as Esc)
+            if (ptr.wheel && drag_row < 0) {
+                Row& d = rows[tab_row_to_global(cur_tab, sel)];
+                const bool on_value = on_row && hit.index == sel && d.value &&
+                                      (hit.part == menu_hit::kSlider || hit.side != 0);
+                if (hit.part == menu_hit::kTab || hit.part == menu_hit::kTabPrev || hit.part == menu_hit::kTabNext) {
+                    if (ptr.wheel > 0) tab_left = true;
+                    else tab_right = true;
+                } else if (on_value) {   // (over a value: it changes, up for the wheel away; a slider stops at its ends)
+                    const int dir = ptr.wheel > 0 ? 1 : -1;
+                    for (int n = ptr.wheel > 0 ? ptr.wheel : -ptr.wheel; n > 0; n--) {
+                        const int v = *d.value + dir * d.step;
+                        if (is_slider(d) && (v < d.lo || v > d.hi)) break;
+                        set_row(d, v, dir);
+                    }
+                    changed = true;
+                } else if (on_row || hit.part == menu_hit::kNone) {   // (elsewhere on the menu: the selection moves)
+                    sel = ((sel - ptr.wheel) % count + count) % count, changed = true;
+                }
+            }
+        }
         if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab)
         if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
@@ -1398,28 +1598,8 @@ void menu_tick() {
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
-            int v = *r.value + (press[4] ? r.step : -r.step);
-            if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
-            if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)
-            if (r.value == &opts.pad_layout) {
-                if (v > 2) v = press[4] ? 0 : 2;
-                if (v < 0) v = 2;
-                *r.value = v;
-                apply_pad_layout(*r.value);
-            } else if (r.value == &opts.preset) {
-                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                apply_preset(*r.value);
-            } else {
-                *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
-                if (r.value != &opts.fullscreen && r.value != &opts.show_fps && r.value != &opts.gpu_device &&
-                    r.value != &opts.invert_cam_x && r.value != &opts.invert_cam_y && r.value != &opts.mouse_native &&
-                    r.value != &opts.mouse_sens && r.value != &opts.mouse_invert) {   // (the controls are not the preset's)
-                    opts.preset = 0; // Custom
-                    sync_preset_budgets(0);
-                }
-            }
+            set_row(r, *r.value + (press[4] ? r.step : -r.step), press[4] ? 1 : -1);
             changed = true;
-            save();
         }
         const int64_t now = prof_now();
         if (changed) {   // (a new row or value: its name from the start, after a rest)
@@ -1431,6 +1611,18 @@ void menu_tick() {
             changed = true;
         }
         if (changed) redraw_menu(scale);
+    }
+    {   // (hookshot) the window lets the mouse go while the menu is open, and takes it back after (host/display.c)
+        static bool told = false;
+        const bool now_open = open_now.load();
+        if (!now_open) {
+            if (drag_row >= 0) save();   // (a slider let go off the window: kept now)
+            hover_tab = -1, drag_row = -1, mouse_read = false;
+        }
+        if (now_open != told && app_window()) {
+            told = now_open;
+            PostMessageA(app_window(), WM_APP + 8, (WPARAM)now_open, 0);
+        }
     }
     if (opts.show_fps) {
         static int64_t next = 0, last_game = 0, last_shown = 0;

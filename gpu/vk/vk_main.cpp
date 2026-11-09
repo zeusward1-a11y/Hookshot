@@ -584,6 +584,7 @@ bool started_up() {
         };
         const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
         if (!update && prepare_run(progress, false)) predict_run(progress);
+        if (update) state_list_run();
         precompile_run(progress);
         if (update) prepare_background();
         if (console) CloseHandle(console), console = nullptr, FreeConsole();

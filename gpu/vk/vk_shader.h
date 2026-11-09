@@ -70,6 +70,10 @@ struct Program {
     std::vector<Answer> answers;
     uint64_t variant = 0;   // (a hash of the answers: key alone names all the variants of these stages)
     mutable std::atomic<int64_t> wm_sig{-1};   // (hookshot: what its write masks are made from, vk_draw.cpp program_wm_sig; -1: not asked yet)
+    // (hookshot) the translation's texture questions as answered, in the order asked: what makes this variant again with nothing
+    // bound (the pipeline state list, vk_draw.cpp)
+    std::vector<uint8_t> questions;
+    uint64_t codes[4]{};   // (hookshot) its stages' code keys: vertex (mesh), fragment, task, the header-only stage (the state list)
 };
 
 enum class ProgramKind { Graphics, Compute, Mesh };
@@ -84,7 +88,8 @@ std::string program_code_keys(const NvnState& s);   // (hookshot) " stage:key" f
 const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]);   // (program_for without its cache)
 void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
-size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn);
+size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
+                               bool computes = true);   // (computes: and every kept compute program)
 /// The precompile of every shader of the game (hookshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
 size_t seed_open();
 void seed_close();
@@ -107,6 +112,16 @@ struct KeptProgram {
 void program_cache_each(const std::function<void(const KeptProgram&)>& fn);
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn);   // (made for fn, then let go; still kept)
 const Program* program_find(uint64_t key, uint64_t variant);
+/// (hookshot) The pipeline state list (vk_draw.cpp): a program by its stages' code keys (graphics: vertex, fragment; mesh: mesh,
+/// fragment, task) and the vertex inputs and colour output types it was drawn with, from the seed (seed_open first): translated
+/// and kept unless kept already (null then, or when it does not translate). *key_out: its key, 0 when a stage is not in the seed
+std::unique_ptr<Program> seed_program_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
+                                         uint64_t* key_out);
+/// (hookshot) The same for a program variant made by other textures' answers: translated with the answers given in the order asked
+/// (Program::questions) and taking those answers (Program::answers); kept in memory for the precompile, and in the program cache.
+/// Null when a stage is not in the seed or it does not translate
+const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t attributes[16], const uint8_t color_types[8],
+                               const std::vector<uint8_t>& questions, const std::vector<Program::Answer>& answers);
 /// The NVN stages of the bound program, for logs (stage field of each control section)
 void log_program_stages(const NvnState& s, const char* why);
 Shader::AttributeType attribute_type_of(uint32_t vattr);
