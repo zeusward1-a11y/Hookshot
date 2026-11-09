@@ -81,6 +81,13 @@ bool resolve(const nvn_tex* t, const nvn_view* v, bool has_v, const NVNcopyRegio
                  s.tex->astc ? " ASTC" : "", s.tex->skip);
         return false;
     }
+    if (!s.down && view_level(view) >= s.tex->skip + s.tex->levels) {   // (hookshot-amd: a level the image left out at its end)
+        static int logged;
+        if (logged++ < 20)
+            logf("vk: copy with level %u of texture %#llx %ux%u, %u levels (its last levels left out): skipped",
+                 view_level(view), (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height, s.tex->levels);
+        return false;
+    }
     s.level = s.down ? 0 : image_level(s.tex, view_level(view));
     const uint32_t lw = std::max(1u, s.tex->width >> s.level), lh = std::max(1u, s.tex->height >> s.level);
     const uint32_t ld = s.tex->type == VK_IMAGE_TYPE_3D ? std::max(1u, s.tex->depth >> s.level) : 1;
@@ -252,6 +259,10 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         if (d.tex->bc && same_size) {
             done = texture_copy_into_bc(cmd, s.tex, s.level, s.layer, s.x, s.y, d.tex, d.level, d.layer, d.x, d.y, s.w, s.h,
                                         s.layers);
+        } else if (s.tex->bc && !d.tex->bc && s.tex->bc_resized) {   // (hookshot-amd: its texels are not the game's)
+            static int logged;
+            if (logged++ < 8)
+                logf("vk: a copy out of resized BC3 texture %#llx left out", (unsigned long long)s.tex->gpu);
         } else if (s.tex->bc && !d.tex->bc) {   // (decompressed by a blit)
             VkFormatProperties fp{};
             vkGetPhysicalDeviceFormatProperties(dev.physical, s.tex->format, &fp);

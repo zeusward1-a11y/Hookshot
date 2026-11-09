@@ -21,6 +21,7 @@ import os
 import re
 
 import a64_lift
+import lifted_c
 
 FILE = "chunks.txt"
 
@@ -144,14 +145,15 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None):
     b = Boundaries(a64_lift.CHUNK_BYTES, starts, L.funcs)
     base_emit = L.emit_function
     jobs = emit_jobs() if jobs is None else jobs
-    made = {"it": None}
+    made = None
 
     def emit_function(e, texts):
+        nonlocal made
         b.current = e
-        if made["it"] is None:   # (the first call: write() has its texts now, and asks for the functions in sorted order)
-            made["it"] = parallel_emit(base_emit, sorted(L.funcs), texts,
+        if made is None:   # (the first call: write() has its texts now, and asks for the functions in sorted order)
+            made = parallel_emit(base_emit, sorted(L.funcs), texts,
                                        [L.stats, L.unhandled, L.ijump] + list(counters), jobs)
-        got = next(made["it"], None)
+        got = next(made, None)
         if got is None or got[0] != e:
             raise SystemExit("chunks: write() asked for f_%08x, the emit made %s" % (e, "f_%08x" % got[0] if got else "nothing"))
         return got[1], got[2]
@@ -160,8 +162,8 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None):
         files = L.write(gen_dir, chunk_bytes=b)
     finally:
         del L.emit_function
-        if made["it"] is not None:
-            made["it"].close()   # (the processes go now, not when the generator is collected)
+        if made is not None:
+            made.close()   # (the processes go now, not when the generator is collected)
     # (the numbered chunks only: files has code_hot.c too, and counting it skipped the first stale chunk, linked twice)
     n = sum(1 for f in files if re.fullmatch(r"code_\d{3}\.c", os.path.basename(f)))
     while os.path.exists(os.path.join(gen_dir, "code_%03d.c" % n)):   # (fewer chunks than the last lift)
@@ -173,10 +175,10 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None):
     return files
 
 
-HEAD = re.compile(r"^(?:/\* .* \*/\n)?void f_[0-9a-f]+\(Ctx \*__restrict A64_NOESC c\) \{", re.M)
+HEAD = lifted_c.HEAD_NOTED
 PART = re.compile(r"code_(\d{3})_(\d+)\.c")
 # (a function's compile time grows with the square of its size: LLVM's passes over one function of tens of thousands of blocks. Fitted to
-# a cold build of the 48 chunks at -O1 on a Ryzen 9 7900X: seconds ~ 1.5 x MB + 4.4 x MB^2 per function, so a function of QUAD bytes
+# a cold build of the 48 chunks at -O1 on a 24-thread desktop: seconds ~ 1.5 x MB + 4.4 x MB^2 per function, so a function of QUAD bytes
 # costs twice its size. A 24 MB chunk of small functions took ~45 s; one of 20 MB holding a few 2 MB functions, 350 s)
 QUAD = 350000
 COSTS = "chunk_costs.txt"   # (in the gen folder: each file's estimated compile cost, for build.py's order)

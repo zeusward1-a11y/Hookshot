@@ -1,11 +1,25 @@
 // Draws and dispatches (vk_draw.cpp).
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "vk_internal.h"
+#include "vk_state.h"
 
 namespace mkwvk {
 /// Something other than the draw path pushed or bound descriptors in the recording (its next push is whole)
 void descriptors_disturbed();
+
+/// A graphics pipeline as hookshot_pipelines.bin keeps it (the precompile's notes): what built it
+struct PipeNote {
+    uint64_t key, prog, variant;
+    uint32_t topo, n, samples, depth_format, has_depth;
+    uint32_t color_format[8];
+    NvnState s;
+};
+/// (vk_predict.cpp) The pipelines the notes predict for the kept graphics program variants no note names (key 0: not made yet)
+std::vector<std::unique_ptr<PipeNote>> predict_pipelines(const std::vector<std::unique_ptr<PipeNote>>& notes, size_t* programs);
 }
 
 #include <functional>

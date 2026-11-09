@@ -744,6 +744,7 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
 }
 #endif
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
+thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
 /// (Maxwell keeps its texels; Vulkan writes undefined values: TOTK's maxwell.md 1.1)
@@ -781,12 +782,6 @@ uint64_t program_wm_sig(const Program& p) {
 // makes every kept program ready and builds every noted pipeline on all the CPUs (the driver's own cache, mkw_vk_pipelines.bin,
 // makes that quick), so that nothing is built during play. RX_VK_PRECOMPILE=1: in any build; =0: off. A build with
 // RX_RELEASE=1 (nx2/build.py) has it on. The notes are written in every build ----
-struct PipeNote {
-    uint64_t key, prog, variant;
-    uint32_t topo, n, samples, depth_format, has_depth;
-    uint32_t color_format[8];
-    NvnState s;
-};
 std::mutex note_mu;
 FILE* note_file = nullptr;
 std::unordered_set<uint64_t> noted;   // (a pipeline once in the file, however many runs meet it)
@@ -795,6 +790,33 @@ std::string pipe_notes_path() {
     const DWORD n = game_module_path(exe, MAX_PATH);
     std::string dir(exe, n);
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_pipelines.bin";
+}
+/// The notes of this build (hookshot_pipelines.bin), each pipeline once
+std::vector<std::unique_ptr<PipeNote>> pipe_notes_read() {
+    std::vector<std::unique_ptr<PipeNote>> notes;
+    if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
+        uint64_t head[2] = {0, 0};
+        if (fread(head, 8, 2, f) == 2 && head[0] == program_cache_stamp() && head[1] == sizeof(PipeNote)) {
+            std::unordered_set<uint64_t> seen;
+            for (;;) {
+                auto rec = std::make_unique<PipeNote>();
+                if (fread(rec.get(), sizeof(PipeNote), 1, f) != 1) break;
+                if (seen.insert(rec->key).second) notes.push_back(std::move(rec));
+            }
+        }
+        fclose(f);
+    }
+    return notes;
+}
+/// A note's targets, as its draw had them
+Targets note_targets(const PipeNote& n) {
+    Targets at{};
+    at.n = (int)n.n;
+    at.samples = (VkSampleCountFlagBits)n.samples;
+    at.depth_format = (VkFormat)n.depth_format;
+    at.depth = n.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
+    for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
+    return at;
 }
 void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo) {
     static const bool off = getenv("RX_VK_NO_PROGRAM_CACHE") != nullptr;
@@ -1211,7 +1233,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             }
         }
     }
-    const VkResult r = guarded_graphics(part >= 0 ? VK_NULL_HANDLE : pcache, &ci, &pl);
+    const VkResult r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl);
     if (part >= 0) {
         if (r != VK_SUCCESS) {
             static std::atomic<int> logged;
@@ -1226,7 +1248,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         pl = VK_NULL_HANDLE;
     }
     st_pipelines++;
-    pcache_built_since_save++;
+    pcache_built_since_save += !driver_cache_only;
     st_pipeline_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
     return pl;
 }
@@ -5397,8 +5419,8 @@ bool precompile_wanted() {
     if (const char* e = getenv("RX_VK_PRECOMPILE")) on = atoi(e) != 0;
     return on;
 }
-/// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator
-void prepare_run(void (*progress)(size_t done, size_t total)) {
+/// Every shader of the game, before its first start (vk_shader.cpp, the seed): once for this translator. True: prepared now
+bool prepare_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
     char exe[MAX_PATH];
     const DWORD exe_n = game_module_path(exe, MAX_PATH);
@@ -5411,11 +5433,11 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
         fclose(f);
         if (same && !getenv("RX_VK_PREPARE_AGAIN")) {
             if (getenv("RX_VK_SEED_CHECK")) seed_open();
-            return;
+            return false;
         }
     }
     const size_t programs = seed_open();
-    if (!programs) return;
+    if (!programs) return false;
     const size_t total = programs * 3;   // (each program for float, one and two integer bone inputs)
     // The driver's part: each program's stage libraries, built once and let go, for the driver's own disk cache. What stays with us is
     // nothing: a kept library costs memory, and our pipeline cache would be read in whole at every start. A driver whose compiler
@@ -5434,36 +5456,47 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     auto blank = std::make_unique<NvnState>();
     blank->nvattr = 16;
     pcache_init();   // (once, here: the workers below build compute pipelines into it)
-    std::atomic<size_t> next{0}, done{0}, made{0}, libs{0};
+    std::atomic<size_t> next{0}, done{0}, made{0}, libs{0}, variants{0}, asking{0}, capped{0};
+    // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the driver compiled
+    // them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
+    const auto warm_compute = [&](Program& p) {
+        if (!warm_cs || taau_key(p.key)) return;
+        ensure_layout(p);
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = p.stages[0].module;
+        ci.stage.pName = "main";
+        pin_subgroup(ci.stage, p.workgroup[0]);
+        ci.layout = p.layout;
+        if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        VkPipeline pl = VK_NULL_HANDLE;
+        // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
+        // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
+        if (guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
+            vkDestroyPipeline(dev.device, pl, nullptr);
+            libs++;
+            pcache_built_since_save++;
+        }
+        if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
+        if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
+    };
     const auto worker = [&] {
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             const size_t i = next++;
             if (i >= total) return;
+            if (seed_is_compute(i / 3)) {   // (hookshot) a compute program with each of its texture variants, each warmed
+                if (i % 3 == 0) {
+                    const SeedVariants v = seed_compute(i / 3, 64, warm_compute);
+                    made += v.variants != 0, variants += v.variants, asking += v.variants > 1, capped += v.capped && v.variants;
+                }
+                done++;
+                continue;
+            }
             if (std::unique_ptr<Program> p = seed_program(i / 3, (int)(i % 3))) {
                 if (!p->failed) made++;
-                if (!p->failed && warm_cs && p->compute && !taau_key(p->key)) {
-                    // (hookshot) compute pipelines too, for the driver's own cache: built in play they stopped the game while the
-                    // driver compiled them, seconds each for the culling programs (53caac5f: 6.5 s, 41 s inlined), which looked like a hang
-                    ensure_layout(*p);
-                    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-                    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-                    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-                    ci.stage.module = p->stages[0].module;
-                    ci.stage.pName = "main";
-                    pin_subgroup(ci.stage, p->workgroup[0]);
-                    ci.layout = p->layout;
-                    if (getenv("RX_VK_NOOPT")) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
-                    VkPipeline pl = VK_NULL_HANDLE;
-                    // (into the app's pipeline cache, saved to mkw_vk_pipelines.bin: without it the next start compiled them again in play
-                    // where the driver's own cache missed them, AMD's 15 s culling compiles each time)
-                    if (guarded_compute(pcache, &ci, &pl) == VK_SUCCESS && pl) {
-                        vkDestroyPipeline(dev.device, pl, nullptr);
-                        libs++;
-                        pcache_built_since_save++;
-                    }
-                }
                 if (!p->failed && warm && !p->compute) {
                     ensure_layout(*p);
                     Targets at{};
@@ -5493,10 +5526,12 @@ void prepare_run(void (*progress)(size_t done, size_t total)) {
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
     int64_t translated = 0, failed = 0;
     shader_stats(&translated, &failed);
-    logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries) in %.1f s", programs, made.load(), (long long)failed,
-         libs.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    logf("vk: prepared %zu shader programs (%zu new, %lld failed, %zu stage libraries; %zu compute variants, %zu programs with "
+         "texture variants, %zu at the limit) in %.1f s", programs, made.load(), (long long)failed, libs.load(), variants.load(),
+         asking.load(), capped.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     remove(warming.c_str());
     if (FILE* f = fopen(path.c_str(), "wb")) fwrite(&stamp, 8, 1, f), fclose(f);
+    return true;
 }
 
 void precompile_run(void (*progress)(size_t done, size_t total)) {
@@ -5521,21 +5556,9 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     if (FILE* f = fopen(running.c_str(), "wb")) fprintf(f, "%d\n", ended_inside + 1), fclose(f);
     struct Done { const std::string& path; ~Done() { remove(path.c_str()); } } done_marker{running};
     pcache_init();
-    std::vector<std::unique_ptr<PipeNote>> notes;
+    std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     std::unordered_set<uint64_t> wanted;
-    if (FILE* f = fopen(pipe_notes_path().c_str(), "rb")) {
-        uint64_t head[2] = {0, 0};
-        if (fread(head, 8, 2, f) == 2 && head[0] == program_cache_stamp() && head[1] == sizeof(PipeNote)) {
-            std::unordered_set<uint64_t> seen;
-            for (;;) {
-                auto rec = std::make_unique<PipeNote>();
-                if (fread(rec.get(), sizeof(PipeNote), 1, f) != 1) break;
-                wanted.insert(rec->prog);
-                if (seen.insert(rec->key).second) notes.push_back(std::move(rec));
-            }
-        }
-        fclose(f);
-    }
+    for (const auto& n : notes) wanted.insert(n->prog);
     std::vector<Program*> computes;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
         ensure_layout(p);
@@ -5581,13 +5604,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
                 PipeNote& n = *notes[i - computes.size()];
                 const Program* p = program_find(n.prog, n.variant);
                 if (p) {
-                    Targets at{};
-                    at.n = (int)n.n;
-                    at.samples = (VkSampleCountFlagBits)n.samples;
-                    at.depth_format = (VkFormat)n.depth_format;
-                    at.depth = n.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
-                    for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)n.color_format[k];
-                    const VkPipeline made = build_graphics(*p, n.s, at, (VkPrimitiveTopology)n.topo);
+                    const VkPipeline made = build_graphics(*p, n.s, note_targets(n), (VkPrimitiveTopology)n.topo);
                     std::lock_guard lk(note_mu);
                     auto it = pipelines.find(n.key);
                     if (it == pipelines.end()) {
@@ -5631,6 +5648,49 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     }
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms", programs_n, graphics_n, computes_n,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// (hookshot) The pipelines the notes predict for the programs no note names (vk_predict.cpp), after a prepare that prepared: each built
+// once for the driver's own cache and let go. Not into ours (mkw_vk_pipelines.bin, read whole at every start: ~40000 more pipelines made
+// it 1.7 GB), nor kept: each program is borrowed from hookshot_programs.bin for its pipelines and let go
+void predict_run(void (*progress)(size_t done, size_t total)) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
+    if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
+    size_t programs = 0;
+    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs);
+    std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
+    for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
+    std::vector<uint64_t> keys;
+    for (const auto& kv : by_program) keys.push_back(kv.first);
+    std::atomic<size_t> next{0}, done{0}, made{0};
+    const auto worker = [&] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's)
+        driver_cache_only = true;
+        for (;;) {
+            const size_t i = next++;
+            if (i >= keys.size()) return;
+            const auto& list = by_program[keys[i]];
+            program_cache_borrow(keys[i], [&](Program& p) {
+                ensure_layout(p);
+                for (const PipeNote* n : list)
+                    if (n->variant == p.variant)
+                        if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
+                            vkDestroyPipeline(dev.device, pl, nullptr), made++;
+            });
+            done += list.size();
+        }
+    };
+    std::vector<std::thread> threads;
+    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    while (next.load() < keys.size() + threads.size()) {
+        if (progress) progress(done.load(), predicted.size());
+        Sleep(100);
+    }
+    for (std::thread& t : threads) t.join();
+    logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s", predicted.size(),
+         notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {

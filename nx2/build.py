@@ -25,15 +25,18 @@ Usage:  python -I nx2/build.py [--jobs 1] [--only 0,7] [--opt O1] [--no-polls] [
 """
 import argparse
 import concurrent.futures
+import ctypes
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # (python -I leaves the script folder off)
 import kit
+import lifted_c
 import rtgen
 import toolchain
 import version
@@ -178,17 +181,27 @@ def cache_put(obj, key):
         shutil.copyfile(obj, dst)
 
 
+class MemoryStatus(ctypes.Structure):   # (Windows' MEMORYSTATUSEX, for GlobalMemoryStatusEx)
+    _fields_ = [("len", ctypes.c_uint32), ("load", ctypes.c_uint32)] + \
+               [(f, ctypes.c_uint64) for f in ("total", "avail", "pt", "pa", "vt", "va", "ve")]
+
+
+class ProcessMemory(ctypes.Structure):   # (Windows' PROCESS_MEMORY_COUNTERS, for GetProcessMemoryInfo)
+    _fields_ = [("cb", ctypes.c_uint32), ("faults", ctypes.c_uint32)] + \
+               [(f, ctypes.c_size_t) for f in ("peak_ws", "ws", "qpp", "qp", "qnpp", "qnp", "pf", "peak_pf")]
+
+
+# (what one compiler is counted at where its own need is not worked out: a hot piece (0.8-1.7 GB measured, -O2 and the profile),
+# and the compile countdown's guess of how many the free memory holds. About the median chunk's peak)
+COMPILER_MB = 1500
+
+
 def free_mb():
     """The memory free now (MemAvailable on Linux, the available physical memory on Windows), in MB; None: not known"""
     try:
         if os.name == "nt":
-            import ctypes
-
-            class MS(ctypes.Structure):
-                _fields_ = [("len", ctypes.c_uint32), ("load", ctypes.c_uint32)] + \
-                           [(f, ctypes.c_uint64) for f in ("total", "avail", "pt", "pa", "vt", "va", "ve")]
-            m = MS()
-            m.len = ctypes.sizeof(MS)
+            m = MemoryStatus()
+            m.len = ctypes.sizeof(MemoryStatus)
             return m.avail >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
         with open("/proc/meminfo") as f:
             for line in f:
@@ -222,13 +235,8 @@ def rss_mb(proc):
         return 0
     try:
         if os.name == "nt":
-            import ctypes
-
-            class PMC(ctypes.Structure):
-                _fields_ = [("cb", ctypes.c_uint32), ("faults", ctypes.c_uint32)] + \
-                           [(f, ctypes.c_size_t) for f in ("peak_ws", "ws", "qpp", "qp", "qnpp", "qnp", "pf", "peak_pf")]
-            c = PMC()
-            c.cb = ctypes.sizeof(PMC)
+            c = ProcessMemory()
+            c.cb = ctypes.sizeof(ProcessMemory)
             ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
             return c.ws >> 20 if ok else 0
         return tree_rss(proc.pid) >> 20
@@ -243,16 +251,12 @@ def mem_need(src):
     files up to ~1 GB"""
     name = os.path.basename(src)
     if name.startswith("code_hot"):
-        return 1500
+        return COMPILER_MB
     if name.startswith("code_"):
         with open(src, "rb") as f:
             text = f.read()
-        starts, at = [], text.find(b"\nvoid f_")
-        while at >= 0:
-            if text.endswith(b"{", 0, text.find(b"\n", at + 1)):   # (a definition, not one of the declarations above them)
-                starts.append(at)
-            at = text.find(b"\nvoid f_", at + 1)
-        starts.append(len(text))
+        # (each function from the newline before its definition, as this was first measured)
+        starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)] + [len(text)]
         largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
         return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
     return 1000 if src.endswith(".cpp") else 400
@@ -269,7 +273,6 @@ class MemoryGate:
     compiles wait"""
 
     def __init__(self):
-        import threading
         self.cv = threading.Condition()
         self.running = {}   # (src: [need, Popen or None])
         self.reserve = float(os.environ.get("HOOKSHOT_MEM_RESERVE_GB") or 1.5) * 1024
@@ -293,12 +296,12 @@ class MemoryGate:
             self.running[src][1] = proc
 
     def expected(self, jobs):
-        """How many compilers the memory free now is likely to hold at once (a 1.5 GB file each, the median chunk's peak),
-        between the floor and the jobs: the compile countdown's estimate"""
+        """How many compilers the memory free now is likely to hold at once (COMPILER_MB each), between the floor and the jobs:
+        the compile countdown's estimate"""
         free = free_mb()
         if free is None:
             return jobs
-        return max(self.floor, min(jobs, int((free - self.reserve) // 1500)))
+        return max(self.floor, min(jobs, int((free - self.reserve) // COMPILER_MB)))
 
     def leave(self, src):
         with self.cv:
@@ -503,7 +506,7 @@ PLANNED = {}   # (src, obj) -> the object key plan_jobs worked out, so compile_o
 # (hookshot) the order of the compile: the longest first (LPT), so no long one starts late and runs alone at the end. The lift's
 # estimate (gen/chunk_costs.txt, nx2/chunks.py fn_cost: functions cost with the square of their size) where it is there, else the size.
 # HOT_COST: how much longer the hot flags (-O2, the profile, the hot callees inlined) take for the same estimate. Fitted to a cold build
-# on a Ryzen 9 7900X; by size alone the hot pieces (9 MB, up to 333 s) started after every 25 MB chunk (45 s)
+# on a 24-thread desktop; by size alone the hot pieces (9 MB, up to 333 s) started after every 25 MB chunk (45 s)
 HOT_COST = 4
 
 
@@ -689,11 +692,11 @@ def main():
         # keeps them)
         stamp = hashlib.sha1()
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
-        for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
+        for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
+        shader_stamp = "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
-            "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
@@ -718,7 +721,8 @@ def main():
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []),
+                            vflags + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []),
                             vk_lib_deps if lib else vdeps))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
             cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
@@ -894,3 +898,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

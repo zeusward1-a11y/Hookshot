@@ -13,7 +13,8 @@ cpp=r"""
 #include <vector>
 using std::size_t;
 std::vector<int> calls;
-void prepare_run(void(*)(size_t,size_t)){calls.push_back(1);}
+bool prepare_run(void(*)(size_t,size_t)){calls.push_back(1);return true;}
+void predict_run(void(*)(size_t,size_t)){calls.push_back(5);}
 void precompile_run(void(*)(size_t,size_t)){calls.push_back(2);}
 void pipeline_cache_save(bool force){if(!force)std::exit(2);calls.push_back(3);}
 std::string skipped_path(){return "sentinel";}
@@ -22,7 +23,7 @@ int fake_remove(const char*){calls.push_back(4);return 0;}
 bool run(){
 """+body+r"""
 }
-int main(){if(!run()||calls!=std::vector<int>{1,2,3,4}){std::fputs("FAIL: preparation must synchronously force cache save before clearing skipped marker\n",stderr);return 1;}std::puts("PASS: actual preparation branch forces save after precompile before marker cleanup");}
+int main(){if(!run()||calls!=std::vector<int>{1,5,2,3,4}){std::fputs("FAIL: preparation must synchronously force cache save before clearing skipped marker\n",stderr);return 1;}std::puts("PASS: actual preparation branch forces save after precompile before marker cleanup");}
 """
 with tempfile.TemporaryDirectory(prefix='prepare-cache-') as tmp:
     src=Path(tmp)/'fixture.cpp';exe=Path(tmp)/'fixture.exe';src.write_text(cpp)

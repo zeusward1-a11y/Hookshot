@@ -59,6 +59,9 @@ const void* descriptor_ok(const void* p, size_t n);
 void texture_released(uint64_t serial);
 bool texture_of(int id, nvn_tex* t, nvn_view* v, bool* has_view);
 void cs_slot_counts(const NvnState& s, uint32_t* tex, uint32_t* img);   // (hookshot) the compute program's slot counts
+/// (hookshot) set while a seed compute program is translated: its control section, which the c0 layout is read from in place of
+/// the bound program's (vk_bank.cpp)
+extern thread_local const uint8_t* seed_cs_control;
 bool sampler_of(int id, nvn_samp_par* p);
 /// Changes whenever a texture slot may resolve to another texture (a registration, a texture finalized)
 uint64_t registrations_generation();

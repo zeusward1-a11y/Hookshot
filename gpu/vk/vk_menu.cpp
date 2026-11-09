@@ -63,8 +63,35 @@ const char* tx_percent(int v) {
     snprintf(b, sizeof b, "%d%%", v);
     return b;
 }
+// The output the menu's sizes are shown for: the Output resolution row's (applied at the next start), so the rows below follow a change
+// at once; the handheld profile runs the game's own (1536x864)
+struct Out {
+    uint32_t w, h;
+};
+Out shown_output() {
+    static const Out t[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}};
+    return opts.handheld ? Out{1536, 864} : t[std::min(std::max(opts.output_res, 0), 2)];
+}
+constexpr int kResPercent[] = {0, 100, 75, 67, 50};
+// The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
+// outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
+// 3840x2160, not the 2560x1440 of 8/12.
+int twelfths(float scale) { return std::min(std::max((int)(scale * 12.0f + 0.5f), 1), 12); }
+void game_size(float scale, uint32_t& w, uint32_t& h) {
+    const Out o = shown_output();
+    const int k = twelfths(scale);
+    w = (o.w * k + 11) / 12, h = o.h * k / 12;
+}
 const char* tx_resolution(int v) {
-    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%"};
+    static char b[48];
+    if (v <= 0 || v > 4) return "Auto (dynamic)";
+    uint32_t w, h;
+    game_size(kResPercent[v] / 100.0f, w, h);
+    snprintf(b, sizeof b, "%d%% (%ux%u)", kResPercent[v], w, h);
+    return b;
+}
+const char* tx_output_res(int v) {
+    static const char* t[] = {"2048x1152 (game, restart)", "2560x1440 (restart)", "3840x2160 (restart)"};
     return t[v];
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
@@ -150,6 +177,9 @@ Row rows[] = {
     {TAB_GRAPHICS, "Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
      "faster."},
+    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, 2, 1, tx_output_res,
+     "The size the game draws its whole frame at, HUD included, before it is scaled to your window. The 3D is drawn at the "
+     "Resolution percentage of it. Docked only. Applies after a restart."},
     {TAB_GRAPHICS, "Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
@@ -323,6 +353,7 @@ std::string ini_path() {
     return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_options.ini";
 }
 const char* ini_key(const Row& r) {
+    if (r.value == &opts.output_res) return "output_res";   // (host/nn_applet.c reads it at the start)
     static char k[32];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
@@ -516,6 +547,19 @@ void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, 
     HGDIOBJ old = SelectObject(dc, bmp);
     paint(dc, w, h, scale);
     GdiFlush();
+    if (const char* dir = &out == &menu_bmp ? getenv("RX_VK_MENU_DUMP") : nullptr) {   // (test runs: each drawing of the menu, as menu_<n>.bmp)
+        static int n = 0;
+        char path[1024];
+        snprintf(path, sizeof path, "%s/menu_%03d.bmp", dir, n++);
+        if (FILE* f = fopen(path, "wb")) {   // (the 14-byte file header and the 40-byte info header, little-endian: 32-bit, top-down)
+            uint8_t hd[54] = {'B', 'M'};
+            auto put = [&](int at, uint32_t v, int bytes) { for (int i = 0; i < bytes; i++) hd[at + i] = (uint8_t)(v >> (8 * i)); };
+            put(2, 54 + w * h * 4, 4), put(10, 54, 4), put(14, 40, 4), put(18, w, 4), put(22, (uint32_t)-(int32_t)h, 4), put(26, 1, 2),
+                put(28, 32, 2);
+            fwrite(hd, 1, sizeof hd, f), fwrite(bits, 4, (size_t)w * h, f);
+            fclose(f);
+        }
+    }
     const bool rgba = dev.swap_format == VK_FORMAT_R8G8B8A8_UNORM || dev.swap_format == VK_FORMAT_R8G8B8A8_SRGB;
     std::lock_guard lk(bmp_mu);
     out.w = w, out.h = h;
@@ -1004,6 +1048,13 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
+    if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = std::min(std::max(atoi(e), 0), 2);
+}
+
+bool resolution_auto() { return opts.resolution == 0; }
+int resolution_scale() {
+    const float s = opts.resolution > 0 && opts.resolution <= 4 ? kResPercent[opts.resolution] / 100.0f : 0;
+    return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 
 void menu_set_gpu_count(int count) {
@@ -1149,6 +1200,18 @@ void menu_tick() {
     if (open_now.load() && listening != 1) {
         press[1] |= pad(HOS_PAD_UP), press[2] |= pad(HOS_PAD_DOWN), press[3] |= pad(HOS_PAD_LEFT);
         press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(HOS_PAD_EAST), press[7] |= pad(HOS_PAD_SOUTH);
+    }
+    {   // RX_VK_MENU_SCRIPT (test runs, which never have the focus): timed menu keys, "<seconds>:<INS|UP|DOWN|LEFT|RIGHT|ESC|ENTER|TABL|TABR>,..."
+        static const char* next = getenv("RX_VK_MENU_SCRIPT");
+        static const int64_t start = prof_now();
+        double at;
+        char key[8];
+        int n = 0;
+        if (next && sscanf(next, "%lf:%7[A-Z]%n", &at, key, &n) == 2 && (prof_now() - start) / 1e9 >= at) {
+            static const char* names[] = {"INS", "UP", "DOWN", "LEFT", "RIGHT", "ESC", "", "ENTER", "", "", "TABL", "TABR"};
+            for (int i = 0; i < 12; i++) press[i] |= *names[i] && !strcmp(key, names[i]);
+            next = next[n] == ',' ? next + n + 1 : nullptr;
+        }
     }
     bool tab_left = press[10] || pad(HOS_PAD_LSHOULDER) || pad(HOS_PAD_LTRIGGER);
     bool tab_right = press[11] || press[12] || pad(HOS_PAD_RSHOULDER) || pad(HOS_PAD_RTRIGGER);

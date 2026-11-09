@@ -518,11 +518,13 @@ bool started_up() {
     if (const char* e = getenv("RX_VK_START_DELAY")) Sleep((DWORD)atoi(e) * 1000);   // (diagnosis: a long start, as the first one is)
     if (!replay_start()) return false;
     if (prepare_only()) {
-        static int part;   // (two parts: the programs, then the pipelines the notes name; most of the time is the first)
+        // (three parts: the programs, the pipelines the notes predict, then those they name; most of the time is the first)
+        static int part;
         const auto progress = [](size_t done, size_t total) {
             static size_t last = ~(size_t)0;
             if (!total) return;
-            const size_t at = (part ? 900 : 0) + done * (part ? 100 : 900) / total;
+            static const size_t from[3] = {0, 700, 900}, span[3] = {700, 200, 100};
+            const size_t at = from[part] + done * span[part] / total;
             if (at == last) return;
             last = at;
             printf("@@progress %.3f\n", at / 1000.0);
@@ -531,8 +533,10 @@ bool started_up() {
         printf("@@stage shaders Preparing shaders\n");
         fflush(stdout);
         part = 0;
-        prepare_run(progress);
+        const bool prepared = prepare_run(progress);
         part = 1;
+        if (prepared) predict_run(progress);
+        part = 2;
         precompile_run(progress);
         pipeline_cache_save(true);
         remove(skipped_path().c_str());
@@ -574,7 +578,7 @@ bool started_up() {
             DWORD wrote = 0;
             WriteFile(console, line, (DWORD)n, &wrote, nullptr);
         };
-        prepare_run(progress);
+        if (prepare_run(progress)) predict_run(progress);
         precompile_run(progress);
         if (console) CloseHandle(console), console = nullptr, FreeConsole();
     }

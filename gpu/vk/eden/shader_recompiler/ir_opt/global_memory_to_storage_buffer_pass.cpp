@@ -64,7 +64,7 @@ bool SplitFallbackOn() {
 }
 /// (hookshot) Switches for the analysis ported from Fritchii (Frizti/Fritchii), read once. EDEN_* variables are part of the
 /// program cache's key (vk_shader.cpp disk_stamp), so a change translates the programs again.
-///   EDEN_NX2_GM_LEGACY=1     the tracking as before the port (NVN-biased, then unbiased search; no pairing, no native rules)
+///   EDEN_NX2_GM_LEGACY=0     the port (default 1 since v2.0.4: the tracking as before the port (NVN-biased, then unbiased search; no pairing, no native rules)
 ///   EDEN_NX2_GM_NATIVE=0     the pairing, but not the native-program rules (mapped pointers, candidates bound together)
 ///   EDEN_NX2_GM_COMPETING=0  a split access's tracked pointer is not bound (Lichii #410's adaptation off)
 bool EnvSwitch(const char* name, bool fallback) {
@@ -72,7 +72,10 @@ bool EnvSwitch(const char* name, bool fallback) {
     return value && *value ? std::atoi(value) != 0 : fallback;
 }
 bool GmLegacy() {
-    static const bool on{EnvSwitch("EDEN_NX2_GM_LEGACY", false)};
+    // (the tracking as before is the default again since v2.0.4: with the port on, v2.0.3 drew Link and the NPCs nearly black
+    // and its lighting wrong (Discord, 11-08; an A/B in Link's house: his face lit with it off, a dark silhouette with it on),
+    // and more draws cost fps. EDEN_NX2_GM_LEGACY=0: the port, for testing)
+    static const bool on{EnvSwitch("EDEN_NX2_GM_LEGACY", true)};
     return on;
 }
 bool GmNative() {

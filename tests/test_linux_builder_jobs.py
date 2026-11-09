@@ -117,7 +117,7 @@ class BuilderBuildJobsTests(unittest.TestCase):
         self.assert_started(harness, 2)
         self.assertEqual(harness.environ, {"HOOKSHOT_JOBS": "", "RX_JOBS": "2"})
 
-    # (issue 531) Neither set: no --jobs, so make_game chooses from the free memory, as on Windows
+    # (issue 531) Neither set: no --jobs, so make_game chooses (one per CPU thread, the memory gate deciding), as on Windows
     def test_no_override_leaves_the_choice_to_make_game(self):
         for environ in ({}, {"HOOKSHOT_JOBS": "0"}, {"HOOKSHOT_JOBS": "", "RX_JOBS": ""}):
             with self.subTest(environ=environ):
@@ -156,9 +156,8 @@ class BuilderBuildJobsTests(unittest.TestCase):
 class MakeGameJobsTests(unittest.TestCase):
     """make_game's own choice, which the Linux window now leaves to it (issue 531)"""
 
-    def choose(self, cpus, free_gb, os_name):
+    def choose(self, cpus, os_name):
         with mock.patch.object(make_game.os, "cpu_count", return_value=cpus), \
-                mock.patch.object(make_game, "free_memory_gb", return_value=free_gb), \
                 mock.patch.object(make_game.os, "name", os_name), \
                 contextlib.redirect_stdout(io.StringIO()):
             return make_game.default_jobs()
@@ -166,9 +165,9 @@ class MakeGameJobsTests(unittest.TestCase):
     def test_one_a_cpu_thread_and_the_memory_gate_decides(self):
         # (nx2/build.py's MemoryGate starts each compiler when the memory free holds it, so the count is not fitted to the free
         # memory at the start; the window chose 7 from 32 GB total at 3.5 GB each on a 16-thread PC)
-        self.assertEqual(self.choose(16, 24.0, "posix"), 16)
-        self.assertEqual(self.choose(16, 24.0, "nt"), 16)
-        self.assertEqual(self.choose(32, 3.0, "posix"), 32)
+        self.assertEqual(self.choose(16, "posix"), 16)
+        self.assertEqual(self.choose(16, "nt"), 16)
+        self.assertEqual(self.choose(32, "posix"), 32)
 
     def test_the_gate_floor_is_windows_only(self):
         # (Windows pages rather than fails; Linux stops a compiler that does not fit)
@@ -177,9 +176,6 @@ class MakeGameJobsTests(unittest.TestCase):
             self.assertEqual(build.MemoryGate().floor, 4)
         with mock.patch.object(build.os, "cpu_count", return_value=16), mock.patch.object(build.os, "name", "posix"):
             self.assertEqual(build.MemoryGate().floor, 1)
-
-    def test_memory_not_known_is_one_a_thread(self):
-        self.assertEqual(self.choose(12, None, "posix"), 12)
 
     def chosen(self, given, environ):
         calls = []

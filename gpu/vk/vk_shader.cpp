@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <functional>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -336,6 +337,23 @@ bool handle_is_integer(uint32_t handle) {
     }
 }
 
+// (hookshot) A compute program's texture variants (seed_compute): translated with nothing bound, every texture question of a compute program
+// is asked of handle 0, and which slot asks is not known. Under `forced`, c0's texture and image handles read as tokens of their
+// slots, each question is noted once by its handle, and the answer wanted for it is given in place of an unbound slot's
+struct Forced {
+    uint32_t lo = 0, hi = 0;   // c0's texture and image handles (the program's layout)
+    std::vector<std::pair<uint32_t, uint8_t>> asked;   // (handle, 0: its type / 1: whether its format is integer), in order
+    std::map<std::pair<uint32_t, uint8_t>, uint8_t> want;
+    uint8_t answer(uint32_t handle, uint8_t kind, uint8_t plain) {
+        const std::pair<uint32_t, uint8_t> q{handle, kind};
+        if (std::find(asked.begin(), asked.end(), q) == asked.end()) asked.push_back(q);
+        const auto it = want.find(q);
+        return it != want.end() ? it->second : plain;
+    }
+};
+thread_local Forced* forced = nullptr;
+thread_local std::vector<std::vector<uint32_t>>* seed_capture = nullptr;   // (the translation's SPIR-V, kept here and not on disk)
+
 class Env final : public Shader::Environment {
 public:
     Env(const NvnState& state, const Code& c, Shader::Stage st) : s{state}, nvn{c} {
@@ -360,6 +378,8 @@ public:
             if ((size_t)offset + 4 <= nvn.c1.size()) std::memcpy(&v, nvn.c1.data() + offset, 4);
             return v;
         }
+        if (forced && index == 0 && nvn.stage == 5 && offset >= forced->lo && offset < forced->hi && !(offset & 7))
+            return 0x8000 | offset;   // (a slot's token: nothing is bound in the seed)
         if (index == 0 || index == 2) return driver_bank_word(s, (int)index, nvn.stage, offset);
         if (index >= 3 && index < 3 + 16) {
             const nvn_p_bind_buf& u = s.ubo[nvn.stage][index - 3];
@@ -371,6 +391,7 @@ public:
     }
     Shader::TextureType ReadTextureType(u32 handle) override {
         texture_questions++;
+        if (forced && handle) return (Shader::TextureType)forced->answer(handle, 0, (uint8_t)Shader::TextureType::Color2D);
         return handle_texture_type(handle);
     }
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
@@ -378,6 +399,7 @@ public:
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
         texture_questions++;
+        if (forced && handle) return forced->answer(handle, 1, 0) != 0;
         return handle_is_integer(handle);
     }
     int texture_questions = 0;   // (the variant then depends on the bound textures: Program::answers)
@@ -1026,7 +1048,7 @@ void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t
 }
 
 /// (shader_mu held) the kept variants of key go to its list, ready, once
-void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants) {
+void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool keep = false) {
     disk_init();
     if (!disk_on) return;
     std::vector<DiskRecord> recs;
@@ -1034,8 +1056,12 @@ void program_cache_load(uint64_t key, std::vector<std::unique_ptr<Program>>& var
         std::lock_guard lk(disk_mu);
         auto it = disk_records.find(key);
         if (it == disk_records.end()) return;
-        recs = std::move(it->second);
-        disk_records.erase(it);
+        if (keep) {   // (borrowed: still on disk for play)
+            recs = it->second;
+        } else {
+            recs = std::move(it->second);
+            disk_records.erase(it);
+        }
     }
     for (const DiskRecord& d : recs) {
         std::vector<uint8_t> data(d.size);
@@ -1237,12 +1263,14 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
         if (questions) record_answers(p, s);
         st_translated++;
         ptr_diag_log(p.key, csc ? "compute" : fsc ? "graphics" : "vertex");
-        program_cache_save(p, kept);
+        if (seed_capture) *seed_capture = std::move(kept);
+        else program_cache_save(p, kept);
     } catch (const std::exception& e) {
         p.failed = true;
-        st_failed++;
+        const bool trial = forced && !forced->want.empty();   // (an answer seed_compute tries: it may well not translate)
+        if (!trial) st_failed++;
         static std::atomic<int> logged;
-        if (logged++ < 30) logf("vk: program %016llx not translated: %s", (unsigned long long)p.key, e.what());
+        if (!trial && logged++ < 30) logf("vk: program %016llx not translated: %s", (unsigned long long)p.key, e.what());
     }
     st_translate_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     p.ready.store(true, std::memory_order_release);
@@ -1727,6 +1755,62 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     return n;
 }
 
+/// (hookshot) Program key's kept variants made for fn, then let go (modules and layouts): the records stay for play
+void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn) {
+    std::vector<std::unique_ptr<Program>> variants;
+    program_cache_load(key, variants, true);
+    for (auto& p : variants) {
+        fn(*p);
+        for (Stage& st : p->stages)
+            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+        if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
+        if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+    }
+}
+
+/// (hookshot, the prediction: vk_predict.cpp) every kept graphics program variant, read without making its modules
+void program_cache_each(const std::function<void(const KeptProgram&)>& fn) {
+    disk_init();
+    if (!disk_on) return;
+    std::vector<std::pair<uint64_t, DiskRecord>> all;
+    {
+        std::lock_guard lk(disk_mu);
+        for (const auto& kv : disk_records)
+            for (const DiskRecord& d : kv.second)
+                if (!(d.kind & 1)) all.push_back({kv.first, d});
+    }
+    std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.second.at < b.second.at; });   // (file order)
+    KeptProgram k;
+    for (const auto& [key, d] : all) {
+        std::vector<uint8_t> data(d.size);
+        {
+            std::lock_guard lk(disk_mu);
+            _fseeki64(disk_in, d.at, SEEK_SET);
+            if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
+        }
+        Reader r{data.data(), data.data() + data.size()};
+        Program p;
+        p.key = key;
+        const uint32_t kind = r.get<uint32_t>();
+        r.list(p.answers);
+        k.key = key, k.variant = answers_hash(p), k.mesh = (kind & 2) != 0;
+        r.get<std::array<uint32_t, 3>>();
+        r.get<uint32_t>();   // (shared memory)
+        const uint64_t n = r.count(1);
+        k.stages.resize(n <= 8 ? n : 0);
+        for (auto& [stage, spirv] : k.stages) {
+            r.get<int>();
+            stage = r.get<VkShaderStageFlagBits>();
+            r.list(spirv);
+            std::vector<uint8_t> c1;
+            r.list(c1);
+            Shader::Info info;
+            get_info(r, info);
+        }
+        if (!r.bad && !k.stages.empty()) fn(k);
+    }
+}
+
 // ---- (hookshot) Every shader of the game before it starts, as TotK Recomp's tools/prepare_shaders.py and totk.exe --prepare-shaders: the
 // builder writes hookshot_shaders.bin (nx2/shader_census.py) from the archives, each program's stages, and here each is translated
 // for the default state (nothing bound, float inputs and outputs) and kept in hookshot_programs.bin. What a draw then asks for is on
@@ -1859,12 +1943,144 @@ std::unique_ptr<Program> seed_program(size_t i, int inputs) {
     p->mesh = by_stage[7] != nullptr;
     if (p->mesh)
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, no_types);
-    else if (p->compute)
+    else if (p->compute) {
+        seed_cs_control = seed.blob.data() + by_stage[5]->control;
         translate_into(*p, *blank, nullptr, nullptr, &code[5], no_types);
-    else
+        seed_cs_control = nullptr;
+    } else
         translate_into(*p, *blank, &code[0], by_stage[1] ? &code[1] : nullptr, nullptr, no_types);
     return p;
 }
+
+bool seed_is_compute(size_t i) {
+    for (const uint32_t k : seed.programs[i])
+        if ((seed.stages[k].stage & 7) == 5) return true;
+    return false;
+}
+
+// (hookshot) The seed's compute programs, each with its texture variants. A program's texture questions are answered in play by the
+// textures bound (Program::answers), which nothing before the game knows; the questions themselves are few, so each is tried with every
+// answer it can get, and an answer that changes the SPIR-V makes a variant. Variants of two answers and more are taken fewest first, up
+// to cap: one of them is the variant play makes, which still_valid then finds kept. All go to hookshot_programs.bin, as play keeps them,
+// and each new one is given to made (its modules live until it returns)
+SeedVariants seed_compute(size_t i, size_t cap, const std::function<void(Program&)>& made) {
+    static const uint8_t no_types[8]{};
+    SeedVariants r;
+    const SeedStage* cs = nullptr;
+    for (const uint32_t k : seed.programs[i])
+        if ((seed.stages[k].stage & 7) == 5) cs = &seed.stages[k];
+    if (!cs || !cs->end) return r;
+    // (the variants kept already, by play or an earlier prepare: the others are
+    // still asked for, as a kept base says nothing of them)
+    std::unordered_set<uint64_t> variants;
+    {
+        std::lock_guard lk(disk_mu);
+        if (auto it = disk_records.find(cs->key); it != disk_records.end())
+            for (const DiskRecord& d : it->second) {
+                std::vector<uint8_t> data(d.size);
+                _fseeki64(disk_in, d.at, SEEK_SET);
+                if (fread(data.data(), 1, d.size, disk_in) != d.size) continue;
+                Reader rd{data.data(), data.data() + data.size()};
+                Program q;
+                rd.get<uint32_t>();
+                rd.list(q.answers);
+                if (!rd.bad) variants.insert(answers_hash(q));
+            }
+    }
+    const size_t had = variants.size();
+    const Code code = stage_of_seed(*cs);
+    if (!code.ok) return st_failed++, r.failed = true, r;
+    auto blank = std::make_unique<NvnState>();
+    blank->nvattr = 16;
+    seed_cs_control = seed.blob.data() + cs->control;
+    struct Reset { ~Reset() { seed_cs_control = nullptr, forced = nullptr, seed_capture = nullptr; } } reset;
+    Forced f;
+    uint32_t count = 0, end = 0;
+    f.lo = compute_ssbo_table(*blank, &count, &end) + 16 * count;   // (the texture handles follow the storage buffers)
+    f.hi = end;
+    struct Try {
+        std::unique_ptr<Program> p;
+        std::vector<std::vector<uint32_t>> spirv;
+        std::vector<std::pair<uint32_t, uint8_t>> asked;
+    };
+    const auto run = [&](std::map<std::pair<uint32_t, uint8_t>, uint8_t> want) {
+        Try t;
+        f.asked.clear();
+        f.want = std::move(want);
+        t.p = std::make_unique<Program>();
+        t.p->key = cs->key;
+        t.p->compute = true;
+        forced = &f, seed_capture = &t.spirv;
+        translate_into(*t.p, *blank, nullptr, nullptr, &code, no_types);
+        forced = nullptr, seed_capture = nullptr;
+        t.asked = f.asked;
+        return t;
+    };
+    const auto drop = [](Try& t) {
+        for (Stage& st : t.p->stages)
+            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr), st.module = VK_NULL_HANDLE;
+    };
+    std::vector<Try> kept;
+    kept.push_back(run({}));
+    if (kept[0].p->failed) return drop(kept[0]), r.failed = true, r;
+    const auto base_asked = kept[0].asked;
+    const auto base_spirv = kept[0].spirv;
+    r.questions = base_asked.size();
+    // each question alone: the answers that change the SPIR-V
+    std::vector<std::vector<uint8_t>> options(base_asked.size());
+    for (size_t q = 0; q < base_asked.size(); q++) {
+        const uint8_t kind = base_asked[q].second, plain = kind ? 0 : (uint8_t)Shader::TextureType::Color2D;
+        for (uint8_t a = 0; a < (kind ? 2 : 9); a++) {
+            if (a == plain) continue;
+            Try t = run({{base_asked[q], a}});
+            if (!t.p->failed && t.asked == base_asked && t.spirv != base_spirv && kept.size() < cap) {
+                options[q].push_back(a);
+                kept.push_back(std::move(t));
+            } else {
+                drop(t);
+            }
+        }
+    }
+    // then two answers and more, fewest first
+    std::vector<size_t> open;
+    for (size_t q = 0; q < options.size(); q++)
+        if (!options[q].empty()) open.push_back(q);
+    for (size_t n = 2; n <= open.size() && kept.size() < cap; n++) {
+        std::vector<size_t> pick(n), choice(n);
+        for (size_t k = 0; k < n; k++) pick[k] = k;
+        for (;;) {   // (each n of the open questions, each answer of each)
+            std::fill(choice.begin(), choice.end(), 0);
+            for (;;) {
+                if (kept.size() >= cap) break;
+                std::map<std::pair<uint32_t, uint8_t>, uint8_t> want;
+                for (size_t k = 0; k < n; k++) want[base_asked[open[pick[k]]]] = options[open[pick[k]]][choice[k]];
+                Try t = run(std::move(want));
+                if (!t.p->failed && t.asked == base_asked) kept.push_back(std::move(t));
+                else drop(t);
+                size_t k = 0;
+                while (k < n && ++choice[k] == options[open[pick[k]]].size()) choice[k++] = 0;
+                if (k == n) break;
+            }
+            if (kept.size() >= cap) break;
+            size_t k = n;
+            while (k > 0 && pick[k - 1] == open.size() - n + k - 1) k--;
+            if (k == 0) break;
+            pick[k - 1]++;
+            for (size_t j = k; j < n; j++) pick[j] = pick[j - 1] + 1;
+        }
+    }
+    r.capped = kept.size() >= cap;
+    for (Try& t : kept) {
+        if (variants.insert(t.p->variant).second) {
+            program_cache_save(*t.p, t.spirv), r.variants++;
+            if (made) made(*t.p);
+        }
+        drop(t);
+    }
+    r.kept = had && !r.variants;
+    return r;
+}
+
 const Program* program_find(uint64_t key, uint64_t variant) {
     std::lock_guard lk(shader_mu);
     auto it = programs.find(key);

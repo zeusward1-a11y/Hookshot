@@ -18,6 +18,9 @@
 #include "vk_state.h"
 
 namespace mkwvk {
+// (hookshot) the seed's compute programs (vk_shader.cpp seed_program) have no bound program to read their layout from. Translated
+// with Maxwell's table instead, one kept the right key and the wrong storage buffers, and play would have used it as it was
+thread_local const uint8_t* seed_cs_control = nullptr;
 namespace {
 
 struct TexReg {
@@ -51,7 +54,14 @@ struct CsLayout {
     uint32_t img_at() const { return tex_at() + 8 * tex; }
     uint32_t end() const { return img_at() + 8 * img; }
 };
+CsLayout cs_layout_of(const uint8_t* c) {   // (c: the control section from +0x58)
+    CsLayout l;
+    l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
+    l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+    return l;
+}
 CsLayout cs_layout(const NvnState& s) {
+    if (seed_cs_control) return cs_layout_of(seed_cs_control + 0x58);
     static std::mutex mu;
     static std::unordered_map<uint64_t, CsLayout> by_serial;
     std::lock_guard lk(mu);
@@ -65,8 +75,7 @@ CsLayout cs_layout(const NvnState& s) {
         host->gpu_read(s.prog.sd[i].control, &magic, 4);
         host->gpu_read(s.prog.sd[i].control + 0x56, &st, 2);
         if (magic != 0x98761234 || st != 5) continue;
-        l.ubo = c[0xb1 - 0x58], l.ssbo = c[0xb2 - 0x58], l.tex = c[0xb3 - 0x58], l.img = c[0xb6 - 0x58];
-        l.push = ((uint32_t)c[0xa9 - 0x58] * 4 + 15) & ~15u;
+        l = cs_layout_of(c);
         static const bool log_cs = getenv("RX_VK_LOG_CS") != nullptr;   // (hookshot) the control bytes 0xb0..0xbf
         if (log_cs) {
             char hex[700];

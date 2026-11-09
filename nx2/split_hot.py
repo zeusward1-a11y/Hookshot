@@ -3,8 +3,8 @@
     python -I nx2/split_hot.py [gen folder] [pieces, default 8]
 
 Functions that call each other stay together, heaviest calls first, so what used to inline still can. The pieces cost about the
-same to compile (chunks.fn_cost). code_hot.c stays as it was, renamed code_hot.c.whole, and build.py compiles code_hot_*.c at the hot flags. A profile from the whole
-file fits the pieces: its counters go by function name and shape.
+same to compile (chunks.fn_cost). code_hot.c stays as it was, renamed code_hot.c.whole, and build.py compiles code_hot_*.c at the
+hot flags. A profile from the whole file fits the pieces: its counters go by function name and shape.
 """
 import collections
 import glob
@@ -15,8 +15,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # (python -I leaves the script folder off)
 import kit  # noqa: E402,F401  (a64-kit on the path, for chunks)
 import chunks  # noqa: E402
+import lifted_c  # noqa: E402
 
-HEAD = re.compile(r"^void (f_[0-9a-f]+)\(Ctx \*__restrict A64_NOESC c\) \{", re.M)
+HEAD = lifted_c.HEAD
 CALL = re.compile(r"\b(f_[0-9a-f]{8})\(c\)")
 
 
