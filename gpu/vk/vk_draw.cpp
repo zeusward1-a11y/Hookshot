@@ -776,7 +776,10 @@ static void install_driver_fault_guard() {
 
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
-    if (sigsetjmp(fault_jmp, 1) != 0) return VK_ERROR_UNKNOWN;
+    if (sigsetjmp(fault_jmp, 1) != 0) {
+        logf("vk: the driver faulted compiling a graphics pipeline: that one is left out");
+        return VK_ERROR_UNKNOWN;
+    }
     fault_armed = 1;
     const VkResult r = vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
     fault_armed = 0;
@@ -784,7 +787,10 @@ VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateI
 }
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
-    if (sigsetjmp(fault_jmp, 1) != 0) return (VkResult)-77;
+    if (sigsetjmp(fault_jmp, 1) != 0) {
+        logf("vk: the driver faulted compiling a compute pipeline: that one is left out");
+        return (VkResult)-77;
+    }
     fault_armed = 1;
     const VkResult r = vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
     fault_armed = 0;
