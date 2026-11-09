@@ -2295,6 +2295,10 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     const BufferRef w = gpu_buffer_bind(base, wide_n, false);
                     if (w && w.buffer == b.buffer && w.offset == b.offset) b = w, n = wide_n;
                 }
+                // (hookshot) all a program may write through it, past what is marked written (a bare entry's guessed range, the
+                // pointer table's, a wide binding's): not copied back, but a GPU write hazard for the readback refresh of a later
+                // recording in the submission (vk_memory.cpp memory_rb_refresh)
+                if (b && d.is_written && (bare || wide_n)) memory_note_gpu_write(base, n);
                 {   // (EvilOOT) the wanted programs' storage descriptors in order, once: descriptor n = the IR's "#n"
                     static std::mutex lm;
                     static std::unordered_set<uint64_t> told;

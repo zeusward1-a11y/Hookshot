@@ -30,6 +30,7 @@ ARGS = {
     "tests/test_mesh_args_cleanup.py": ["--cxx", "{cxx}"],
     "tests/test_fallback_buffer_cleanup.py": ["--cxx", "{cxx}"],
     "tests/test_capture_copy_runs.py": ["--cxx", "{cxx}"],
+    "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_screensaver.py": ["--cc", "gcc"],
     "tests/test_pipeline_cache_save.py": ["--cxx", "{cxx}"],
     "tests/test_texture_handle_banks.py": ["--cxx", "{cxx}"],

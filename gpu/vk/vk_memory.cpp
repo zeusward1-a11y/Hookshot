@@ -2134,9 +2134,38 @@ void mirror_sync(Pool& p) {
 // one after, and the exposure stepped (the light dimming or flaring for a frame in Kokiri). So each submission first copies those
 // pages from guest memory into the mirror, on the GPU as its work starts, last of the uploads: what the CPU wrote by then is what the
 // GPU adds to. RX_VK_NO_RB_REFRESH=1: off ----
+// (hookshot, 11-09) A parallel replay's recordings share one submission (mirror_epoch) and its one write-back at its end: the part
+// before the segments, each segment and the recording after them (vk_replay.cpp replay_handle). A refresh in a later one copied the
+// guest's page, which has none of the submission's GPU writes, over what the recordings ahead of it had written in the mirror: OoT's
+// exposure sum came back ~0 and every frame was too bright (RX_VK_PARALLEL=4). So a recording that joined an open submission
+// refreshes a page only when every recording ahead of it in the queue is made and none of them may have written the page: the copy
+// then brings the CPU's writes and wipes nothing (and a page first read in the middle of a submission is refreshed ahead of its first
+// use, unless the recordings up to that use were all made before it was read). What they may have written are the GPU write
+// hazards: every range bound for writing in the mirror, and the ranges a program may write that are not copied back (a bare table
+// entry's guessed range past its first 64 bytes, the pointer table's, a wide binding: vk_draw.cpp, memory_note_gpu_write). A
+// recording that opens its submission, or comes after its write-back (frame generation's), refreshes every page as before: serial
+// replay records the same copies. With RX_VK_FOLLOW_STORES (stores through the page table, bound nowhere) a joining one refreshes
+// none. RX_VK_RB_REFRESH_EACH=1: in every recording, as before
 namespace {
 std::unordered_map<uint32_t, uint64_t> rb_pages;   // (guest page -> mirror_epoch it was last read at)
-std::atomic<int64_t> st_rb_refresh{0};
+std::atomic<int64_t> st_rb_refresh{0}, st_rb_held{0};
+// (the open submission the recording this thread is making joined; 0: none: it opens one, or comes after one's end)
+thread_local uint64_t rb_joined = 0;
+// (the GPU write hazards of submission rb_hazards_epoch, by guest address, with their recording's place in the queue
+// (texture_segment); kept past its write-back, for the recording that ends it)
+struct RbHazard {
+    uint64_t lo, hi, seg;
+};
+std::vector<RbHazard> rb_hazards;
+uint64_t rb_hazards_epoch = 0;
+// (a parallel replay's segments: the submission, the first one's order (texture_segment) and how many; the ones made, by order)
+struct RbSegments {
+    uint64_t epoch = 0, base = 0, n = 0, made = 0;
+} rb_segs;
+void rb_hazard_locked(uint64_t lo, uint64_t hi) {   // (pools_mu held)
+    if (rb_hazards_epoch != mirror_epoch) rb_hazards.clear(), rb_hazards_epoch = mirror_epoch;
+    rb_hazards.push_back({lo, hi, texture_segment()});
+}
 }
 void memory_note_readback(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_NO_RB_REFRESH") != nullptr;
@@ -2144,10 +2173,46 @@ void memory_note_readback(uint64_t guest, uint64_t size) {
     std::lock_guard lk(pools_mu);
     for (uint64_t pg = guest >> kPageShift; pg <= (guest + size - 1) >> kPageShift; pg++) rb_pages[(uint32_t)pg] = mirror_epoch;
 }
+void memory_note_gpu_write(uint64_t gpu, uint64_t size) {
+    if (!size) return;
+    uint64_t guest = gpu;
+    if (gpu >= (1ull << 40)) {   // (as gpu_buffer_bind)
+        uint64_t avail = 0;
+        if (!host->gpu_ptr(gpu, &avail) || avail < size) return;
+        guest = host->gpu_guest(gpu);
+    }
+    std::lock_guard lk(pools_mu);
+    rb_hazard_locked(guest, guest + size);
+}
+void memory_rb_recording_begun() {
+    std::lock_guard lk(pools_mu);
+    rb_joined = mirror_upload ? mirror_epoch : 0;
+}
+void memory_rb_segments_begin(uint64_t base, uint64_t n) {
+    std::lock_guard lk(pools_mu);
+    rb_segs = {mirror_epoch, base, n, 0};
+}
 /// Records the refresh copies into the submission's upload command buffer; true when it recorded any
 bool memory_rb_refresh(VkCommandBuffer up) {
     std::lock_guard lk(pools_mu);
+    static const bool each = getenv("RX_VK_RB_REFRESH_EACH") != nullptr;
+    static const bool follow_stores = getenv("RX_VK_FOLLOW_STORES") != nullptr;
+    const bool joined = !each && rb_joined && rb_joined == mirror_epoch;
+    const uint64_t seg = texture_segment();
+    bool ahead_made = !follow_stores;   // (every recording ahead of this one in the queue made, and what they may write known)
+    if (joined && rb_segs.epoch == mirror_epoch && seg >= rb_segs.base && seg - rb_segs.base < rb_segs.n) {
+        const uint64_t k = seg - rb_segs.base;   // (a segment's: the ones before it made, and this one now)
+        const uint64_t below = k < 64 ? (1ull << k) - 1 : ~0ull;
+        ahead_made = ahead_made && k < 64 && (rb_segs.made & below) == below;
+        if (k < 64) rb_segs.made |= 1ull << k;
+    }
     if (rb_pages.empty() || !up) return false;
+    auto written_ahead = [&](uint64_t lo, uint64_t hi) {   // (may be, by a recording ahead of this one in its submission)
+        if (rb_hazards_epoch != mirror_epoch) return false;
+        for (const RbHazard& h : rb_hazards)
+            if (h.seg < seg && h.lo < hi && lo < h.hi) return true;
+        return false;
+    };
     std::map<Pool*, std::vector<VkBufferCopy>> by_pool;
     for (auto it = rb_pages.begin(); it != rb_pages.end();) {
         if (it->second + 600 < mirror_epoch) { it = rb_pages.erase(it); continue; }   // (not read for a while)
@@ -2159,6 +2224,10 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         Pool& p = pit->second;
         if (g < p.lo || g >= p.hi || p.mstate != Pool::MIRROR_ON || !p.mirror) continue;
         const uint64_t a = g - p.lo, b = std::min(g + 4096, p.hi) - p.lo;
+        if (joined && (!ahead_made || written_ahead(p.lo + a, p.lo + b))) {   // (not here: see above)
+            st_rb_held++;
+            continue;
+        }
         by_pool[&p].push_back({a, a, b - a});
     }
     if (by_pool.empty()) return false;
@@ -2179,7 +2248,9 @@ bool memory_rb_refresh(VkCommandBuffer up) {
         for (const VkBufferCopy& r : rs) gp.bytes += r.size;
     }
     static std::atomic<int64_t> n{0};
-    if (++n % 3000 == 1) logf("vk: readback pages refreshed from guest memory: %lld pages so far", (long long)st_rb_refresh.load());
+    if (++n % 3000 == 1)
+        logf("vk: readback pages refreshed from guest memory: %lld pages so far (%lld held: may be written ahead in their submission)",
+             (long long)st_rb_refresh.load(), (long long)st_rb_held.load());
     return true;
 }
 
@@ -2392,7 +2463,10 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         return remember({p->buffer, off, size, 0});
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
-    if (written) writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
+    if (written) {
+        writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
+        rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
+    }
     return remember({p->mirror, off, size, 0});
 }
 

@@ -1403,6 +1403,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     static uint64_t seq = 0;   // (the segments' order, across submissions: a recording's uploads precede it)
     const uint64_t base = ++seq;
     seq += seg.size();
+    memory_rb_segments_begin(base, seg.size());   // (their order in the queue: memory_rb_refresh)
     struct Job {
         Recording* r;
         Segment g;

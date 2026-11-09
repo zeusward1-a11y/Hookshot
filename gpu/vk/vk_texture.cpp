@@ -1844,6 +1844,7 @@ void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     rec_value = value;
     up_used = false;
     memory_table_begin();
+    memory_rb_recording_begun();   // (which readback pages its uploads may refresh: memory_rb_refresh)
 }
 VkCommandBuffer upload_command_buffer() {
     return upload_cmd();
