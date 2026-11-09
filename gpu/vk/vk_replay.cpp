@@ -479,6 +479,9 @@ void ub_prune(uint64_t done) {
 uint64_t ub_generation() {
     return ub_gen;
 }
+void ub_thread_off() {
+    ub_limit = 0;
+}
 /// The open gap around [addr, addr+bytes) that no update covers. False when one does. [lo, hi) is that gap.
 bool ub_gap(const uint64_t* dst, const uint64_t* end, int n, uint64_t addr, uint64_t bytes, uint64_t* lo, uint64_t* hi) {
     if (!bytes || addr + bytes < addr) return false;
@@ -566,7 +569,8 @@ void ub_copy_keep(uint64_t addr, uint64_t n, const uint8_t* base, size_t first, 
     c.rec = rec_value_now, c.view = view, c.epoch = epoch;
 }
 uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc) {
-    const size_t lim = std::min(ub_limit, ub_updates.size());   // (a worker: those before its place in the stream)
+    // (a worker: those before its place in the stream; a background thread: none, not even the list's size)
+    const size_t lim = ub_limit ? std::min(ub_limit, ub_updates.size()) : 0;
     static const bool cur_only = getenv("RX_VK_UB_CUR_ONLY") != nullptr;   // (A/B: this submission's updates only)
     const size_t first = cur_only ? std::min(ub_first_of_recording, lim) : 0;
     if (ub_gap_holds(addr, n, first, lim)) return UINT64_MAX;
@@ -602,7 +606,7 @@ uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::functio
 /// the stream made before this place (a worker: before its segment) over it. For what the replay reads on the CPU for
 /// the GPU's sake (handles in uniform and storage buffers): the game's memory now may be its next frames'.
 bool ub_read(uint64_t addr, void* dst, uint64_t n) {
-    const size_t lim = std::min(ub_limit, ub_updates.size());
+    const size_t lim = ub_limit ? std::min(ub_limit, ub_updates.size()) : 0;
     if (n == 4) {
         uint32_t v = 0;
         if (ub_word_hit(addr, lim, &v)) {
