@@ -1366,7 +1366,7 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
         // (over a linked one, which is left alone: draws recorded with it may still be on their way)
         if (const VkPipeline full = build_graphics(*job->p, job->s, job->at, job->topo)) job->e->pipeline = full;
         job->e->ready.store(true, std::memory_order_release);
-    });
+    }, false, &e->ready);   // (a draw that waits for it runs it at once if it is still queued: jobs_wait)
     return remember(e);
 }
 
