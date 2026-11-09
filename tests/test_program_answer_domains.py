@@ -36,6 +36,7 @@ FIXTURE = r'''
 namespace mkwvk {
 static uint32_t handles[3]{};
 static uint8_t answers[4]{0,2,2,2};
+thread_local const std::vector<Program::Answer>* answers_in = nullptr;
 uint32_t driver_bank_word(const NvnState&, int, int, uint32_t offset) { return handles[offset/8]; }
 uint32_t stage_handle(const NvnState&, const Stage&, uint32_t) { std::abort(); }
 uint8_t texture_answer(uint32_t h) { return h ? answers[h] : 0xff; }
@@ -68,6 +69,10 @@ int main(int argc, char** argv){using namespace mkwvk;auto s=std::make_unique<Nv
   answers[1]=3;check(!still_valid(*s,*d),"strict depth changed raw bit still rejects");
   printf("strict checks=%u failures=%u\n",checked,failed);return failed?1:0;
  }
+
+ unbind();auto seeded=sampled(false);std::vector<Program::Answer> seed{{0,0,131,false}};
+ answers_in=&seed;record_answers(*seeded,*s);answers_in=nullptr;
+ check(seeded->answers.size()==1&&seeded->answers[0].type==131&&seeded->variant==answers_hash(*seeded),"pipeline-state answers and variant retained");
 
  for(auto fmt:{Shader::ImageFormat::R8_UINT,Shader::ImageFormat::R16_UINT,Shader::ImageFormat::R32_UINT,Shader::ImageFormat::R32G32_UINT,Shader::ImageFormat::R32G32B32A32_UINT}){
   unbind();auto p=image(fmt);record_answers(*p,*s);auto hash=p->variant;check(p->answers.size()==3&&p->answers[2].type==128,"prepared UINT answer metadata retained");
