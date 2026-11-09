@@ -207,6 +207,8 @@ bool has_stencil(VkFormat f);
 
 // device memory (vk_vma.cpp, Vulkan Memory Allocator)
 bool vma_init(PFN_vkGetInstanceProcAddr gipa);
+void texture_refresh_request();   // (the Insert menu's "Refresh memory": vk_texture.cpp)
+void working_set_keep();          // (ask the system to keep the game's memory in RAM: vk_texture.cpp)
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated = false);
 void destroy_image(VkImage image, VmaAllocation allocation);
 /// What an allocation really takes (VkMemoryRequirements.size: padding, alignment, the driver's metadata), 0 for none

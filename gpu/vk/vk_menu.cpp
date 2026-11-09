@@ -60,6 +60,7 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_refresh(int) { return "Press A / Enter"; }
 const char* tx_mousecam(int v) { return v ? "Native" : "As the stick"; }
 const char* tx_sens(int v) {
     static char b[12];
@@ -262,6 +263,9 @@ Row rows[] = {
     {TAB_GRAPHICS, "Robust buffers", &opts.robust, 0, 2, 1, tx_robust,
      "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Auto is on, on every card; "
      "Off can be faster on some NVIDIA cards. Applies after restart."},
+    {TAB_GRAPHICS, "Refresh memory", &opts.refresh, 0, 1, 1, tx_refresh,
+     "Lets go of the textures not drawn lately and asks the system to keep the game's memory in RAM: what a restart does for "
+     "memory, without leaving the game. A short stutter while the textures still needed come back."},
 
     // Gameplay (3 rows)
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff,
@@ -518,6 +522,11 @@ void save() {
 /// A row's new value v, as the arrows set it (dir: 1 up, -1 down, for the rows that skip or wrap), saved unless !keep
 /// (a slider's drag: saved once it is let go)
 void set_row(Row& r, int v, int dir, bool keep = true) {
+    if (r.value == &opts.refresh) {   // ("Refresh memory": a button, not a value)
+        texture_refresh_request();
+        opts.refresh = 0;
+        return;
+    }
     if (r.value == &opts.framegen && v == 1) v = dir > 0 ? 2 : 0;   // (off, 2x ... 8x)
     if (r.value == &opts.dlssg) v = dlssg::menu_step(*r.value, dir > 0);   // (off, 2x, 3x, 4x)
     if (r.value == &opts.mouse_sens) v = std::min(std::max(v, r.lo), r.hi);   // (a scale: it stops at its ends)

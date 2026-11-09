@@ -54,6 +54,32 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+// "Refresh memory" (Insert menu): the next housekeeping lets go of every texture not drawn for 60 frames, whatever the budget, and
+// the working set is asked for again. At start-up too: on Windows, with other programs in front, the system took the game's pages
+// away (13-15 GB down to 6.3 GB, 18000 page faults a second, 3 fps with every thread idle, Quadro P4000 / 32 GB). RX_VK_MIN_WORKING_SET_MB:
+// the least of the game's memory the system is asked to keep in RAM; default a third of the RAM, at most 10 GB; 0: not asked
+std::atomic<bool> refresh_flag{false};
+void texture_refresh_request() { refresh_flag = true; }
+void working_set_keep() {
+#ifdef _WIN32
+    uint64_t mb;
+    if (const char* e = getenv("RX_VK_MIN_WORKING_SET_MB")) {
+        mb = (uint64_t)std::max(0, atoi(e));
+    } else {
+        MEMORYSTATUSEX ms{sizeof ms};
+        mb = GlobalMemoryStatusEx(&ms) ? std::min<uint64_t>(ms.ullTotalPhys / 3 >> 20, 10240) : 0;
+    }
+    if (!mb) return;
+    const SIZE_T lo = (SIZE_T)(mb << 20), hi = lo * 3;
+    BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    const char* how = "kept (hard minimum)";
+    if (!ok) {
+        ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+        how = ok ? "asked (soft minimum)" : "refused";
+    }
+    logf("vk: working set: at least %llu MB of the game's memory in RAM: %s", (unsigned long long)mb, how);
+#endif
+}
 namespace {
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -2999,7 +3025,13 @@ void texture_frame(uint64_t completed) {
     }
     static const bool no_evict = getenv("RX_VK_NO_EVICT") != nullptr;   // (an experiment: nothing evicted)
     // (hookshot) under the budget, every 600 presents: the render targets drawn over since (below), unused for 120
-    const bool sweep = total_bytes <= budget;
+    const bool forced = refresh_flag.exchange(false);   // ("Refresh memory")
+    if (forced) {
+        logf("vk: refresh: %llu MB of textures, letting go of those not drawn for 60 frames", (unsigned long long)(total_bytes >> 20));
+        budget = 0;
+        working_set_keep();
+    }
+    const bool sweep = !forced && total_bytes <= budget;
     // (hookshot-amd) and every 60 presents for the render targets drawn over by one at another start (below): OoT makes a frame's
     // transient targets (768 x 432 RGBA16F, 1536 x 864) in a scratch heap whose offsets shift with what came before them in the
     // frame, so turning the camera made new ones each frame ~1.2 MB from the last, each a new image. Left for the 600-present
