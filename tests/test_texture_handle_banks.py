@@ -33,6 +33,7 @@ def main():
         function(shader, 'uint32_t descriptor_handle(const NvnState& s, const Stage& st, const Shader::ImageDescriptor& d)'),
     ])
     prelude = r'''
+#define _CRT_SECURE_NO_WARNINGS 1
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
