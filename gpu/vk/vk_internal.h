@@ -83,7 +83,6 @@ struct BufferRef {
     }
 };
 bool memory_init();                                   // vk_memory.cpp
-void memory_rb_direct_note(uint64_t guest, uint64_t size);   // (test: RX_VK_RB_DIRECT, vk_memory.cpp)
 void memory_cpu_owned(uint64_t guest, uint64_t size);   // (hookshot: words the replay writes on the CPU, left out of write-backs)
 void memory_table_begin();                         // (hookshot: a recording's page table changes held back for its upload commands)
 bool memory_table_flush();
