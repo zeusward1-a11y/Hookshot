@@ -129,5 +129,52 @@ int main() {
     h = controls(800, 128 + 2 * 48 + 10, 2, cw * 2, ch * 2, 24);
     CHECK("controls, scale 2: row 2's keys", h.part == kCtlCell && h.index == 2 && h.side == 1);
 
+    // ---- the Cheats page: 11 rows 28 high from 44; row 4's value from x 420 (none on row 2: the menu's width) ----
+    {
+        int vl[11];
+        for (int& v : vl) v = 420;
+        vl[2] = kWidth;
+        const int cheat_h = 136 + 11 * 28;
+        h = cheats(30, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
+        CHECK("cheats: row 4's name", h.part == kCheatRow && h.index == 4 && h.side == 0);
+        h = cheats(425, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
+        CHECK("cheats: row 4's value, left half", h.part == kCheatRow && h.index == 4 && h.side == -1);
+        h = cheats(460, 44 + 4 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
+        CHECK("cheats: row 4's value, right half", h.part == kCheatRow && h.index == 4 && h.side == 1);
+        h = cheats(460, 44 + 2 * 28 + 10, 1, kWidth, cheat_h, 11, vl);
+        CHECK("cheats: a row without a value", h.part == kCheatRow && h.index == 2 && h.side == 0);
+        CHECK("cheats: the title", cheats(30, 43, 1, kWidth, cheat_h, 11, vl).part == kNone);
+        CHECK("cheats: the help below the rows", cheats(30, 44 + 11 * 28 + 2, 1, kWidth, cheat_h, 11, vl).part == kNone);
+        CHECK("cheats: the band's margin", cheats(7, 44 + 10, 1, kWidth, cheat_h, 11, vl).part == kNone);
+        CHECK("cheats: off the menu", cheats(30, cheat_h, 1, kWidth, cheat_h, 11, vl).part == kOutside);
+        int vl2[11];
+        for (int i = 0; i < 11; i++) vl2[i] = vl[i] * 2;
+        h = cheats(60, (44 + 10 * 28 + 3) * 2, 2, kWidth * 2, cheat_h * 2, 11, vl2);
+        CHECK("cheats, scale 2: the last row", h.part == kCheatRow && h.index == 10 && h.side == 0);
+        h = cheats(930, (44 + 4 * 28 + 3) * 2, 2, kWidth * 2, cheat_h * 2, 11, vl2);
+        CHECK("cheats, scale 2: row 4's value, right half", h.part == kCheatRow && h.index == 4 && h.side == 1);
+    }
+
+    // ---- a list page: 20 lines 24 high from 48 (the line as shown; the menu maps it to its item) ----
+    {
+        int vl[20];
+        for (int& v : vl) v = kWidth;
+        vl[3] = 440;
+        const int list_h = 100 + 20 * 24;
+        h = list_lines(40, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
+        CHECK("list: line 3's name", h.part == kListLine && h.index == 3 && h.side == 0);
+        h = list_lines(445, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
+        CHECK("list: line 3's amount, left half", h.part == kListLine && h.index == 3 && h.side == -1);
+        h = list_lines(460, 48 + 3 * 24 + 5, 1, kWidth, list_h, 20, vl);
+        CHECK("list: line 3's amount, right half", h.part == kListLine && h.index == 3 && h.side == 1);
+        h = list_lines(460, 48 + 5 * 24 + 5, 1, kWidth, list_h, 20, vl);
+        CHECK("list: a line without an amount", h.part == kListLine && h.index == 5 && h.side == 0);
+        CHECK("list: the heading line above", list_lines(40, 47, 1, kWidth, list_h, 20, vl).part == kNone);
+        CHECK("list: a short list's end", list_lines(40, 48 + 7 * 24 + 5, 1, kWidth, list_h, 7, vl).part == kNone);
+        CHECK("list: the hints", list_lines(40, 48 + 20 * 24 + 5, 1, kWidth, list_h, 20, vl).part == kNone);
+        h = list_lines(80, (48 + 19 * 24 + 2) * 2, 2, kWidth * 2, list_h * 2, 20, nullptr);
+        CHECK("list, scale 2: the last line", h.part == kListLine && h.index == 19 && h.side == 0);
+    }
+
     std::puts("menu hit-test: all checks passed");
 }

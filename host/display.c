@@ -183,10 +183,13 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (menu_open) menu_press(w, lp, HOS_MOUSE_LEFT);
         else if (renderer && !mouse_captured) mouse_capture(w, 1);
         return 0;
-    case WM_KEYDOWN:
+    case WM_KEYDOWN: {
+        extern void hos_vk_note_key_press(unsigned key);
+        if (!(lp & (1 << 30))) hos_vk_note_key_press((unsigned)wp);
         if (wp == VK_ESCAPE) mouse_capture(w, 0);
         if (wp == VK_F11 && !(lp & (1 << 30))) set_fullscreen(w, !fullscreen);
         return 0;
+    }
     case WM_SYSKEYDOWN:   /* Alt+Enter, as on Linux (display_sdl.c); other Alt keys (Alt+F4) go on to Windows */
         if (wp == VK_RETURN && (lp & (1 << 29))) {
             if (!(lp & (1 << 30))) set_fullscreen(w, !fullscreen);

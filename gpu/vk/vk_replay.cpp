@@ -3542,6 +3542,10 @@ void fill_replay_table(MkwVkRenderer& t) {
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
     t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp)
+        if (id == HOS_OPT_CHEAT_HEARTS) return menu_heart_protection();
+        if (id == HOS_OPT_CHEAT_FLIGHT) return menu_player_flight();
+        if (id == HOS_OPT_CHEAT_ACTION) return menu_take_cheat_action();
+        if (id == HOS_OPT_CHEAT_CAMERA) return menu_free_camera();
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() : id == 3 ? resolution_scale() : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : 0;
     };

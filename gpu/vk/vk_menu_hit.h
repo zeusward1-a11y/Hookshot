@@ -15,6 +15,10 @@ constexpr int kSliderL = 200, kSliderR = 330;   // a slider row's track (Sharpne
 constexpr int kSliderGrab = 6;            // (a click this far past either end still takes the track's end)
 // ---- the Controls page ----
 constexpr int kCtlWidth = 600, kCtlTop = 64, kCtlRowH = 24, kCtlPad = 200, kCtlKey = 390, kCtlCellPad = 6;
+// ---- the Cheats page (no tab strip), and its lists: the teleport list and the inventory ----
+constexpr int kCheatTop = 44, kCheatRowH = 28;   // the cheats' rows, from kCheatTop
+constexpr int kListTop = 48, kListRowH = 24;     // a list's lines (a section's heading is one too), from kListTop
+constexpr int kListValueRight = 16;              // a cheat's or a list line's value ends kListValueRight from the right
 
 enum Part {
     kNone,      // off the menu's controls (still over the menu: a click does nothing)
@@ -26,6 +30,8 @@ enum Part {
     kSlider,    // a slider row's track: index, permille 0 to 1000 along it
     kCtlRow,    // the Controls page: a row's name (index; index == the count: Reset to defaults)
     kCtlCell,   // a binding: index the row, side 0 the gamepad's, 1 the keyboard's
+    kCheatRow,  // the Cheats page: a row (index), side -1 the value's left half, 1 its right half, 0 the name
+    kListLine,  // a list (the teleport list, the inventory): a line as shown (index, 0 the top one), side as kCheatRow
 };
 struct Hit {
     Part part = kNone;
@@ -117,6 +123,30 @@ inline Hit controls(int x, int y, int s, int w, int h, int count) {
         hit.part = kCtlRow;
     }
     return hit;
+}
+
+/// Rows top + i * row_h high (times s), in the band kRowX in from either side: part with the row's index and the side of
+/// its value it is on (value_l[i] the left edge of row i's value as last drawn, w or more: none; null: no values)
+inline Hit row_list(int x, int y, int s, int w, int h, int top, int row_h, int count, const int* value_l, Part part) {
+    Hit hit;
+    if (x < 0 || y < 0 || x >= w || y >= h) return hit.part = kOutside, hit;
+    if (y < top * s || x < kRowX * s || x >= w - kRowX * s) return hit;
+    const int i = (y - top * s) / (row_h * s);
+    if (i >= count) return hit;
+    hit.part = part;
+    hit.index = i;
+    const int vl = value_l ? value_l[i] : w;
+    const int vr = w - kListValueRight * s;
+    if (x >= vl && vl < vr) hit.side = x < (vl + vr) / 2 ? -1 : 1;
+    return hit;
+}
+/// The Cheats page: count its rows
+inline Hit cheats(int x, int y, int s, int w, int h, int count, const int* value_l) {
+    return row_list(x, y, s, w, h, kCheatTop, kCheatRowH, count, value_l, kCheatRow);
+}
+/// A list page: count the lines shown (headings included); index is the line from the top as shown, not the item
+inline Hit list_lines(int x, int y, int s, int w, int h, int count, const int* value_l) {
+    return row_list(x, y, s, w, h, kListTop, kListRowH, count, value_l, kListLine);
 }
 
 } // namespace mkwvk::menu_hit

@@ -1,5 +1,5 @@
 """The Insert menu's mouse: the hit-test (gpu/vk/vk_menu_hit.h) compiled and run against positions at two window sizes
-(tests/test_menu_hit.cpp), and the sources checked for the rest of the path: the window lets the mouse go while the
+(tests/test_menu_hit.cpp: the options, the Controls page, the Cheats page and its lists), and the sources checked for the rest of the path: the window lets the mouse go while the
 menu is open and takes it back after (WM_APP + 8, host/display.c and host/posix/display_sdl.c), the free mouse reaches
 the menu (MkwVkHost.pointer, host/rx_backend.c), and the menu draws with the sizes it hit-tests with.
 
@@ -20,9 +20,11 @@ def read(*parts):
 def sources():
     menu, api, backend = read("gpu", "vk", "vk_menu.cpp"), read("gpu", "vk", "vk_api.h"), read("host", "rx_backend.c")
     win, sdl = read("host", "display.c"), read("host", "posix", "display_sdl.c")
-    if '#include "vk_menu_hit.h"' not in menu or "menu_hit::options(" not in menu or "menu_hit::controls(" not in menu:
+    if '#include "vk_menu_hit.h"' not in menu or any("menu_hit::%s(" % f not in menu
+                                                      for f in ("options", "controls", "cheats", "list_lines")):
         raise SystemExit("the menu does not hit-test with vk_menu_hit.h")
-    for size in ("menu_hit::kTabY", "menu_hit::kRowH", "menu_hit::rows_top(s)", "menu_hit::tab_slot_w(", "menu_hit::kCtlRowH"):
+    for size in ("menu_hit::kTabY", "menu_hit::kRowH", "menu_hit::rows_top(s)", "menu_hit::tab_slot_w(", "menu_hit::kCtlRowH",
+                 "menu_hit::kCheatTop", "menu_hit::kCheatRowH", "menu_hit::kListTop", "menu_hit::kListRowH"):
         if size not in menu:
             raise SystemExit("the menu draws without %s: its picture and its hit-test can drift apart" % size)
     if "PostMessageA(app_window(), WM_APP + 8" not in menu:

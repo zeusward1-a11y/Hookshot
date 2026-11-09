@@ -15,7 +15,8 @@
 extern "C" {
 #endif
 
-#define MKWVK_API_VERSION 5
+#define MKWVK_API_VERSION 7
+enum { HOS_OPT_CHEAT_HEARTS = 32, HOS_OPT_CHEAT_FLIGHT, HOS_OPT_CHEAT_ACTION, HOS_OPT_CHEAT_CAMERA };
 
 /* (hookshot) the controls' names (host/nn_hid.c, host/pad_sdl.c, the pad_ and key_ lines of hookshot_options.ini):
    the Switch's buttons in nn::hid's bit order, and a gamepad's inputs by position, SDL's order (the bottom face
@@ -93,6 +94,7 @@ typedef struct MkwVkHost {
     void (*bind)(int set, int button, int slot, int code);
     /// The guest camera aspect explicitly applied at startup (0: its default aspect)
     float (*aspect_ratio)(void);
+    int (*take_key_press)(int key);
     /* (hookshot) the free mouse (MkwVkPointer), read and its presses and wheel cleared: 1 when the cursor is over the
        window and the window has the focus. The Insert menu releases the mouse while it is open: WM_APP + 8 to the
        window, wParam 1 open, 0 closed (the capture it had then comes back) */
