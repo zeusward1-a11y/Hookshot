@@ -229,16 +229,61 @@ def tree_rss(pid):
     return n
 
 
+class ProcessEntry(ctypes.Structure):   # (Windows' PROCESSENTRY32W, for CreateToolhelp32Snapshot)
+    _fields_ = [("size", ctypes.c_uint32), ("usage", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("heap", ctypes.c_size_t),
+                ("module", ctypes.c_uint32), ("threads", ctypes.c_uint32), ("parent", ctypes.c_uint32), ("base", ctypes.c_long),
+                ("flags", ctypes.c_uint32), ("exe", ctypes.c_wchar * 260)]
+
+
+def tree_ws(pid):
+    """(windows) The working set in bytes of a process and the processes it started: llvm-mingw's clang.exe is a 5 MB driver, and the
+    memory is in the clang-23.exe it runs"""
+    k = ctypes.WinDLL("kernel32")
+    psapi = ctypes.WinDLL("psapi")
+    k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.OpenProcess.restype = ctypes.c_void_p
+    k.CloseHandle.argtypes = [ctypes.c_void_p]
+    psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_uint32]
+    snapshot = k.CreateToolhelp32Snapshot(2, 0)   # (TH32CS_SNAPPROCESS)
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        return 0
+    children = {}
+    try:
+        e = ProcessEntry()
+        e.size = ctypes.sizeof(ProcessEntry)
+        more = k.Process32FirstW(snapshot, ctypes.byref(e))
+        while more:
+            children.setdefault(e.parent, []).append(e.pid)
+            more = k.Process32NextW(snapshot, ctypes.byref(e))
+    finally:
+        k.CloseHandle(snapshot)
+    total, seen, todo = 0, set(), [pid]
+    while todo:
+        p = todo.pop()
+        if p in seen:   # (Windows reuses ids: a parent id can name a newer process, and even loop)
+            continue
+        seen.add(p)
+        todo += children.get(p, [])
+        handle = k.OpenProcess(0x1000, 0, p)   # (PROCESS_QUERY_LIMITED_INFORMATION)
+        if handle:
+            c = ProcessMemory()
+            c.cb = ctypes.sizeof(ProcessMemory)
+            if psapi.GetProcessMemoryInfo(handle, ctypes.byref(c), c.cb):
+                total += c.ws
+            k.CloseHandle(handle)
+    return total
+
+
 def rss_mb(proc):
     """A running compiler's resident memory in MB (0: not known, or not started yet)"""
     if proc is None:
         return 0
     try:
         if os.name == "nt":
-            c = ProcessMemory()
-            c.cb = ctypes.sizeof(ProcessMemory)
-            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
-            return c.ws >> 20 if ok else 0
+            return tree_ws(proc.pid) >> 20
         return tree_rss(proc.pid) >> 20
     except (OSError, ValueError, AttributeError, IndexError):
         return 0
