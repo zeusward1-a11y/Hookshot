@@ -82,6 +82,23 @@ static void hos_log_flush(void) { unexpected(); }
 static void ExitProcess(unsigned code) { (void)code; unexpected(); }
 void hos_vk_note_key_press(unsigned key) { (void)key; }   /* (host/rx_backend.c: the menu notes key presses; nothing here) */
 
+/* (PR 946: the Insert menu takes the mouse while it is open; these branches never run here either) */
+enum {
+    WM_MOUSEMOVE = 0x200, WM_MOUSELEAVE = 0x2a3, WM_MOUSEWHEEL = 0x20a, WM_LBUTTONUP = 0x202,
+    WM_RBUTTONDOWN = 0x204, WM_RBUTTONUP = 0x205, WM_MBUTTONDOWN = 0x207, WM_MBUTTONUP = 0x208,
+    MK_LBUTTON = 1, MK_RBUTTON = 2, MK_MBUTTON = 0x10, TME_LEAVE = 2,
+    HOS_MOUSE_LEFT = 1, HOS_MOUSE_RIGHT = 2, HOS_MOUSE_MIDDLE = 4
+};
+typedef struct { UINT cbSize; UINT dwFlags; HWND hwndTrack; UINT dwHoverTime; } TRACKMOUSEEVENT;
+#define GET_WHEEL_DELTA_WPARAM(v) ((short)HIWORD(v))
+static volatile LONG ptr_x, ptr_y, ptr_w, ptr_h, ptr_in, ptr_wheel;
+static int menu_open;
+static BOOL TrackMouseEvent(TRACKMOUSEEVENT *t) { (void)t; unexpected(); return FALSE; }
+static HWND GetCapture(void) { unexpected(); return NULL; }
+static BOOL ReleaseCapture(void) { unexpected(); return FALSE; }
+static void menu_press(HWND w, LPARAM lp, LONG bit) { (void)w; (void)lp; (void)bit; unexpected(); }
+static void menu_mouse(HWND w, int open) { (void)w; (void)open; unexpected(); }
+
 /* ACTUAL_WNDPROC */
 
 static void reset(void) {

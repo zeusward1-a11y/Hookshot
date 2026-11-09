@@ -1042,6 +1042,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     }
     std::atomic<size_t> next{0}, made{0}, missing{0};
     const auto worker = [&] {
+        ub_thread_off();   // (a background thread: see ub_thread_off; the pipeline state list's builds raced the replay's updates)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             const size_t i = next++;
