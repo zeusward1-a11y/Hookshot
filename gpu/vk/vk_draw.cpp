@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -996,7 +997,10 @@ std::vector<StateRec> state_list_read(const std::string& path) {
     uint32_t size = 0;
     if (fread(magic, 8, 1, f) == 1 && !memcmp(magic, kStateMagic, 8) && fread(&size, 4, 1, f) == 1 && size == sizeof(StateRec)) {
         StateRec r;
-        while (fread(&r, sizeof r, 1, f) == 1) out.push_back(r);
+        while (fread(&r, sizeof r, 1, f) == 1) {
+            if (r.nanswers > std::size(r.answers) || r.nquestions > std::size(r.questions)) continue;
+            out.push_back(r);
+        }
     }
     fclose(f);
     return out;
