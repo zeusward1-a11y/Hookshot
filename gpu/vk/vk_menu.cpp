@@ -93,6 +93,10 @@ const char* tx_framegen(int v) {
     static const char* t[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
     return t[v];
 }
+const char* tx_dlssg(int v) {   // (vk_slfg.cpp: 1 is 2x, dlssg_logic.h multiplier_of)
+    static const char* t[] = {"Off", "2x", "2x", "3x", "4x"};
+    return t[v < 0 ? 0 : v > 4 ? 4 : v];
+}
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
 const char* tx_menu_shortcut(int v) {
     static const char* const names[] = {"Insert or F1", "Insert only", "F1 only"};
@@ -557,6 +561,11 @@ Row rows[] = {
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen, false, true},
+    {TAB_GRAPHICS, "DLSS Frame Generation", &opts.dlssg, 0, 4, 1, tx_dlssg,
+     "NVIDIA RTX 40 and 50 series: frames made by NVIDIA's DLSS Frame Generation, paced with NVIDIA Reflex, in place of the "
+     "Frame generation row's. Needs NVIDIA DLSS or DLAA as the Upscaler, and NVIDIA's Streamline files in the game folder's "
+     "streamline folder (see the readme). Applies after a restart.",
+     nullptr, true, true},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
     {TAB_GRAPHICS, "HDR", &opts.hdr, 0, 2, 1, tx_hdr,
      "HDR10 out on an HDR display (Windows: Use HDR on in the display settings). Expanded: the game's SDR picture, its white at "

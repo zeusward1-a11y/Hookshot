@@ -262,6 +262,10 @@ inline uint32_t frame_limit_us(uint32_t refresh_hz, int multiplier, double fract
 /// What Reflex's frame limit counts (RX_DLSSG_LIMIT): Streamline hands frameLimitUs to VK_NV_low_latency2's minimumIntervalUs, which
 /// may count the game's presents or every present DLSS-G makes. game (the default): the game's frames, the limit times the frames
 /// shown per game frame; present: every present, 97% of the refresh whatever the multiplier; 0: no limit
+/// The menu's row or RX_DLSSG as the frames shown for each of the game's: 0 off; 1 is 2 (the least there is); at most 4
+inline int multiplier_of(int v) {
+    return v <= 0 ? 0 : v < 2 ? 2 : v > 4 ? 4 : v;
+}
 enum LimitBasis : int { LIMIT_NONE = 0, LIMIT_GAME, LIMIT_PRESENT };
 inline int parse_limit(const char* v) {
     if (!v || !*v) return LIMIT_GAME;

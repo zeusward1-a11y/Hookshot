@@ -30,6 +30,7 @@
 #include "dlss_result.h"
 #include "dlssg_logic.h"
 #include "vk_menu.h"
+#include "vk_paths.h"
 
 namespace mkwvk {
 HWND app_window();   // (vk_main.cpp)
@@ -37,8 +38,30 @@ namespace slfg {
 namespace {
 // (this build's DLSS Super Resolution is NGX's, vk_dlss.cpp, with the menu's rows: here only what frame generation asks.
 // RX_DLSSG=<n>: 0 off, 2 and up the frames shown for each of the game's)
+/// The Insert menu's DLSS Frame Generation row as it was saved (hookshot_options.ini beside the game, its line
+/// dlss_frame_generation=<n>), read here and not from the menu: Streamline is started before the instance, the menu after
+int saved_dlssg() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);   // (the game folder, not bin beside the launcher: vk_paths.h)
+    std::string ini(exe, n);
+    ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "hookshot_options.ini";
+    static const char key[] = "dlss_frame_generation=";
+    int v = 0;
+    if (FILE* f = fopen(ini.c_str(), "r")) {
+        char line[80];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, key, sizeof key - 1)) {
+                v = atoi(line + sizeof key - 1);
+                break;
+            }
+        fclose(f);
+    }
+    return v;
+}
+// (this build's DLSS Super Resolution is NGX's, vk_dlss.cpp: here only what frame generation asks. The frames shown for each
+// of the game's: RX_DLSSG=<n> for a run, else the menu's row; 0 off, 1 as 2 (dlssg_logic.h multiplier_of), up to 4)
 struct SlfgOptions {
-    int dlssg = getenv("RX_DLSSG") ? atoi(getenv("RX_DLSSG")) : 0;
+    int dlssg = dlssg::multiplier_of(getenv("RX_DLSSG") && *getenv("RX_DLSSG") ? atoi(getenv("RX_DLSSG")) : saved_dlssg());
     int dlss_preset = 3;   // (never used: no super resolution through Streamline here)
 } sopts;
 /// The frames DLSS-G showed beyond the game's, for the FPS counter (vk_menu.cpp menu_note_frame: one call a frame shown)
@@ -710,11 +733,14 @@ bool dlss_start() {
     for (const std::string& s : st.inst_names) st.inst.push_back(s.c_str());
     for (const std::string& s : st.dev_names) st.devx.push_back(s.c_str());
     st.reflex_asked = dlssg::parse_reflex(getenv("RX_REFLEX"), 1);
-    st.limit_basis = dlssg::parse_limit(getenv("RX_DLSSG_LIMIT"));
+    // (every present by default: with the game's frames as the basis the driver still counted every present, and the game
+    // ran at half the limit at 2x, 40 fps on a 165 Hz display. RX_DLSSG_LIMIT=game: that; 0: no limit)
+    const char* const limit = getenv("RX_DLSSG_LIMIT");
+    st.limit_basis = dlssg::parse_limit(limit && *limit ? limit : "present");
     st.player_fps = dlssg::parse_game_fps(getenv("RX_DLSSG_FPS"));
     st.mailbox_asked = env_int("RX_DLSSG_MAILBOX", 0) != 0;
     sl::FeatureVersion version{};
-    st.get_feature_version(sl::kFeatureDLSS, version);
+    st.get_feature_version(sl::kFeatureDLSS_G, version);
     const Version mv = read_version(used).value_or(Version{});
     logf("vk: dlss: Streamline %s started from %s (DLSS %u.%u.%u.%u: %s; Streamline reports %s), %zu instance and %zu device "
          "extensions, %u graphics, %u compute and %u optical flow queues of its own%s", version.versionSL.toStr().c_str(),
