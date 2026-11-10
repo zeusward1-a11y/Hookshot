@@ -14,7 +14,8 @@ VkImage framegen_made_image(uint32_t* w, uint32_t* h);
 /// After that recording's submit (value): the display thread shows its frames
 void framegen_queue(uint64_t value);
 /// The window's present of an image (GENERAL, w x h; crop as above or null), vk_replay.cpp: the display thread's
-void present_image(VkImage src, uint32_t w, uint32_t h, const int crop[4], VkImageView view = VK_NULL_HANDLE);
+/// game_frame: the game frame's number (vk_slfg.cpp dlss_frame_id: DLSS Frame Generation's); 0: a frame made here
+void present_image(VkImage src, uint32_t w, uint32_t h, const int crop[4], VkImageView view = VK_NULL_HANDLE, uint32_t game_frame = 0);
 /// The Insert menu's upscaling of a frame to the window (dw x dh), recorded: the image to show, or null when it is off
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh);
 VkImageView framegen_scaled_view();   // (hookshot) the view of framegen_scale's last image

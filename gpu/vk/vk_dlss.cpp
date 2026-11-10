@@ -40,6 +40,7 @@
 // NGX's core is the driver's (Windows: _nvngx.dll, which NVIDIA's loader finds in the driver's own folder; Linux:
 // libnvidia-ngx.so). It is never put beside the game: a copy there would be loaded in place of the driver's.
 #include "vk_dlss.h"
+#include "vk_slfg.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -1085,8 +1086,9 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     } disturbed;
     if (!make_feature(cmd, rw, rh, dw, dh)) return false;
     if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, s.feature_rw, s.feature_rh) ||
-        !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, s.feature_rw, s.feature_rh) ||
-        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, s.feature_rw, s.feature_rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+        !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, s.feature_rw, s.feature_rh, VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, s.feature_rw, s.feature_rh,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
         !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh))
         return fail("its images were not made");
 
@@ -1169,6 +1171,23 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         logf("vk: NVIDIA DLSS: its evaluation failed (%#x): the game's upscale from now on", (unsigned)r);
         s.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
+    }
+    {   // (hookshot) NVIDIA DLSS Frame Generation (Streamline, vk_slfg.cpp; RX_DLSSG=2 and up): this frame's constants, and the
+        // depth and motion DLSS was just given (render pixels, not jittered, depth not reversed), copied by Streamline now
+        constexpr VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        const slfg::DlssImage gd{s.depth.image, s.depth.view, s.depth.format, s.depth.width, s.depth.height, VK_IMAGE_ASPECT_COLOR_BIT, u};
+        const slfg::DlssImage gm{s.motion.image, s.motion.view, s.motion.format, s.motion.width, s.motion.height,
+                                 VK_IMAGE_ASPECT_COLOR_BIT, u | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        // (the camera as frame generation wants it: this frame's view-projection without its jitter, and its clip space to the
+        // frame before's, both as dlss_math has them, row major, clip = M * position; a first frame or a cut: none, identity)
+        slfg::DlssView gv;
+        float g_current[16], g_to_previous[16];
+        std::memcpy(g_current, cam.current, sizeof g_current);
+        dlss_math::unjitter(g_current, cam.jitter);
+        gv.view_projection = g_current;
+        if (!reset && dlss_math::reprojection(g_current, previous, g_to_previous)) gv.clip_to_previous = g_to_previous;
+        gv.jitter[0] = jitter_px[0], gv.jitter[1] = jitter_px[1];
+        if (slfg::dlssg_frame_inputs(cmd, gd, gm, rw, rh, reset, slfg::dlss_frame_id(), gv)) note_work();
     }
     full_barrier(cmd);
     {

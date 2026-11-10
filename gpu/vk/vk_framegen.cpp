@@ -23,6 +23,7 @@
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"
+#include "vk_slfg.h"
 #include "vk_texture.h"
 
 #include "shaders/fg_copy_comp_spv.h"
@@ -472,7 +473,8 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    // (hookshot) DLSS Frame Generation makes the frames (vk_slfg.cpp): this interpolation stays off
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !slfg::dlssg_engaged();
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {

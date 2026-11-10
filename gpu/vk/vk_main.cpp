@@ -22,6 +22,8 @@
 #include "vk_menu.h"
 #include "vk_dlss.h"
 #include "vk_reflex.h"
+#include "vk_slfg.h"
+#include "dlssg_logic.h"
 #include "vk_progress.h"
 
 namespace vkx {
@@ -124,6 +126,11 @@ bool create_instance() {
         std::vector<VkExtensionProperties> all(n);
         vkEnumerateInstanceExtensionProperties(nullptr, &n, all.data());
         dlss_instance_extensions(ext_list, all);
+        // (hookshot) NVIDIA DLSS Frame Generation through Streamline (vk_slfg.cpp; RX_DLSSG=2 and up, else nothing is loaded):
+        // started before the instance, whose extensions it names
+        if (slfg::dlss_start())
+            for (const char* e : slfg::dlss_instance_exts())
+                if (has_extension(all, e) && std::none_of(ext_list.begin(), ext_list.end(), [&](const char* x) { return !std::strcmp(x, e); })) ext_list.push_back(e);
         // (hookshot) the HDR10 colour space for the Insert menu's HDR (the menu's settings are read after the instance is made, so
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
@@ -256,6 +263,8 @@ bool create_device() {
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
     reflex_device_extensions(want, exts);   // (hookshot: NVIDIA Reflex's, vk_reflex.cpp)
+    for (const char* e : slfg::dlss_device_exts())   // (hookshot: Streamline's, for DLSS Frame Generation: vk_slfg.cpp)
+        if (has_extension(exts, e) && std::none_of(want.begin(), want.end(), [&](const char* x) { return !std::strcmp(x, e); })) want.push_back(e);
 
     // the queue: one family for graphics, compute and transfer
     vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
@@ -301,6 +310,14 @@ bool create_device() {
     qs[1].queueFamilyIndex = compute_family;
     qs[1].queueCount = 1;
     qs[1].pQueuePriorities = &priority;
+    // (hookshot) with Streamline started, the queues its features asked for beside Hookshot's one, planned as its own
+    // vkCreateDevice would (vk_slfg.cpp dlss_queues); the presents then stay on the replay's queue (no compute family's)
+    const slfg::DlssQueues& sl_queues =
+        slfg::dlss_queues(dev.physical, dev.queue_family, families, has_extension(exts, VK_NV_OPTICAL_FLOW_EXTENSION_NAME));
+    const bool sl_plan = slfg::dlssg_requested();
+    if (sl_plan) compute_family = UINT32_MAX;
+    if (sl_plan && sl_queues.optical_flow && std::none_of(want.begin(), want.end(), [&](const char* x) { return !std::strcmp(x, VK_NV_OPTICAL_FLOW_EXTENSION_NAME); }))
+        want.push_back(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
 
     // features: what the hardware has of what the replay uses (all of them on the GPUs MKW-class hardware maps to)
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -336,7 +353,10 @@ bool create_device() {
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
+    VkPhysicalDeviceOpticalFlowFeaturesNV optical_flow{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};   // (DLSS-G's, native)
+    if (sl_plan && sl_queues.optical_flow) *tail = &optical_flow, tail = &optical_flow.pNext;
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    if (sl_plan) slfg::dlss_check_features(f12, f13);   // (the Vulkan 1.2 and 1.3 features Streamline asked for)
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
@@ -420,8 +440,8 @@ bool create_device() {
     dev.sparse_buffers = (families[dev.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) && f.features.sparseBinding;
     VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     ci.pNext = &f;
-    ci.queueCreateInfoCount = compute_family != UINT32_MAX ? 2 : 1;
-    ci.pQueueCreateInfos = qs;
+    ci.queueCreateInfoCount = sl_plan ? (uint32_t)sl_queues.infos.size() : compute_family != UINT32_MAX ? 2 : 1;
+    ci.pQueueCreateInfos = sl_plan ? sl_queues.infos.data() : qs;
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
     if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
@@ -432,6 +452,7 @@ bool create_device() {
 
     load_device(dev.device);
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    slfg::dlss_attach(dev.instance, dev.physical, dev.device, dev.queue_family);   // (hookshot: Streamline takes the device)
     dev.present_queue = VK_NULL_HANDLE;
     dev.present_family = dev.queue_family;
     if (compute_family != UINT32_MAX) vkGetDeviceQueue(dev.device, compute_family, 0, &dev.present_queue), dev.present_family = compute_family;
@@ -483,6 +504,7 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
 }
 
 bool create_swapchain(uint32_t width, uint32_t height) {
+    slfg::dlss_swapchain_changing();   // (hookshot: DLSS-G off before any swapchain is made or destroyed: its guide's section 17)
     VkSurfaceCapabilitiesKHR caps;
     VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(dev.physical, dev.surface, &caps);
     if (result != VK_SUCCESS) {
@@ -560,6 +582,18 @@ bool create_swapchain(uint32_t width, uint32_t height) {
 #endif
             for (auto m : modes)
                 if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = m;
+    }
+    if (slfg::dlssg_available()) {
+        // (hookshot) With DLSS Frame Generation: vsync with it is D3D12's only, so immediate (G-SYNC through the driver), else
+        // mailbox, and Reflex's frame limit under the refresh (dlssg_logic.h pick_present_mode). RX_VK_FIFO is not taken
+        const bool has_mailbox = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != modes.end();
+        const bool has_immediate = std::find(modes.begin(), modes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != modes.end();
+        bool fifo_ignored = false, capped = false;
+        const int pick = dlssg::pick_present_mode(getenv("RX_VK_FIFO") != nullptr, getenv("RX_VK_IMMEDIATE") != nullptr, true, has_mailbox,
+                                                  has_immediate, true, &fifo_ignored, &capped, slfg::dlssg_mailbox_asked());
+        mode = pick == dlssg::PRESENT_MAILBOX ? VK_PRESENT_MODE_MAILBOX_KHR
+               : pick == dlssg::PRESENT_IMMEDIATE ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+        slfg::dlssg_present_mode(capped, fifo_ignored, pick == dlssg::PRESENT_IMMEDIATE);
     }
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = dev.surface;
@@ -653,6 +687,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
          mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
+    slfg::dlss_swapchain_created();   // (hookshot, DLSS-G: Reflex's mode is the swapchain's; generation waits a few presents)
     return true;
 }
 
@@ -1053,3 +1088,16 @@ int display_refresh_mhz() {
     return mhz;
 }
 } // namespace mkwvk
+
+// (hookshot, DLSS Frame Generation) The game's thread at its window acquire (host/nvn_native.c nvnWindowAcquireTexture, after its
+// own pacing): Reflex's sleep and the frame's first latency markers (vk_slfg.cpp dlssg_frame_start). An export of its own, looked
+// up by name (host/rx_backend.c rx_frame_start), as mkwvk_close_asked is, and not an entry of the renderer table
+extern "C"
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void mkwvk_frame_start(void) {
+    mkwvk::slfg::dlssg_frame_start();
+}

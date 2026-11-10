@@ -33,6 +33,7 @@
 #include "vk_fsr3_inputs.h"   // (the camera jitter while AMD FSR 3.1 upscales)
 #include "status_line.h"
 #include "vk_reflex.h"
+#include "vk_slfg.h"
 #include "vk_draw.h"
 #include "vk_dump.h"
 #include "vk_paths.h"   // (game_module_path: the frame trace beside the game)
@@ -2910,6 +2911,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         full_barrier(r.cmd);
         presents++;
         presents_now = presents;
+        slfg::dlss_note_present((uint64_t)presents);   // (DLSS-G: the frame recorded from now on is the next one)
         if (presents == 1) hang_watch_start();
         {   // (EvilBoyce, diagnostics) RX_VK_WATCH_CPU=<present>:<gpu address>[,...] (hex addresses): from that present on, the
             // CPU's writes to those 4 KB pages logged with the writer's stack (host page watch: 12 reports)
@@ -3196,7 +3198,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         log_frame_stats();
     }
     if (dev.offscreen || interpolated) return;
-    present_image(src, sw, sh, crop, direct_view);
+    present_image(src, sw, sh, crop, direct_view, (uint32_t)presents);   // (the game frame's number: DLSS-G's)
 }
 
 } // namespace
@@ -3390,12 +3392,16 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 // for the submit and the present. Held over vkAcquireNextImageKHR and the fence, it stopped the replay's submits for as long as
 // the swapchain had no image free, twice a frame with frame interpolation.
 std::mutex present_image_mu;
-void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
+void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, uint32_t game_frame) {
     std::lock_guard lk(present_image_mu);
+    slfg::dlssg_window_check();   // (DLSS-G off at once when the window is minimized, even if the acquire below fails)
     static int hdr_was = -1;   // (the Insert menu's HDR as the swapchain was made for it; -1: not yet looked at)
     const bool hdr_changed = hdr_was >= 0 && hdr_was != opts.hdr;   // (turned on or off: the swapchain's format)
     if (hdr_was < 0) hdr_was = opts.hdr;
-    const uint64_t want = dev.swap_resize.exchange(0, std::memory_order_acquire);
+    // (hookshot) with DLSS Frame Generation on, a resize waits one present: this one turns generation off first and the
+    // swapchain is made at the next (the guide wants DLSS-G off for any window change: vk_slfg.cpp dlss_defer_swapchain)
+    const bool sl_wait = dev.swap_resize.load(std::memory_order_acquire) && game_frame && slfg::dlss_defer_swapchain();
+    const uint64_t want = sl_wait ? 0 : dev.swap_resize.exchange(0, std::memory_order_acquire);
     if (want || !dev.swapchain || reflex_swapchain_stale() || hdr_changed) {   // (resized, gone, Reflex or HDR changed)
         std::lock_guard qk(dev.present_mu);
         const uint32_t width = want ? (uint32_t)(want >> 32) : dev.swap_extent.width;
@@ -3584,6 +3590,11 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
     // ~15% to submit. With a queue of their own (dev.present_queue, a compute family's: vk_main.cpp create_device) the presents go
     // out with the submits' lock let go: the blit above signals swap_rendered on the replay's queue (submitted already, as a binary
     // semaphore's wait needs). (Waiting for the blit's fence before the present, with the lock let go, was worse.)
+    // (hookshot) DLSS Frame Generation: generation on or off for this frame, its tags, and the render-submit-end and present
+    // markers around the present (Streamline's vkQueuePresentKHR inserts the made frames). game_frame 0: a frame the built-in
+    // interpolation made, which turns DLSS-G off if it was on
+    slfg::dlssg_present_begin(game_frame, src != VK_NULL_HANDLE, (int)rect.x, (int)rect.y, rect.w, rect.h, dev.swap_extent.width,
+                              dev.swap_extent.height);
     if (dev.present_queue) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
@@ -3592,6 +3603,7 @@ void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkI
         res = vkQueuePresentKHR(dev.queue, &pi);
     }
     reflex_presented();
+    slfg::dlssg_present_end(game_frame);
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue ? ", on the presents' own queue" : "");
@@ -3933,6 +3945,7 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    slfg::dlssg_game_present();   // (the game's thread: DLSS-G's frames are numbered by the game's presents)
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)

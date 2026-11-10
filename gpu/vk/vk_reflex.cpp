@@ -26,6 +26,7 @@
 
 #include "vk_framegen.h"
 #include "vk_menu.h"
+#include "vk_slfg.h"
 
 namespace mkwvk {
 
@@ -57,6 +58,8 @@ Reflex& rx() {
 }
 
 int wanted_mode() {
+    // (hookshot) with DLSS Frame Generation asked for (vk_slfg.cpp), Reflex is Streamline's: this one stays off
+    if (slfg::dlssg_requested()) return 0;
     static const char* e = getenv("RX_VK_REFLEX");
     return std::clamp(e && *e ? atoi(e) : opts.reflex, 0, 2);
 }

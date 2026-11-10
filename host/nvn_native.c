@@ -2476,6 +2476,11 @@ NV(nvnWindowAcquireTexture) {
     {
         const int away = hos_vcore_away();
         hos_vi_native_acquire(o->active ? o->active : o->ntex);
+        {   /* (hookshot) the frame starts here, after the pacing: NVIDIA Reflex's sleep and the frame's first latency markers
+               with DLSS Frame Generation (gpu/vk/vk_slfg.cpp dlssg_frame_start), off the game's core like the pacing's sleep */
+            void rx_frame_start(void);
+            rx_frame_start();
+        }
         if (away) hos_vcore_back();
     }
     /* the acquire sync: this texture is no longer read by the display path (presents copy it in GPU order) */

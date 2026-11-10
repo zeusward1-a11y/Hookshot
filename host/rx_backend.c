@@ -284,6 +284,15 @@ void rx_close_asked(void) {
     void (*close_asked)(void) = (void (*)(void))(void *)GetProcAddress(vk_module, "mkwvk_close_asked");
     if (close_asked) close_asked();
 }
+/* (hookshot) the game starts a frame: its window acquire, after the host's pacing (nvn_native.c). DLSS Frame Generation's Reflex
+   sleep and first latency markers (gpu/vk/vk_main.cpp mkwvk_frame_start); a back end without the export: nothing */
+void rx_frame_start(void) {
+    static void (*frame_start)(void);
+    static int looked;
+    if (!vk || !vk_module) return;
+    if (!looked) frame_start = (void (*)(void))(void *)GetProcAddress(vk_module, "mkwvk_frame_start"), looked = 1;
+    if (frame_start) frame_start();
+}
 void rx_resize(int width, int height) { vk ? vk->resize(width, height) : wgr_resize(width, height); }
 const char *rx_describe(void) { return vk ? vk->describe() : wgr_describe(); }
 void rx_stats(int64_t *draws, int64_t *skipped, int64_t *pipelines) {
