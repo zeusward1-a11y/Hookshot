@@ -70,6 +70,17 @@ def check_sources():
     row = menu[menu.index('"DLSS Frame Generation", &opts.dlssg'):]
     need("nullptr, true, true}," in row[:row.index("},") + 2], "the row is not marked as read at the start (and preset exempt)")
     need("int dlssg = 0;" in read("gpu/vk/vk_menu.h"), "no opts.dlssg")
+    # while it runs, the rows it stands in for have nothing to choose, and say whose work it is
+    fixed = code(block(menu, "bool row_fixed(const int* value)"))
+    need("if (dlssg_takes_over() && (value == &opts.framegen || value == &opts.pace || value == &opts.reflex)) return true;" in fixed,
+         "Frame generation, Frame pacing and NVIDIA Reflex can still be changed while DLSS Frame Generation runs")
+    need("bool dlssg_takes_over() { return slfg::dlssg_engaged(); }" in menu, "the menu does not ask whether DLSS-G runs")
+    need('return dlssg_takes_over() ? "Off (DLSS Frame Generation)" : t[v];' in block(menu, "const char* tx_framegen(int v)"),
+         "the Frame generation row does not say DLSS Frame Generation makes the frames")
+    need("dlssg_takes_over()" in block(menu, "const char* tx_pace(int v)") and '"Frame pacing", &opts.pace, 0, 1, 1, tx_pace,' in menu,
+         "the Frame pacing row does not say whose pacing it is")
+    need('if (dlssg_takes_over()) return "On (DLSS Frame Generation\'s)";' in block(menu, "const char* tx_reflex(int v)"),
+         "the NVIDIA Reflex row reads Off while Streamline's Reflex runs")
     # Reflex's limit: every present unless told
     need('st.limit_basis = dlssg::parse_limit(limit && *limit ? limit : "present");' in slfg,
          "Reflex's frame limit does not count every present by default")

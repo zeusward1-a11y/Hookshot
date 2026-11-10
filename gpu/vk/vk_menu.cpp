@@ -39,6 +39,7 @@
 #include "vk_fsr3.h"      // (the Upscaler row: whether AMD FSR 3.1 runs on this GPU)
 #include "vk_fsr3fi.h"    // (the Frame generation row: whether FSR 3.1 makes the frame)
 #include "vk_reflex.h"
+#include "vk_slfg.h"   // (DLSS Frame Generation: the rows it stands in for)
 #include "upscaler_rows.h"
 #include "menu_restart.h"
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
@@ -89,10 +90,14 @@ const char* hint_in(const char* const* t, int n, int lo, int v, int variant) {
         static const char* const t[] = {__VA_ARGS__};                                                                        \
         return hint_in(t, (int)(sizeof t / sizeof t[0]), lo, v, variant);                                                    \
     }
+/// NVIDIA DLSS Frame Generation runs (vk_slfg.cpp; its row was on at the start): it makes the frames, paces them and brings
+/// Reflex, so the Frame generation, Frame pacing and NVIDIA Reflex rows have nothing to choose (row_fixed) and say so
+bool dlssg_takes_over() { return slfg::dlssg_engaged(); }
 const char* tx_framegen(int v) {
     static const char* t[] = {"Off", "Auto", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
-    return t[v];
+    return dlssg_takes_over() ? "Off (DLSS Frame Generation)" : t[v];
 }
+const char* tx_pace(int v) { return dlssg_takes_over() ? "DLSS Frame Generation's" : v ? "On" : "Off"; }
 const char* tx_dlssg(int v) {   // (vk_slfg.cpp: 1 is 2x, dlssg_logic.h multiplier_of)
     static const char* t[] = {"Off", "2x", "2x", "3x", "4x"};
     return t[v < 0 ? 0 : v > 4 ? 4 : v];
@@ -143,6 +148,7 @@ const char* tx_upscale(int v) {
 const char* tx_filter(int v) { return filter_needed() ? tx_upscale(v) : "Not needed (window = output)"; }
 const char* tx_reflex(int v) {
     static const char* t[] = {"Off", "On", "On + Boost"};
+    if (dlssg_takes_over()) return "On (DLSS Frame Generation's)";   // (Streamline's Reflex, which DLSS-G needs)
     return t[reflex_available() ? std::clamp(v, 0, 2) : 0];
 }
 /// Reflex: on the value, or that it is not available here (the row shows Off)
@@ -311,6 +317,7 @@ const char* hn_resolution(int v, int variant) {
 }
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
 bool row_fixed(const int* value) {
+    if (dlssg_takes_over() && (value == &opts.framegen || value == &opts.pace || value == &opts.reflex)) return true;
     return (value == &opts.reflex && !reflex_available()) || (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
            (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr));
@@ -566,7 +573,7 @@ Row rows[] = {
      "Frame generation row's. Needs NVIDIA DLSS or DLAA as the Upscaler, and NVIDIA's Streamline files in the game folder's "
      "streamline folder (see the readme). Applies after a restart.",
      nullptr, true, true},
-    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
+    {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_pace, "When each frame is shown.", hn_pace},
     {TAB_GRAPHICS, "HDR", &opts.hdr, 0, 2, 1, tx_hdr,
      "HDR10 out on an HDR display (Windows: Use HDR on in the display settings). Expanded: the game's SDR picture, its white at "
      "the paper white and its highlights up to the peak. Native: the game's own HDR, told the display's peak and paper white.",
