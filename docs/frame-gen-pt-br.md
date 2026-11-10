@@ -2,7 +2,7 @@
 
 Ramo `dlss-framegen-pacing` deste fork. Base: o Hookshot oficial em `8b2e1d3` (NotRexed/Hookshot), mais PRs abertas de desempenho
 e o trabalho de DLSS e frame generation feito aqui. Testado num PC com RTX 5070 (12 GB), i5-14600KF e Windows 11, monitor
-2560x1440 a 164 Hz. Este guia foi escrito para uma pessoa ou uma IA seguir passo a passo.
+2560x1440 a 164 Hz. Este guia foi escrito para uma pessoa ou uma IA seguir passo a passo. (English: `docs/frame-gen-en.md`.)
 
 Nada aqui inclui o jogo nem arquivos da NVIDIA: você precisa da sua própria cópia do jogo (exefs e romfs) e de baixar os
 arquivos da NVIDIA do site deles (seção 2).
