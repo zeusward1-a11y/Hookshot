@@ -233,6 +233,7 @@ choices and starts the game again, so progress since your last save is lost.
 | | Fullscreen | Off, On (the same as <kbd>F11</kbd>) | Off |
 | | GPU device | Auto, or each graphics card by name (after a restart) | Auto |
 | | Frame generation | Off, 2x to 8x | Off |
+| | DLSS Frame Generation | Off, 2x, 3x, 4x (NVIDIA RTX 40 and 50 series, with NVIDIA's Streamline files, below; takes a restart) | Off |
 | | Frame pacing | Off, On | Off |
 | | NVIDIA Reflex | Off, On, On + Boost (NVIDIA GPUs with `VK_NV_low_latency2`) | Off |
 | | Output resolution | 1920x1080, 2048x1152, 2560x1440, 3840x2160, 5120x1440 (after a restart) | 2048x1152 |
@@ -564,6 +565,43 @@ With `RX_VK_DLSS_LOG=1` NGX's own lines go there too (`ngx:`). Some of them look
 `failed to load NGXCore: 126` (twice) is NVIDIA's library looking for `_nvngx.dll` and `nvngx.dll` beside the game, which
 are not there on purpose, before it loads the driver's; `Feature ... failed to load from cache` is NGX finding no model
 of its own downloads (`C:\ProgramData\NVIDIA\NGX\models`) before it uses the game folder's `nvngx_dlss.dll`.
+
+</details>
+
+<details>
+<summary>NVIDIA DLSS Frame Generation (optional, NVIDIA's Streamline files under NVIDIA's license)</summary>
+
+The Graphics tab's **DLSS Frame Generation** row (`dlss_frame_generation=` in `hookshot_options.ini`, `RX_DLSSG=0/2/3/4` for one
+run) turns on NVIDIA's own frame generation, DLSS-G, in place of the **Frame generation** row's. It is another thing than that
+row: there the frames are made by Hookshot's own passes; here NVIDIA's model makes them from the game's depth, motion vectors
+and camera, and the driver paces them together with NVIDIA Reflex. It is off by default, and nothing of it is loaded while it
+is off.
+
+- **What it needs:** an NVIDIA RTX 40 or 50 series card, Windows, **NVIDIA DLSS** or **NVIDIA DLAA** as the **Upscaler** (the
+  section above: the frames are made from what DLSS is given), and NVIDIA's Streamline files, which are not part of Hookshot.
+- **The files:** from NVIDIA's Streamline SDK 2.14.16 (https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16,
+  `streamline-sdk-v2.14.16.zip`), its `bin/x64` folder (the production one, not `development`), into a `streamline` folder
+  beside `hookshot.exe`. It was tested with these nine there: `sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`,
+  `sl.reflex.dll`, `sl.pcl.dll`, `sl.dlss.dll`, `nvngx_dlssg.dll`, `nvngx_dlss.dll`, `NvLowLatencyVk.dll`. Using them is
+  accepting the license NVIDIA ships with the SDK. `RX_DLSS_DIR=<folder>` names another folder.
+- **Turning it on:** set the row to 2x, 3x or 4x and restart (Streamline is started before the game's window is made). The log
+  then says `vk: dlssg: available`, and in play, every 600 presents, `vk: dlssg: ... frames shown per game frame`.
+- **While it is on:** the **Frame generation**, **Frame pacing** and **NVIDIA Reflex** rows are shown without their arrows:
+  DLSS Frame Generation makes the frames, paces them and brings Streamline's Reflex, so Hookshot's own interpolation and Reflex
+  stand aside. The DLSS upscaling is untouched (it stays NGX's).
+- **The window:** presented without vsync while it is on (DLSS Frame Generation asks for that; G-SYNC works through the
+  driver), with Reflex holding what is shown just under the display's refresh rate. Nothing has to be changed in the NVIDIA
+  Control Panel or the NVIDIA app.
+- **Switches** (`hookshot_env.txt`): `RX_DLSSG_LIMIT=present` (the default: Reflex's limit counts every frame shown), `game`
+  (the game's frames; on the test PC this held the game at half the limit at 2x) or `0` (no limit); `RX_DLSSG_FPS=<n>` caps
+  the game's own frames; `RX_DLSS_NO_OTA=1` keeps Streamline to the files in its folder; `RX_DLSS_LOG=2` for Streamline's
+  verbose log.
+- **Tested on:** one PC, an RTX 5070 (12 GB) on Windows 11 with a 165 Hz display, at 2x: every made frame shown (2.00 frames
+  shown per game frame). 3x and 4x, other cards and Linux were not tested; Streamline is Windows only, so on Linux the row
+  does nothing.
+- **RTX 20 and 30 series:** not enabled. DLSS Frame Generation is NVIDIA's for RTX 40 and 50; this is the standard
+  integration, so the unlockers the community already uses for older cards may work on top of it, but that was not tried
+  (no such card to test with).
 
 </details>
 

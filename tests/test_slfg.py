@@ -138,6 +138,12 @@ def check_sources():
     acquire = code(block(read("host/nvn_native.c"), "NV(nvnWindowAcquireTexture)"))
     need(acquire.index("hos_vi_native_acquire(") < acquire.index("rx_frame_start();") < acquire.index("hos_vcore_back();"),
          "the frame does not start after the pacing, off the game's core")
+    # the readme: the row's help sends the player there for the files
+    readme = read("readme.md")
+    need("<summary>NVIDIA DLSS Frame Generation" in readme and "`streamline` folder" in readme, "the readme does not say where Streamline's files go")
+    need(all(f in readme for f in ("sl.interposer.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll")),
+         "the readme does not name Streamline's files")
+    need("| | DLSS Frame Generation |" in readme, "the row is not in the readme's table of the menu")
     # the build
     build = read("nx2/build.py")
     need('"third_party", "streamline", "include")' in build, "the build does not give the back end Streamline's headers")
