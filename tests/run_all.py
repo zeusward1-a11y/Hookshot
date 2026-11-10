@@ -44,6 +44,7 @@ ARGS = {
     "tests/test_ui_texture_upload.py": ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"],
     "tests/test_multiwait_wake.py": ["--cxx", "{cxx}"],
     "tests/test_slfg.py": ["--cxx", "{cxx}"],
+    "tests/test_dlss_grade.py": ["--cxx", "{cxx}"],
     "tests/test_parallel_rb_refresh.py": ["--cxx", "{cxx}"],
     "tests/test_prof_sampling.py": ["--cxx", "{cxx}"],
     "tests/test_present_geometry_trace.py": ["--cxx", "{cxx}"],

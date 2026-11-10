@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "vk_fsr3.h"
+#include "dlss_grade.h"
 #include "vk_fsr3_inputs.h"
 #include "vk_draw.h"      // (descriptors_disturbed)
 #include "vk_gprof.h"     // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
@@ -712,7 +713,7 @@ bool make_out_pipeline() {
     li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = 2, li.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &o.set) != VK_SUCCESS) return false;
-    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(grade::OutPush)};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1, pi.pSetLayouts = &o.set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
     if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &o.layout) != VK_SUCCESS) return false;
@@ -785,7 +786,7 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     ai.reset = f.reset;
     if (!fsr3::upscale(cmd, ai)) return fail("its passes could not be recorded");
     {
-        const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
+        const grade::OutPush pc{{(int)ow, (int)oh}};   // (no colour grade on FSR's picture: its three factors 0)
         const VkDescriptorImageInfo info[2] = {{o.point, fsr3::output_view(), VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -795,7 +796,7 @@ bool fsr3_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         w[1].pImageInfo = &info[1];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, o.pipe);
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, o.layout, 0, 2, w);
-        vkCmdPushConstants(cmd, o.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdPushConstants(cmd, o.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
     }
     full_barrier(cmd);

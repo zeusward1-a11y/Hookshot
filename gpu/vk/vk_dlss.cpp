@@ -57,6 +57,7 @@
 #endif
 
 #include "dlss_actor.h"
+#include "dlss_grade.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
 #include "upscaler_rows.h"
@@ -491,7 +492,7 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(DLSS_PREP_COMP_SPV, sizeof DLSS_PREP_COMP_SPV, prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
-    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 8, s.out_set, s.out_layout, s.out))
+    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, sizeof(grade::OutPush), s.out_set, s.out_layout, s.out))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -1191,7 +1192,11 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     }
     full_barrier(cmd);
     {
-        const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
+        // (hookshot) the colour grade, read once: RX_DLSS_GRADE_SAT and _CONTRAST in percent, _DENSITY the saturation's when unset
+        static const float g_sat = grade::factor_of(getenv("RX_DLSS_GRADE_SAT")),
+                           g_contrast = grade::factor_of(getenv("RX_DLSS_GRADE_CONTRAST")),
+                           g_density = grade::given(getenv("RX_DLSS_GRADE_DENSITY")) ? grade::factor_of(getenv("RX_DLSS_GRADE_DENSITY")) : g_sat;
+        const grade::OutPush opc{{(int32_t)ow, (int32_t)oh}, g_sat, g_contrast, g_density};
         const VkDescriptorImageInfo info[2] = {{dlaa ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -1201,7 +1206,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         w[1].pImageInfo = &info[1];
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
         vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
-        vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, opc);
+        vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, &opc);
         vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
     }
     s.last_frame = now;
